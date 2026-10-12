@@ -1,0 +1,261 @@
+"""配置层 —— 全部走环境变量，零硬编码。
+
+为什么全用环境变量而不是配置文件：
+  部署目标是 vivo（192.168.3.35）上的常驻进程，改配置要能不碰代码重启。
+  环境变量 + start-mcp.sh 里 export 是最省事、也是 shared-memory-mcp 已验证的做法。
+
+命名统一前缀 WS_，避免和同机其它服务撞车。
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+def _env_str(name: str, default: str) -> str:
+    v = os.environ.get(name)
+    return v.strip() if v and v.strip() else default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    v = (os.environ.get(name) or "").strip().lower()
+    if not v:
+        return default
+    return v in ("1", "true", "yes", "on", "y")
+
+
+def _env_list(name: str, default: list[str]) -> list[str]:
+    v = os.environ.get(name)
+    if not v or not v.strip():
+        return list(default)
+    return [x.strip() for x in v.split(",") if x.strip()]
+
+
+# 默认启用引擎。
+# 顺序只影响「同分时谁在前」，不影响并发（所有引擎同时起飞）。
+#
+# 这份列表是 2026-10-13 在 vivo（国内网络）实测出来的，不是拍脑袋排的：
+#   bing / so360 / baidu_m / sogou_m / so360_m / weixin  实测能出相关结果
+#   baidu / sogou（PC 版）被反爬硬拦，保留但排后面，靠预热熔断自动跳过
+#   ddg / mojeek / brave / searx  国内网络不可达，同上
+DEFAULT_ENGINES = [
+    "bing",        # 桌面版实测相关度最高；注意对 UA 敏感
+    "so360",       # PC 版最稳，反爬最弱
+    "baidu_m",     # 中文覆盖最强（移动版绕过安全验证）
+    "sogou_m",     # 移动版可用
+    "so360_m",     # 与 PC 版互补
+    "weixin",      # 垂直：微信公众号
+    "toutiao",     # 垂直：资讯，时效性强
+    "bing_intl",   # 必应国际版：实测与 cn 版结果有差异，是有效的交叉验证源
+    "duckduckgo",  # 国际
+    "mojeek",      # 独立索引
+    "brave",       # 国际
+    "baidu",       # PC 版（常被拦，保留待恢复）
+    "sogou",       # PC 版（常被拦，保留待恢复）
+]
+
+# 可选引擎（默认不开，需要外部 SearXNG 实例）
+OPTIONAL_ENGINES = ["searx"]
+
+
+@dataclass
+class Config:
+    """运行时配置。所有字段都可在 start-mcp.sh 里用环境变量覆盖。"""
+
+    # ── 服务 ──
+    host: str = "0.0.0.0"
+    port: int = 8300
+    transport: str = "http"          # http | stdio
+    mcp_path: str = "/mcp"           # streamable-http 端点路径
+    log_level: str = "info"
+
+    # ── 鉴权（部署到局域网必须开）──
+    token_file: str = ""             # WS_TOKEN_FILE，600 权限，一行一个 token
+    auth_required: bool | None = None  # None = 自动判断（非 loopback 则强制）
+
+    # ── 引擎 ──
+    engines: list[str] = field(default_factory=lambda: list(DEFAULT_ENGINES))
+    # per-engine 覆盖：WS_DISABLE_ENGINES=baidu,sogou
+    disable_engines: list[str] = field(default_factory=list)
+
+    # ── 超时预算（毫秒）—— 三层，必须满足 connect < engine < total ──
+    total_budget_ms: int = 12_000
+    engine_timeout_ms: int = 6_000
+    connect_timeout_ms: int = 2_500
+
+    # ── 并发 ──
+    max_concurrency: int = 32        # 全局在飞请求上限
+    quorum: int = 2                  # 早停所需的最小成功源数
+    quorum_results: int = 12         # 早停所需的去重结果数（太低会砍掉更全的结果）
+    early_stop: bool = True
+
+    # ── 结果 ──
+    max_results: int = 20
+    per_domain_cap: int = 3          # 单域名最多几条（多样性）
+    # 相关性校验开关：设为 0 关闭。
+    # 开启后，「结果里没有任何一条命中查询词」的引擎会被判为投毒并标记失败。
+    min_relevance_ratio: float = 0.3
+    warmup_query: str = "中国 新闻"   # 预热探测词（用中文，避免英文词触发异常路径）
+
+    # ── 限流（per engine 令牌桶）──
+    # 实测校准：vivo 国内网络下 so360 / weixin 在 1.0 rps、burst 5 下
+    # 连续 30 秒长跑零熔断、零 403。原值 0.5/3 是拍脑袋的保守值，
+    # 结果是压测里 1700+ 次请求被限流挡在门外，白白拖慢自己又不换来保护。
+    rate_per_sec: float = 1.0
+    rate_burst: int = 5
+
+    # ── 熔断 ──
+    cb_failure_threshold: int = 3    # 连续失败几次跳闸
+    cb_cooldown_sec: int = 60        # 初始冷却（每次再触发翻倍，上限见下）
+    cb_cooldown_max_sec: int = 600
+    cb_ema_alpha: float = 0.2        # 成功率 EMA 平滑系数
+
+    # ── 缓存 ──
+    cache_dir: str = ""              # 空 = 系统临时目录下 websearch-cache
+    cache_search_ttl: int = 300      # 5 分钟：搜索缓存只防反爬，不当数据源
+    cache_fetch_ttl: int = 1800      # 30 分钟：网页正文相对稳定
+    cache_negative_ttl: int = 30     # 失败负缓存，防反复撞墙
+    cache_memory_items: int = 512    # L1 LRU 容量
+    cache_db_items: int = 5000       # L2 SQLite 上限
+    cache_enabled: bool = True
+
+    # ── 抓取 ──
+    # 搜索结果页比正文页大得多（百度移动版实测 2.1MB），
+    # 用正文的上限去卡搜索页会把正常响应判成「过大」。
+    search_max_bytes: int = 4_000_000
+    fetch_max_bytes: int = 1_500_000   # 单页读取上限（vivo 内存只有 3.7G）
+    fetch_max_chars: int = 20_000      # 返回正文字符上限
+    fetch_timeout_ms: int = 6_000
+    max_redirects: int = 5
+    fetch_concurrency: int = 8         # web_fetch 批量并发度
+    user_agent_pool: list[str] = field(default_factory=list)
+
+    # ── 网络 ──
+    proxy: str = ""                  # http://user:pass@host:port
+    verify_ssl: bool = True
+    http2: bool = True
+
+    # ── 安全 ──
+    allow_private_net: bool = False  # 默认禁内网（SSRF 防护）
+    allow_nonstd_port: bool = False  # 默认只放行 80/443
+    domain_blocklist: list[str] = field(default_factory=list)
+    domain_allowlist: list[str] = field(default_factory=list)
+
+    # ── 反爬 ──
+    retry_on_transient: int = 1      # 瞬时错误重试次数（403/429 不重试）
+    backoff_base: float = 0.3
+
+    @classmethod
+    def from_env(cls) -> "Config":
+        c = cls()
+        c.host = _env_str("WS_HOST", c.host)
+        c.port = _env_int("WS_PORT", c.port)
+        c.transport = _env_str("WS_TRANSPORT", c.transport).lower()
+        c.mcp_path = _env_str("WS_MCP_PATH", c.mcp_path)
+        c.log_level = _env_str("LOG_LEVEL", c.log_level).lower()
+
+        c.token_file = _env_str("WS_TOKEN_FILE", "")
+        if _env_bool("WS_AUTH_REQUIRED", False):
+            c.auth_required = True
+        elif _env_bool("WS_AUTH_DISABLED", False):
+            c.auth_required = False
+
+        eng = _env_list("WS_ENGINES", DEFAULT_ENGINES)
+        c.engines = eng
+        c.disable_engines = _env_list("WS_DISABLE_ENGINES", [])
+
+        c.total_budget_ms = _env_int("WS_TOTAL_BUDGET_MS", c.total_budget_ms)
+        c.engine_timeout_ms = _env_int("WS_ENGINE_TIMEOUT_MS", c.engine_timeout_ms)
+        c.connect_timeout_ms = _env_int("WS_CONNECT_TIMEOUT_MS", c.connect_timeout_ms)
+        # 预算关系校正：这条不校正会出现「单引擎超时 > 全局超时」的荒谬配置，
+        # 结果就是第一个慢引擎独占全部预算，后面的引擎永远没机会跑
+        # （这正是调研里 leanzero 实测到的 10.4s 吃光 8s 预算的成因）。
+        c.engine_timeout_ms = min(c.engine_timeout_ms, c.total_budget_ms)
+        c.connect_timeout_ms = min(c.connect_timeout_ms, c.engine_timeout_ms)
+
+        c.max_concurrency = _env_int("WS_MAX_CONCURRENCY", c.max_concurrency)
+        c.quorum = _env_int("WS_QUORUM", c.quorum)
+        c.quorum_results = _env_int("WS_QUORUM_RESULTS", c.quorum_results)
+        c.early_stop = _env_bool("WS_EARLY_STOP", c.early_stop)
+
+        c.max_results = _env_int("WS_MAX_RESULTS", c.max_results)
+        c.per_domain_cap = _env_int("WS_PER_DOMAIN_CAP", c.per_domain_cap)
+        c.min_relevance_ratio = _env_float("WS_MIN_RELEVANCE", c.min_relevance_ratio)
+        c.warmup_query = _env_str("WS_WARMUP_QUERY", c.warmup_query)
+
+        c.rate_per_sec = _env_float("WS_RATE_PER_SEC", c.rate_per_sec)
+        c.rate_burst = _env_int("WS_RATE_BURST", c.rate_burst)
+
+        c.cb_failure_threshold = _env_int("WS_CB_THRESHOLD", c.cb_failure_threshold)
+        c.cb_cooldown_sec = _env_int("WS_CB_COOLDOWN", c.cb_cooldown_sec)
+        c.cb_cooldown_max_sec = _env_int("WS_CB_COOLDOWN_MAX", c.cb_cooldown_max_sec)
+        c.cb_ema_alpha = _env_float("WS_CB_EMA_ALPHA", c.cb_ema_alpha)
+
+        c.cache_dir = _env_str("WS_CACHE_DIR", "")
+        c.cache_search_ttl = _env_int("WS_CACHE_SEARCH_TTL", c.cache_search_ttl)
+        c.cache_fetch_ttl = _env_int("WS_CACHE_FETCH_TTL", c.cache_fetch_ttl)
+        c.cache_negative_ttl = _env_int("WS_CACHE_NEG_TTL", c.cache_negative_ttl)
+        c.cache_memory_items = _env_int("WS_CACHE_MEM_ITEMS", c.cache_memory_items)
+        c.cache_db_items = _env_int("WS_CACHE_DB_ITEMS", c.cache_db_items)
+        c.cache_enabled = _env_bool("WS_CACHE_ENABLED", c.cache_enabled)
+
+        c.search_max_bytes = _env_int("WS_SEARCH_MAX_BYTES", c.search_max_bytes)
+        c.fetch_max_bytes = _env_int("WS_FETCH_MAX_BYTES", c.fetch_max_bytes)
+        c.fetch_max_chars = _env_int("WS_FETCH_MAX_CHARS", c.fetch_max_chars)
+        c.fetch_timeout_ms = _env_int("WS_FETCH_TIMEOUT_MS", c.fetch_timeout_ms)
+        c.max_redirects = _env_int("WS_MAX_REDIRECTS", c.max_redirects)
+        c.fetch_concurrency = _env_int("WS_FETCH_CONCURRENCY", c.fetch_concurrency)
+
+        c.proxy = _env_str("WS_PROXY", "") or _env_str("HTTPS_PROXY", "") or _env_str("HTTP_PROXY", "")
+        c.verify_ssl = _env_bool("WS_VERIFY_SSL", c.verify_ssl)
+        c.http2 = _env_bool("WS_HTTP2", c.http2)
+
+        c.allow_private_net = _env_bool("WS_ALLOW_PRIVATE_NET", c.allow_private_net)
+        c.allow_nonstd_port = _env_bool("WS_ALLOW_NONSTD_PORT", c.allow_nonstd_port)
+        c.domain_blocklist = _env_list("WS_DOMAIN_BLOCKLIST", [])
+        c.domain_allowlist = _env_list("WS_DOMAIN_ALLOWLIST", [])
+
+        c.retry_on_transient = _env_int("WS_RETRY", c.retry_on_transient)
+        c.backoff_base = _env_float("WS_BACKOFF_BASE", c.backoff_base)
+
+        return c
+
+    def cache_path(self) -> Path:
+        """缓存目录。未配置时落在系统临时目录，避免污染项目目录。"""
+        if self.cache_dir:
+            p = Path(self.cache_dir)
+        else:
+            import tempfile
+
+            p = Path(tempfile.gettempdir()) / "websearch-cache"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    def active_engines(self) -> list[str]:
+        """启用引擎 = 配置列表 - 显式禁用。"""
+        disabled = {d.lower() for d in self.disable_engines}
+        return [e for e in self.engines if e.lower() not in disabled]
+
+
+# 搜索引擎解析器版本。改过任何引擎的 parse() 之后，必须手动 +1。
+# 否则旧缓存里的旧格式 URL 会一直命中（360 从 so.com/link 跳转壳改成
+# data-mdurl 真实 URL 时就踩过：缓存不过期，错误结果一直复现）。
+PARSER_VERSION = "2026-10-13.2"
+
+CONFIG = Config.from_env()

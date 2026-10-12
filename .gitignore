@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+cache/
+service.log
+*.log
+.tokens
+*.bak-*
+*-out.txt
+.DS_Store

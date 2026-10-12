@@ -1,0 +1,394 @@
+"""传输层 —— httpx 连接池 + 浏览器伪装 + 反爬识别 + SSRF 防护。
+
+三个职责合一的原因：它们都作用在「一次 HTTP 请求」这个粒度上，
+拆开会导致调用方要连着调三个模块，容易漏掉安全检查。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import ipaddress
+import logging
+import random
+import socket
+from typing import Any
+from urllib.parse import urlsplit
+
+import httpx
+
+from .config import Config
+
+log = logging.getLogger("websearch.http")
+
+
+class TooLargeError(Exception):
+    """响应体积超过上限。
+
+    自定义而不是用 httpx 的内置异常：httpx 各版本对「响应过大」的异常名
+    并不统一（早期版本根本没有），自定义一个最稳。
+    """
+
+# ── UA 池：真实浏览器版本号 ──
+# ⚠️ 实测教训（2026-10-13，vivo 国内网络）：
+# 必应对 UA 极其敏感 —— 用 Firefox/Safari/Edge 的 UA 时，它**不返回 403，
+# 而是返回一批和查询完全无关的随机结果**（东京爱情故事、考研、DOVE 论文…）。
+# 这种「投毒式反爬」比直接封禁危险得多：调用方拿到的是看起来正常的成功响应。
+# 解决办法：UA 池按市场份额**加权**，Chrome/Windows 占绝大多数。
+# 纯随机轮换在这里是负优化。
+_CHROME_WIN = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+_CHROME_WIN2 = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
+_CHROME_MAC = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+_FF_WIN = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0"
+_SAFARI = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+           "(KHTML, like Gecko) Version/18.1 Safari/605.1.15")
+_EDGE = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+         "Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0")
+_MOBILE_IOS = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 "
+               "(KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1")
+_MOBILE_ANDROID = ("Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36")
+
+# 加权池：Chrome/Windows 出现 4 次，其余各 1 次
+USER_AGENTS = [
+    _CHROME_WIN, _CHROME_WIN, _CHROME_WIN2, _CHROME_WIN,
+    _CHROME_MAC, _FF_WIN, _SAFARI, _EDGE,
+]
+MOBILE_UA = [_MOBILE_IOS, _MOBILE_ANDROID]
+
+_ACCEPT_LANGS = [
+    "zh-CN,zh;q=0.9,en;q=0.8",
+    "zh-CN,zh;q=0.9",
+    "en-US,en;q=0.9,zh-CN;q=0.8",
+    "zh-TW,zh;q=0.9,en;q=0.8",
+]
+
+# Accept-Encoding 必须按实际解压能力声明。
+# 血泪教训：无脑写 "gzip, deflate, br" 而环境没装 brotli 时，
+# 服务端会愉快地返回 br 压缩的内容，httpx 解不开，
+# 拿到的就是一堆二进制乱码 —— 而且**不会报错**，
+# 表现为「引擎解析出 0 条」，极难定位。
+try:
+    import brotli  # noqa: F401
+
+    ACCEPT_ENCODING = "gzip, deflate, br"
+    HAVE_BROTLI = True
+except ImportError:  # pragma: no cover
+    ACCEPT_ENCODING = "gzip, deflate"
+    HAVE_BROTLI = False
+
+
+def browser_headers(referer: str = "", ua: str = "", mobile: bool = False) -> dict[str, str]:
+    """构造一套完整的浏览器请求头。
+
+    关键：只换 UA 而其它头保持 httpx 默认值 = 一眼假。
+    Sec-Fetch-* 是现代浏览器必带的，缺了会被 CDN 风控直接判为脚本。
+
+    ua 非空时**强制使用**指定 UA —— 引擎层可以据此固定 UA，
+    避免随机轮换踩到「投毒式反爬」。
+    """
+    if not ua:
+        ua = random.choice(MOBILE_UA if mobile else USER_AGENTS)
+    h = {
+        "User-Agent": ua,
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "image/avif,image/webp,image/apng,*/*;q=0.8"
+        ),
+        "Accept-Language": random.choice(_ACCEPT_LANGS),
+        "Accept-Encoding": ACCEPT_ENCODING,
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "DNT": "1",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none" if not referer else "same-origin",
+        "Sec-Fetch-User": "?1",
+        "Connection": "keep-alive",
+    }
+    # Sec-CH-UA 只对 Chromium 系发；Firefox/Safari 发这个反而露馅
+    if "Chrome" in ua and "Edg" not in ua and "Firefox" not in ua:
+        h["Sec-CH-UA"] = '"Chromium";v="131", "Not_A Brand";v="24"'
+        h["Sec-CH-UA-Mobile"] = "?0"
+        h["Sec-CH-UA-Platform"] = '"Windows"'
+    if referer:
+        h["Referer"] = referer
+    return h
+
+
+# ── 反爬识别 ──
+BLOCK_STATUS = {401, 403, 429, 503}
+BLOCK_MARKERS = (
+    "captcha", "recaptcha", "are you a human", "verify you are human",
+    "unusual traffic", "automated access", "access denied", "robot check",
+    "访问验证", "请输入验证码", "安全验证", "检测到异常", "异常流量",
+    "人机验证", "请完成验证", "拒绝访问", "访问过于频繁", "操作过于频繁",
+    "too many requests", "rate limit exceeded", "blocked by",
+    # 反爬页的**资源指纹**：这些是搜狗/百度验证页特有的 js/css 引用，
+    # 页面文案可能没有关键词，但资源名一定在。
+    "antispider", "verify.css", "seccodeInput", "wappass",
+    # 头条的反爬页特征：文案干净，只有 JS 标记，抓不到就永远被误判成解析失败
+    "isCheating", "pc_captcha", "id=\"pc_captcha\"",
+)
+
+
+# 只出现在页面中部的反爬标记（头部扫描抓不到，需要扫全文）
+DEEP_BLOCK_MARKERS = (
+    "ischeating", "pc_captcha", "antispider", "verify.css",
+    "seccodeinput", "wappass", "unusual traffic",
+)
+
+
+def detect_block(status: int, body: str) -> tuple[bool, str]:
+    """判断是否被反爬拦截。
+
+    两段扫描：
+      · 短关键词扫前 4000 字符（绝大多数验证页在头部）；
+      · 反爬特征标记扫全文（头条/搜狗这类把 pc_captcha、isCheating
+        埋在页面中部的，必须全文才抓得到）。
+
+    两段都做是有原因的：只看头部会漏掉中部的验证码容器，
+    只看全文则没必要为「常见关键词」付全文扫描的钱。
+    """
+    if status in BLOCK_STATUS:
+        return True, f"http_{status}"
+    if not body:
+        return False, ""
+    low = body.lower()
+    for m in BLOCK_MARKERS:
+        if m in low[:4000]:
+            return True, f"marker:{m}"
+    for m in DEEP_BLOCK_MARKERS:
+        if m in low:
+            return True, f"deep_marker:{m}"
+    return False, ""
+
+
+# ── SSRF 防护 ──
+
+def _is_disallowed_ip(ip: ipaddress._BaseAddress) -> bool:
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
+def check_url(url: str, cfg: Config) -> tuple[bool, str]:
+    """同步部分的 URL 安全检查（scheme / 端口 / 凭据 / 字面 IP）。
+
+    返回 (allowed, reason)。DNS 解析放异步函数里做，见 assert_url_async。
+    """
+    try:
+        p = urlsplit(url.strip())
+    except ValueError:
+        return False, "bad_url"
+
+    if p.scheme.lower() not in ("http", "https"):
+        return False, f"scheme_not_allowed:{p.scheme}"
+    if p.username or p.password:
+        return False, "credentials_in_url"
+    host = p.hostname
+    if not host:
+        return False, "no_host"
+
+    # 指向本机的**名字**也要拦：只查字面 IP 会漏掉 localhost / *.local /
+    # metadata.google.internal 这类（它们靠 DNS 才解析得出是内网）。
+    hl = host.lower().rstrip(".")
+    if hl == "localhost" or hl.endswith(".localhost") or hl.endswith(".local"):
+        return False, f"private_host:{host}"
+    if hl in ("metadata.google.internal", "metadata", "instance-data"):
+        return False, f"private_host:{host}"
+
+    if cfg.domain_blocklist:
+        h = host.lower()
+        for d in cfg.domain_blocklist:
+            if h == d.lower() or h.endswith("." + d.lower()):
+                return False, f"domain_blocked:{d}"
+    if cfg.domain_allowlist:
+        h = host.lower()
+        ok = any(h == d.lower() or h.endswith("." + d.lower()) for d in cfg.domain_allowlist)
+        if not ok:
+            return False, "domain_not_in_allowlist"
+
+    port = p.port or (443 if p.scheme.lower() == "https" else 80)
+    if not cfg.allow_nonstd_port and port not in (80, 443):
+        return False, f"port_not_allowed:{port}"
+
+    # 字面 IP 直接判定（无需 DNS）
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+    if ip is not None and not cfg.allow_private_net and _is_disallowed_ip(ip):
+        return False, f"private_ip:{host}"
+
+    return True, ""
+
+
+async def assert_url_async(url: str, cfg: Config) -> tuple[bool, str]:
+    """完整校验：同步检查 + DNS 解析后逐 IP 检查。
+
+    DNS 解析是阻塞调用，扔进线程池避免卡住事件循环——
+    这是 asyncio 服务里最常见的性能事故来源。
+    """
+    allowed, reason = check_url(url, cfg)
+    if not allowed:
+        return False, reason
+    if cfg.allow_private_net:
+        return True, ""
+
+    host = urlsplit(url.strip()).hostname or ""
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(
+            host, None, proto=socket.IPPROTO_TCP
+        )
+    except Exception as e:  # 解析失败 = 域名不存在，放行让请求自己失败
+        log.debug("DNS 解析失败 %s: %s", host, e)
+        return True, ""
+
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if _is_disallowed_ip(ip):
+            return False, f"private_ip_resolved:{ip}"
+    return True, ""
+
+
+class HttpPool:
+    """全局共享的 httpx 连接池。
+
+    为什么全局单例：
+      · TCP/TLS 握手在手机 ARM + 4G/WiFi 上的代价很高，复用连接是最大的单点优化
+      · 每引擎建一个 client 会让连接池碎片化，keepalive 命中率暴跌
+    """
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        limits = httpx.Limits(
+            max_connections=cfg.max_concurrency,
+            max_keepalive_connections=min(50, cfg.max_concurrency),
+            keepalive_expiry=30.0,
+        )
+        timeout = httpx.Timeout(
+            connect=cfg.connect_timeout_ms / 1000.0,
+            read=cfg.engine_timeout_ms / 1000.0,
+            write=5.0,
+            pool=2.0,
+        )
+        kwargs: dict[str, Any] = dict(
+            limits=limits,
+            timeout=timeout,
+            follow_redirects=True,
+            max_redirects=cfg.max_redirects,
+            verify=cfg.verify_ssl,
+            headers=browser_headers(),
+        )
+        if cfg.proxy:
+            kwargs["proxy"] = cfg.proxy
+        # HTTP/2 需要 h2 包。没装就降级到 1.1，而不是让整个服务起不来 ——
+        # 搜索结果页走 1.1 完全够用，h2 的收益主要在高并发同域复用。
+        if cfg.http2:
+            try:
+                import h2  # noqa: F401
+
+                kwargs["http2"] = True
+                self.http2_enabled = True
+            except ImportError:
+                log.warning("未安装 h2，HTTP/2 已禁用（pip install 'httpx[http2]' 可启用）")
+                self.http2_enabled = False
+        else:
+            self.http2_enabled = False
+        self._client = httpx.AsyncClient(**kwargs)
+        # 并发闸门：限制同时在飞的请求数，保护 vivo 的 3.7G 内存和有限 fd
+        self._sem = asyncio.Semaphore(cfg.max_concurrency)
+        self.inflight = 0
+        self.total_requests = 0
+
+    @property
+    def client(self) -> httpx.AsyncClient:
+        return self._client
+
+    @property
+    def sem(self) -> asyncio.Semaphore:
+        return self._sem
+
+    async def fetch(
+        self,
+        url: str,
+        *,
+        method: str = "GET",
+        headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
+        data: dict[str, Any] | None = None,
+        timeout_ms: int | None = None,
+        max_bytes: int | None = None,
+        referer: str = "",
+    ) -> httpx.Response:
+        """发起请求，带并发闸门 + 大小上限。
+
+        max_bytes 用流式读取实现：先看 Content-Length，超了直接放弃，
+        避免把 100MB 的页面读进内存（vivo 只有 3.7G）。
+        """
+        cap = max_bytes or self.cfg.fetch_max_bytes
+        async with self._sem:
+            self.inflight += 1
+            self.total_requests += 1
+            try:
+                req_headers = browser_headers(
+                    referer=referer,
+                    ua=(headers or {}).get("User-Agent", ""),
+                    mobile=(headers or {}).get("X-Mobile", "") == "1",
+                )
+                if headers:
+                    req_headers.update(headers)
+                req_headers.pop("X-Mobile", None)
+
+                kw: dict[str, Any] = {}
+                if timeout_ms:
+                    kw["timeout"] = httpx.Timeout(
+                        connect=self.cfg.connect_timeout_ms / 1000.0,
+                        read=timeout_ms / 1000.0,
+                        write=5.0,
+                        pool=2.0,
+                    )
+
+                if method.upper() == "POST":
+                    resp = await self._client.post(
+                        url, headers=req_headers, data=data, params=params, **kw
+                    )
+                else:
+                    resp = await self._client.get(
+                        url, headers=req_headers, params=params, **kw
+                    )
+
+                # 体积预检：Content-Length 超标直接判失败，省掉传输
+                cl = resp.headers.get("content-length")
+                if cl and cl.isdigit() and int(cl) > cap:
+                    resp.close()
+                    raise TooLargeError(f"content-length {cl} > cap {cap}")
+                await resp.aread()
+                if len(resp.content) > cap:
+                    raise TooLargeError(
+                        f"body {len(resp.content)} > cap {cap}")
+                return resp
+            finally:
+                self.inflight -= 1
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+    def stats(self) -> dict[str, Any]:
+        return {
+            "inflight": self.inflight,
+            "total_requests": self.total_requests,
+            "max_concurrency": self.cfg.max_concurrency,
+        }
