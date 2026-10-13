@@ -193,7 +193,13 @@ def build_panel_app(store: Store, manager: ProxyManager, *, require_token: bool 
         resp = RedirectResponse("/", status_code=303)
         resp.set_cookie(
             SESSION_COOKIE, sid,
-            httponly=True, samesite="strict", max_age=SESSION_TTL,
+            # ⚠️ 必须用 lax 而不是 strict：
+            # strict 会让「从外部链接点进来」的首次跳转**不携带 Cookie**，
+            # 而这正是本功能的核心场景 —— 用户从面板日志/聊天里点链接进来。
+            # 用 strict 时表现是：链接能点、303 也正常、但下一跳就掉登录，
+            # 用户看到「刚进去又让我登录」。
+            # lax 仍然阻止跨站 POST（CSRF 防护），对本场景足够安全。
+            httponly=True, samesite="lax", max_age=SESSION_TTL,
         )
         log.info("面板：一键登录成功")
         return resp
@@ -226,7 +232,8 @@ def build_panel_app(store: Store, manager: ProxyManager, *, require_token: bool 
         resp = JSONResponse({"ok": True})
         resp.set_cookie(
             SESSION_COOKIE, sid,
-            httponly=True, samesite="strict", max_age=SESSION_TTL,
+            # 与 /_open 保持一致用 lax（见那里的说明）
+            httponly=True, samesite="lax", max_age=SESSION_TTL,
             # 面板通常跑在 http 上（内网），所以不设 secure，否则 Cookie 发不出去
         )
         return resp

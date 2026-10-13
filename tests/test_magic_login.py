@@ -139,6 +139,38 @@ def test_magic_login_unauthenticated_access_still_blocked(client, store):
     assert client.get("/api/config").status_code == 401
 
 
+def test_cookie_samesite_is_lax_not_strict(client, store):
+    """Cookie 必须 SameSite=lax，不能用 strict。
+
+    这是真 bug 的回归（用户视角测试才抓到）：
+    用 strict 时，**从外部链接点进来的首次跳转不携带 Cookie** ——
+    而「从面板日志/聊天里点链接进面板」正是本功能的核心场景。
+    表现是：链接能点、303 正常、但下一跳就掉登录，
+    用户看到「刚进去又让我登录」，完全不知道哪里错了。
+
+    lax 仍阻止跨站 POST（CSRF 防护），对本场景足够安全。
+    """
+    t = store.issue_login_ticket()
+    r = client.get(f"/_open?t={t}", follow_redirects=False)
+    cookie = r.headers.get("set-cookie", "").lower()
+    assert "samesite=lax" in cookie, f"Cookie 不是 lax：{cookie}"
+    assert "samesite=strict" not in cookie, "strict 会让点链接进来的人掉登录"
+
+
+def test_login_cookie_also_lax(client):
+    """口令登录的 Cookie 也要 lax（与 /_open 保持一致）。"""
+    r = client.post("/api/login", json={"token": FAKE_PANEL_TOKEN})
+    cookie = r.headers.get("set-cookie", "").lower()
+    assert "samesite=lax" in cookie
+
+
+def test_cookie_is_httponly(client, store):
+    """Cookie 必须 HttpOnly（防 XSS 窃取会话）。"""
+    t = store.issue_login_ticket()
+    r = client.get(f"/_open?t={t}", follow_redirects=False)
+    assert "httponly" in r.headers.get("set-cookie", "").lower()
+
+
 # ══════════════════ 访问信息打印 ══════════════════
 
 
