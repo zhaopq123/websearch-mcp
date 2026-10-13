@@ -33,6 +33,16 @@ class RateLimiter:
         self._lock = asyncio.Lock()
         self.waiter_count = 0
 
+    def peek(self) -> float:
+        """当前可用令牌（惰性结算的只读版，不消费、不加锁）。
+
+        令牌桶是惰性填充：_tokens 只在 acquire() 时结算。直接读 _tokens
+        在没人请求时永远是旧值（干涸后看起来永远没恢复）——
+        容量感知判断必须走 peek，否则排队者全部饿死在假枯竭上。
+        """
+        now = time.monotonic()
+        return min(self.burst, self._tokens + (now - self._last) * self.rate)
+
     async def acquire(self, timeout: float | None = None) -> bool:
         """拿一个令牌。返回 False = 超时没拿到（调用方应跳过该引擎，不是死等）。
 
@@ -118,7 +128,10 @@ class Governor:
     def health(self, engine: str) -> Health:
         h = self._h.get(engine)
         if h is None:
-            h = Health(limiter=RateLimiter(self.cfg.rate_per_sec, self.cfg.rate_burst))
+            rate, burst = self.cfg.engine_rates.get(
+                engine, (self.cfg.rate_per_sec, self.cfg.rate_burst)
+            )
+            h = Health(limiter=RateLimiter(rate, burst))
             self._h[engine] = h
         return h
 
@@ -133,6 +146,23 @@ class Governor:
                 return True, "half_open"
             return False, "circuit_open"
         return True, h.state
+
+    def ready_count(self) -> int:
+        """非熔断且桶里有令牌的引擎数。
+
+        用于准入层的容量感知：全枯竭时扇出必然空手而归。
+        _h 为空（刚启动、预热还没建健康档案）时按"全部就绪"处理，
+        避免启动期卡死。
+        """
+        if not self._h:
+            return 99
+        n = 0
+        for h in self._h.values():
+            if h.state == "open":
+                continue
+            if h.limiter.peek() >= 1.0:
+                n += 1
+        return n
 
     async def acquire(self, engine: str, timeout: float) -> tuple[bool, str]:
         """完整放行判定：熔断 + 令牌桶。"""
@@ -154,6 +184,7 @@ class Governor:
         error: str = "",
         blocked: bool = False,
         cancelled: bool = False,
+        soft: bool = False,
     ) -> None:
         """记账。
 
@@ -190,10 +221,16 @@ class Governor:
                 h.open_until = 0.0
         else:
             h.consecutive_ok = 0
-            h.consecutive_fail += 1
             h.last_error = error[:200]
             if blocked:
                 h.total_blocked += 1
+            if soft:
+                # 软失败（如 zero_results）：引擎正常响应但没产出。
+                # 可能是查询本身无匹配，也可能是页面结构变更的前兆。
+                # 只降 EMA 权重（降权优于除名），不喂熔断计数——
+                # 否则小众查询会误杀引擎（实测 weixin 被误熔断 600s）。
+                return
+            h.consecutive_fail += 1
             if h.consecutive_fail >= self.cfg.cb_failure_threshold:
                 self._trip(h, engine)
 

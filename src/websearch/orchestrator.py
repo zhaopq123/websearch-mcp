@@ -38,8 +38,31 @@ class Orchestrator:
         self.searches = 0
         self.fetches = 0
         self.early_stops = 0
+        # 单飞（single-flight）：同一个 key 的并发搜索只做一次真实扇出，
+        # 其余调用共享同一次结果。多会话/多工作区同时问同一个问题时，
+        # 没有它 = N 次搜索 × M 个引擎的重复请求，全撞限流和反爬。
+        self._singleflight: dict[str, asyncio.Task] = {}
+        self.singleflight_hits = 0
+        # fire-and-forget 任务强引用集合：asyncio 对 create_task 只持弱引用，
+        # 不 await 的后台任务会被 GC 中途吞掉（官方文档点名的坑），
+        # 表现为「缓存随机丢、写盘数对不上」。
+        self._bg_tasks: set[asyncio.Task] = set()
+        # 准入控制：限制同时在飞的搜索数。冷缓存高并发实测教训：
+        # 60 个不同 query 同时扇出 240 个引擎请求 → bing 投毒 + 限流跳过
+        # 风暴（95 次跳过）→ 92% 空结果。超出的进 FIFO 队列等待，
+        # 令牌预算从真正出队那一刻才算。
+        self._adm = asyncio.Semaphore(cfg.max_search_concurrency)
+        self.admission_queued = 0
+        self.admission_busy = 0
 
     # ══════════════════════ 单个引擎的执行 ══════════════════════
+
+    def _spawn_bg(self, coro) -> asyncio.Task:
+        """派发后台任务并持强引用，防止被 GC 吞掉。"""
+        t = asyncio.create_task(coro)
+        self._bg_tasks.add(t)
+        t.add_done_callback(self._bg_tasks.discard)
+        return t
 
     async def _run_engine(
         self, engine: Engine, spec: RequestSpec, *, count: int,
@@ -50,7 +73,9 @@ class Orchestrator:
         name = engine.name
 
         # 1) 放行判定（熔断 + 令牌桶）
-        allowed, reason = await self.gov.acquire(name, timeout=1.5)
+        allowed, reason = await self.gov.acquire(
+            name, timeout=self.cfg.rate_acquire_timeout
+        )
         if not allowed:
             return EngineOutcome(
                 engine=name, ok=False, error=f"skipped:{reason}",
@@ -112,8 +137,10 @@ class Orchestrator:
             )
 
         if not results:
-            # 解析出 0 条 = 事实上的失败（多半是页面结构变了或被软拦截）
-            self.gov.record(name, False, elapsed, "zero_results")
+            # 解析出 0 条：软失败。可能是查询无匹配（正常），也可能是
+            # 结构变更/软拦截的前兆。记 EMA 降权但不喂熔断（soft=True），
+            # 真正的软拦截由 detect_block 标记和相关性校验兜住。
+            self.gov.record(name, False, elapsed, "zero_results", soft=True)
             return EngineOutcome(
                 engine=name, ok=False, error="zero_results",
                 error_kind="parse", elapsed_ms=elapsed,
@@ -194,6 +221,14 @@ class Orchestrator:
 
     # ══════════════════════ 搜索主流程 ══════════════════════
 
+    @staticmethod
+    def _post_snippets(res: dict[str, Any], include_snippets: bool) -> dict[str, Any]:
+        """按调用方偏好裁剪摘要。单飞共享的结果对象不能被原地改，
+        每个调用方拿自己的一份浅拷贝。"""
+        if include_snippets or not res.get("results"):
+            return res
+        return {**res, "results": [{**r, "snippet": ""} for r in res["results"]]}
+
     async def search(
         self,
         query: str,
@@ -207,7 +242,141 @@ class Orchestrator:
         include_snippets: bool = True,
         fresh: bool = False,
     ) -> dict[str, Any]:
-        """搜索主入口。
+        """搜索入口（单飞包装）。
+
+        同一个「查询+参数」的并发调用只做一次真实扇出，其余共享结果。
+        只对可缓存查询生效：fresh/time_range 是实时语义，不合并。
+        """
+        cfg = self.cfg
+        realtime = fresh or bool(time_range)
+        coalesce = cfg.singleflight and use_cache and cfg.cache_enabled and not realtime
+        if not coalesce:
+            res = await self._search_impl(
+                query, max_results=max_results, engine_names=engine_names,
+                lang=lang, region=region, time_range=time_range,
+                use_cache=use_cache, include_snippets=include_snippets,
+                fresh=fresh,
+            )
+            return self._post_snippets(res, include_snippets)
+
+        key = sha1_key(
+            "sf", PARSER_VERSION, query, lang, region, time_range,
+            str(max(1, min(max_results or cfg.max_results, 50))),
+            ",".join(sorted(engine_names)) if engine_names else "",
+        )
+        task = self._singleflight.get(key)
+        if task is None or task.done():
+            task = asyncio.create_task(self._search_impl(
+                query, max_results=max_results, engine_names=engine_names,
+                lang=lang, region=region, time_range=time_range,
+                use_cache=use_cache, include_snippets=True, fresh=fresh,
+            ))
+            self._singleflight[key] = task
+        else:
+            self.singleflight_hits += 1
+        try:
+            # shield：等待者被取消（客户端断开/上层早停）不影响在飞的那次搜索
+            res = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # 在飞的共享任务失败：清掉条目自己重做一次，失败不传染给等待者
+            if self._singleflight.get(key) is task:
+                self._singleflight.pop(key, None)
+            res = await self._search_impl(
+                query, max_results=max_results, engine_names=engine_names,
+                lang=lang, region=region, time_range=time_range,
+                use_cache=use_cache, include_snippets=True, fresh=fresh,
+            )
+        finally:
+            if self._singleflight.get(key) is task and task.done():
+                self._singleflight.pop(key, None)
+        return self._post_snippets(res, include_snippets)
+
+    async def _search_impl(
+        self,
+        query: str,
+        *,
+        max_results: int | None = None,
+        engine_names: list[str] | None = None,
+        lang: str = "",
+        region: str = "",
+        time_range: str = "",
+        use_cache: bool = True,
+        include_snippets: bool = True,
+        fresh: bool = False,
+    ) -> dict[str, Any]:
+        """准入控制包装：限制同时在飞的搜索数（FIFO），防扇出风暴。"""
+        def _busy(reason: str) -> dict[str, Any]:
+            return {
+                "query": query,
+                "results": [],
+                "meta": {
+                    "elapsed_ms": 0,
+                    "fetched_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "realtime": bool(time_range) or fresh,
+                    "time_range": time_range or "",
+                    "engines": {"attempted": [], "succeeded": [], "failed": [],
+                                "blocked": [], "skipped": []},
+                    "error": "server_busy",
+                    "message": reason,
+                },
+            }
+
+        queued = self._adm.locked()
+        if queued:
+            self.admission_queued += 1
+        try:
+            await asyncio.wait_for(
+                self._adm.acquire(), timeout=self.cfg.search_queue_timeout
+            )
+        except asyncio.TimeoutError:
+            self.admission_busy += 1
+            log.warning("搜索排队超时（>%ss）：query=%r", self.cfg.search_queue_timeout, query[:60])
+            return _busy("搜索排队超时（服务器忙），请稍后重试或减少并发")
+        # 容量等待：主力引擎令牌全枯时扇出只会得到空结果——
+        # 排队等令牌恢复（0.25s 粒度）。干等 3s 后放宽到"至少 1 个
+        # 引擎可用"：剩一个 workhorse 也要串行服务（降级优于拒绝），
+        # 令牌等待会自然把并发压到 1/s。到点仍无任何引擎可用才
+        # 诚实返回 server_busy。
+        cap_deadline = time.monotonic() + self.cfg.search_queue_timeout
+        relax_at = time.monotonic() + 3.0
+        while True:
+            n_ready = self.gov.ready_count()
+            if n_ready >= self.cfg.min_ready_engines:
+                break
+            if n_ready >= 1 and time.monotonic() >= relax_at:
+                break
+            if time.monotonic() >= cap_deadline:
+                self.admission_busy += 1
+                self._adm.release()
+                log.warning("引擎容量枯竭排队超时：query=%r", query[:60])
+                return _busy("搜索引擎容量暂枯竭（限流恢复中），请稍后重试")
+            await asyncio.sleep(0.25)
+        try:
+            return await self._search_impl_gate(
+                query, max_results=max_results, engine_names=engine_names,
+                lang=lang, region=region, time_range=time_range,
+                use_cache=use_cache, include_snippets=include_snippets,
+                fresh=fresh,
+            )
+        finally:
+            self._adm.release()
+
+    async def _search_impl_gate(
+        self,
+        query: str,
+        *,
+        max_results: int | None = None,
+        engine_names: list[str] | None = None,
+        lang: str = "",
+        region: str = "",
+        time_range: str = "",
+        use_cache: bool = True,
+        include_snippets: bool = True,
+        fresh: bool = False,
+    ) -> dict[str, Any]:
+        """搜索主实现（扇出+早停+融合）。单飞包装见 search()。
 
         实时性策略（这是搜索服务最容易做错的地方）：
           · `fresh=True` → 完全不走缓存，也不写缓存，**保证实时**；
@@ -263,10 +432,17 @@ class Orchestrator:
         cached_outcomes: list[EngineOutcome] = []
         todo: list[Engine] = []
         if use_cache and cfg.cache_enabled:
-            for e in all_engines:
-                k = sha1_key("search", PARSER_VERSION, e.name, query, lang, region, time_range, str(limit))
-                cache_keys[e.name] = k
-                got = await self.cache.get(k)
+            # 并行查缓存：L2 每次查询要走一次线程池往返，13 个引擎串行
+            # ≈ 13 次线程唤醒，gather 只付最慢那次的钱。
+            cache_keys = {
+                e.name: sha1_key("search", PARSER_VERSION, e.name, query, lang,
+                                 region, time_range, str(limit))
+                for e in all_engines
+            }
+            got_list = await asyncio.gather(
+                *[self.cache.get(cache_keys[e.name]) for e in all_engines]
+            )
+            for e, got in zip(all_engines, got_list):
                 if got is not None:
                     cached_outcomes.append(
                         EngineOutcome(
@@ -339,7 +515,7 @@ class Orchestrator:
                         # 写缓存（异步落盘，不阻塞）
                         ck = cache_keys.get(name)
                         if ck and self.cache.enabled:
-                            asyncio.create_task(
+                            self._spawn_bg(
                                 self.cache.put(
                                     ck, [r.to_dict() for r in o.results],
                                     cfg.cache_search_ttl, "search",
@@ -527,7 +703,7 @@ class Orchestrator:
             fr.error = "empty_extraction"
             fr.error_kind = "parse"
         if use_cache and cfg.cache_enabled and fr.ok:
-            asyncio.create_task(self.cache.put(key, fr.to_dict(), cfg.cache_fetch_ttl, "fetch"))
+            self._spawn_bg(self.cache.put(key, fr.to_dict(), cfg.cache_fetch_ttl, "fetch"))
         return fr
 
     async def fetch_many(

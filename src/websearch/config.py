@@ -73,6 +73,20 @@ DEFAULT_ENGINES = [
 # 可选引擎（默认不开，需要外部 SearXNG 实例）
 OPTIONAL_ENGINES = ["searx"]
 
+# per-engine 限速覆盖（rate, burst）—— 一视同仁的限速是错的：
+#   bing / bing_intl  投毒式反爬的触发器就是「短时间多请求」，压 burst 保平安
+#   so360 / weixin    实测反爬最弱、最耐操，加 burst（瞬时容量）不加 rate
+#                     （持续 rate 仍保持 1.0/s 这个 30s 长跑零熔断的校准值）
+# 格式："engine:rate:burst,engine:rate:burst"，可用 WS_ENGINE_RATES 覆盖。
+DEFAULT_ENGINE_RATES: dict[str, tuple[float, int]] = {
+    "bing": (0.7, 3),
+    "bing_intl": (0.7, 3),
+    "so360": (1.0, 16),
+    "so360_m": (1.0, 16),
+    "weixin": (1.0, 12),
+    "baidu": (0.8, 6),
+}
+
 
 @dataclass
 class Config:
@@ -100,7 +114,25 @@ class Config:
     connect_timeout_ms: int = 2_500
 
     # ── 并发 ──
-    max_concurrency: int = 32        # 全局在飞请求上限
+    max_concurrency: int = 48        # 全局在飞请求上限（实测 fd 32768/内存 2.5G 可用；
+                                      # 早停和限流会让槽位快速释放，48 不会堆积）
+    # 单飞合并：同 query+参数的并发搜索只扇出一次（多会话/多工作区场景的
+    # 核心优化）。只对可缓存查询生效；fresh/time_range 实时语义不合并。
+    singleflight: bool = True
+    # 准入控制：同时在飞的搜索数上限。超出的进 FIFO 队列等待，
+    # 预算从真正出队那一刻才算。没有它，60 个冷 query 并发会同时扇出
+    # 240 个引擎请求 → 触发投毒 + 限流跳过风暴 → 大面积空结果。
+    max_search_concurrency: int = 14
+    # 容量感知：至少这么多个非熔断引擎的令牌桶里有令牌才放行扇出。
+    # 全枯竭时扇出 = 白白等 3s 令牌然后空手而归，不如排队等恢复。
+    min_ready_engines: int = 2
+    search_queue_timeout: float = 12.0   # 排队超过这么久返回 server_busy（=总预算）
+    engine_rates: dict[str, tuple[float, int]] = field(
+        default_factory=lambda: dict(DEFAULT_ENGINE_RATES)
+    )
+    # 令牌桶等待超时（秒）。1.5s 太短：高并发下大量请求等不到令牌被跳过，
+    # 宁可多等两秒换个真实结果，也不要把搜索变成空返回。
+    rate_acquire_timeout: float = 4.0
     quorum: int = 2                  # 早停所需的最小成功源数
     quorum_results: int = 12         # 早停所需的去重结果数（太低会砍掉更全的结果）
     early_stop: bool = True
@@ -190,6 +222,21 @@ class Config:
         c.connect_timeout_ms = min(c.connect_timeout_ms, c.engine_timeout_ms)
 
         c.max_concurrency = _env_int("WS_MAX_CONCURRENCY", c.max_concurrency)
+        c.singleflight = _env_bool("WS_SINGLEFLIGHT", c.singleflight)
+        c.max_search_concurrency = _env_int("WS_MAX_SEARCH_CONCURRENCY", c.max_search_concurrency)
+        c.min_ready_engines = _env_int("WS_MIN_READY_ENGINES", c.min_ready_engines)
+        c.search_queue_timeout = _env_float("WS_SEARCH_QUEUE_TIMEOUT", c.search_queue_timeout)
+        c.rate_acquire_timeout = _env_float("WS_RATE_ACQUIRE_TIMEOUT", c.rate_acquire_timeout)
+        # WS_ENGINE_RATES="bing:0.7:3,so360:1.0:8" 覆盖单引擎限速
+        rates: dict[str, tuple[float, int]] = dict(DEFAULT_ENGINE_RATES)
+        for item in _env_list("WS_ENGINE_RATES", []):
+            parts = item.split(":")
+            if len(parts) == 3:
+                try:
+                    rates[parts[0].strip()] = (float(parts[1]), int(parts[2]))
+                except ValueError:
+                    pass
+        c.engine_rates = rates
         c.quorum = _env_int("WS_QUORUM", c.quorum)
         c.quorum_results = _env_int("WS_QUORUM_RESULTS", c.quorum_results)
         c.early_stop = _env_bool("WS_EARLY_STOP", c.early_stop)

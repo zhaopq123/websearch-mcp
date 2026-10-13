@@ -435,27 +435,30 @@ class LifespanWrapper:
         await self.app(scope, receive, send)
 
 
-from starlette.middleware.base import BaseHTTPMiddleware
+class WarmupMiddleware:
+    """预热的一次性兜底触发（纯 ASGI，不走 BaseHTTPMiddleware）。
 
-
-class WarmupMiddleware(BaseHTTPMiddleware):
-    """预热的一次性兜底触发。
+    为什么换成纯 ASGI：BaseHTTPMiddleware 会把每个请求包进 anyio 任务，
+    实测每请求多 0.5-1ms 和一次任务调度；这个中间件在预热完成后每次请求
+    只做一个属性判断，不值得付包装的钱。鉴权中间件同理。
 
     lifespan 在这台机器上（Starlette 1.7.0 + uvicorn）表现不稳，
     出现过 lifespan 完全不执行、预热没跑的情况。这里不依赖 lifespan：
     第一个请求到达时如果还没预热过，就异步触发一次。
-
-    用 create_task 而不是 await —— 预热要几秒，不能让第一个请求等它。
     """
 
-    async def dispatch(self, request, call_next):
-        svc = get_service()
-        if svc.warmup_info is None and not getattr(svc, "_warmup_started", False):
-            svc._warmup_started = True
-            on = os.environ.get("WS_WARMUP", "1").strip().lower() not in (
-                "0", "false", "no")
-            asyncio.create_task(svc.warmup(enabled=on))
-        return await call_next(request)
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            svc = get_service()
+            if svc.warmup_info is None and not getattr(svc, "_warmup_started", False):
+                svc._warmup_started = True
+                on = os.environ.get("WS_WARMUP", "1").strip().lower() not in (
+                    "0", "false", "no")
+                asyncio.create_task(svc.warmup(enabled=on))
+        await self.app(scope, receive, send)
 
 
 async def _warmup_now() -> None:
@@ -471,7 +474,6 @@ def build_asgi(cfg: Config):
     from contextlib import asynccontextmanager
 
     from starlette.applications import Starlette
-    from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.responses import JSONResponse
     from starlette.routing import Mount, Route
 
@@ -506,16 +508,29 @@ def build_asgi(cfg: Config):
         info = await get_service().warmup(enabled=True)
         return JSONResponse(info or {"error": "warmup disabled"})
 
-    class AuthMiddleware(BaseHTTPMiddleware):
-        async def dispatch(self, request, call_next):
-            if TOKEN_AUTH is not None:
-                ok, reason = TOKEN_AUTH.check(dict(request.headers), request.url.path)
+    class AuthMiddleware:
+        """Bearer 鉴权（纯 ASGI）。401 短路响应不进路由栈。"""
+
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] == "http" and TOKEN_AUTH is not None:
+                headers = {
+                    k.decode("latin-1"): v.decode("latin-1")
+                    for k, v in (scope.get("headers") or [])
+                }
+                ok, reason = TOKEN_AUTH.check(headers, scope.get("path", ""))
                 if not ok:
-                    return JSONResponse(
+                    resp = JSONResponse(
                         {"error": "unauthorized", "detail": reason}, status_code=401
                     )
-            return await call_next(request)
+                    await resp(scope, receive, send)
+                    return
+            await self.app(scope, receive, send)
 
+    # Starlette 的 middleware= 参数要求 (cls, args, kwargs) 三元组——
+    # 传裸类会在 build_middleware_stack 时 TypeError（这个坑踩过两次了）。
     middleware = []
     if TOKEN_AUTH and TOKEN_AUTH.required:
         middleware.append((AuthMiddleware, {}, {}))
@@ -574,9 +589,27 @@ def main() -> None:
     print(f" 鉴权:     {'已启用（Bearer）' if TOKEN_AUTH.required else '未启用'}")
     print(f" 预算:     总 {cfg.total_budget_ms}ms / 单引擎 {cfg.engine_timeout_ms}ms")
     print("═" * 60)
+    # uvloop / httptools：装了才用（manylinux wheel 在安卓 proot 上
+    # 有装得上但 import 失败的可能，运行时守卫，缺了就老实回 auto）。
+    loop_kind = "auto"
+    http_kind = "auto"
+    try:
+        import uvloop  # noqa: F401
+
+        loop_kind = "uvloop"
+    except ImportError:
+        pass
+    try:
+        import httptools  # noqa: F401
+
+        http_kind = "httptools"
+    except ImportError:
+        pass
+    print(f" 事件循环: {loop_kind}  HTTP 解析: {http_kind}")
     uvicorn.run(
         app, host=cfg.host, port=cfg.port,
         log_level=cfg.log_level, timeout_graceful_shutdown=5,
+        loop=loop_kind, http=http_kind,
     )
 
 
