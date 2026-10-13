@@ -140,13 +140,17 @@ def test_store_sees_external_write(cfg):
     于是「工具说链接有效、面板说票据无效」——用户点开链接进不去。
 
     修法是按 mtime 自动重载。这条测试钉住它。
+
+    注意断言方式：走**公开读接口**（get / consume_login_ticket），
+    而不是直接读 _cache —— 后者是内部实现，且不触发重载检查。
+    真实面板代码也是走公开接口的。
     """
     import time as _t
 
     panel_store = Store(cfg)          # 模拟面板进程持有的实例
     panel_store.set_many({"WS_PANEL_TOKEN": "panel-token-for-test-only-0123456789"})
     # 确认此刻没有票据
-    assert panel_store._cache.get("WS_LOGIN_TICKET_HASH", "") == ""
+    assert panel_store.get("WS_LOGIN_TICKET_HASH", "") == ""
 
     # 另一个进程写票据（直接改文件，不经过 panel_store）
     r = run_ticket(cfg)
@@ -155,7 +159,7 @@ def test_store_sees_external_write(cfg):
     # 让节流窗口过期（STAT_INTERVAL = 0.5s）
     _t.sleep(0.6)
     # panel_store 必须能看到新票据
-    assert panel_store._cache.get("WS_LOGIN_TICKET_HASH", "") != "", \
+    assert panel_store.get("WS_LOGIN_TICKET_HASH", "") != "", \
         "Store 没感知到外部写入 —— 跨进程缓存不一致"
 
 
