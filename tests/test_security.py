@@ -164,9 +164,10 @@ async def test_check_redirect_blocks_private_target():
     from websearch.http_pool import check_redirect_sync
 
     c = cfg()
+    # 字面 IP 在 check_url 阶段就被拦，reason 是 private_ip:...
     ok, reason = await check_redirect_sync("http://169.254.169.254/", c)
     assert not ok, "元数据地址必须拒"
-    assert "redirect_private_ip" in reason
+    assert "private_ip" in reason
 
     ok, _ = await check_redirect_sync("http://127.0.0.1:8080/", c)
     assert not ok, "loopback 必须拒"
