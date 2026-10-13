@@ -161,11 +161,29 @@ bash /opt/websearch-mcp/scripts/ctl.sh {status|restart|logs|health|warmup|token|
 
 ```bash
 cd /opt/websearch-mcp
-PYTHONPATH=src ./venv/bin/python -m pytest tests/ -m 'not online'   # 离线 76 用例
-./venv/bin/python scripts/mcp_e2e.py      # MCP 协议 E2E（initialize→tools/list→tools/call→实时→SSRF）
+PYTHONPATH=src ./venv/bin/python -m pytest tests/ -m 'not online'   # 离线用例（含 schema 兼容性回归）
+./venv/bin/python scripts/mcp_e2e.py            # MCP 协议 E2E（initialize→tools/list→tools/call→实时→SSRF）
+PYTHONPATH=src ./venv/bin/python scripts/dump_tool_schema.py   # 打印 tools/list 全量 schema（排查兼容性用）
+PYTHONPATH=src ./venv/bin/python scripts/user_perspective_check.py  # 用户视角协议验证（9 项）
 ./venv/bin/python scripts/diag/smoke.py   # 冒烟
 ./venv/bin/python scripts/stress.py       # 压测
 ```
+
+**工具 schema 红线（改工具前必读）**：严格模型（Step-5-Preview /
+GLM-5.3-Flash / Deepseek-V4.1-Flash）逐字校验工具定义，两个构造会让
+整个请求在进模型前被拒（11129 / 11133，inputTokens: 0，表现是
+「工具一多就全线崩」）：
+
+1. **不许有 outputSchema** —— 所有 `@mcp.tool()` 必须带
+   `output_schema=None`（用 `_MCP` 字典展开）。FastMCP 默认会给返回
+   dict 的工具自动生成一个 `{"additionalProperties": true, ...}` 的
+   outputSchema，纯负担；
+2. **inputSchema 不许有 anyOf** —— 参数要支持多形态（如 `urls` 收
+   字符串/数组），类型写 `Any`，别写 `str | list[str]`（后者会生成
+   anyOf）。运行时解析函数（`_parse_url_list` / `_parse_query_list`）
+   本来就吃三种形态。
+
+`tests/test_tool_schema.py` 把这两条锁死了，破坏它 CI 直接红。
 
 ## 已调好的参数（别乱动）
 

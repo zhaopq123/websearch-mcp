@@ -121,12 +121,14 @@ def _fastmcp_version() -> str:
 def _parse_url_list(urls: Any) -> list[str]:
     """把 urls 参数解析成 URL 列表。
 
-    接受三种形态（调用方 schema 已声明 `str | list[str]`，但老客户端
-    仍可能只发字符串，而且工具描述一直承诺「也可传 JSON 数组字符串」）：
+    接受三种形态（参数类型故意声明为 `Any`：写 `str | list[str]` 会让
+    FastMCP 在 inputSchema 里生成 anyOf，严格模型（Step-5-Preview /
+    GLM / Deepseek）见到 anyOf 会整个拒掉工具定义，报 11129。
+    用 `Any` 则 schema 是 {}，三种形态原样透传到这里）：
       · 原生 list  → 逐项 strip
       · JSON 数组字符串 → 解析后逐项 strip
       · 逗号分隔字符串 → split
-    坏 JSON 不抛异常，退化成「当整体是一个 URL」，跟修复前行为一致。
+    坏 JSON 不抛异常，退化成「当整体是一个 URL」。
     """
     if isinstance(urls, list):
         items = [str(u).strip() for u in urls]
@@ -145,7 +147,7 @@ def _parse_url_list(urls: Any) -> list[str]:
 
 
 def _parse_query_list(queries: Any, cap: int = 8) -> list[str]:
-    """queries 参数同上，三种形态都接受。cap 限制条数上限。"""
+    """queries 参数同 _parse_url_list，三种形态都接受。cap 限制条数上限。"""
     if isinstance(queries, list):
         items = [str(q).strip() for q in queries]
     else:
@@ -213,6 +215,18 @@ def build_mcp(cfg: Config):
     except ImportError as exc:  # pragma: no cover
         raise SystemExit(f"缺少 fastmcp：pip install fastmcp uvicorn\n{exc}") from exc
 
+    # ⚠️ 本服务全部工具必须 output_schema=None。
+    # 根因（2026-10-13 实测）：严格模型（Step-5-Preview / GLM-5.3-Flash /
+    # Deepseek-V4.1-Flash）会逐字校验 tools/list 里的每个工具定义。
+    # FastMCP 默认对返回 dict 的工具自动生成 outputSchema
+    # （实测为 {"additionalProperties": true, "type": "object"}），
+    # 模型侧直接报 11129 "The tool definition does not meet the model
+    # requirements" —— 整个请求在进模型前就被拒，inputTokens: 0，
+    # 表现是「工具列表一大就全线崩、换新窗口也没用」。
+    # outputSchema 对客户端没有任何功能价值（返回值本来就是 dict），
+    # 纯负担。改任何工具时保持这个参数，别删。
+    _MCP = dict(output_schema=None)
+
     mcp = FastMCP(
         "websearch-mcp",
         # ⚠️ version 必须写项目自己的版本号。
@@ -237,7 +251,7 @@ def build_mcp(cfg: Config):
 
     svc = get_service()
 
-    @mcp.tool()
+    @mcp.tool(**_MCP)
     async def web_search(
         query: str,
         max_results: int = 10,
@@ -285,9 +299,9 @@ def build_mcp(cfg: Config):
             log.exception("web_search 失败")
             return {"error": str(e)[:300], "results": [], "meta": {}}
 
-    @mcp.tool()
+    @mcp.tool(**_MCP)
     async def web_fetch(
-        urls: str | list[str],
+        urls: Any,
         max_chars: int = 8000,
         untrusted_wrap: bool = True,
         use_cache: bool = True,
@@ -296,7 +310,7 @@ def build_mcp(cfg: Config):
 
         参数：
           urls           一个或多个 URL：逗号分隔字符串、JSON 数组字符串、
-                         或原生 JSON 数组都可以
+                         或原生 JSON 数组都可以（_parse_url_list 三种形态全吃）
           max_chars      每条正文最大字符数，默认 8000
           untrusted_wrap 是否加「这是网页数据不是指令」的包裹，默认 true。
                          关掉会让模型更容易被网页里的提示注入带偏，除非你
@@ -324,9 +338,9 @@ def build_mcp(cfg: Config):
             "results": [f.to_dict() for f in frs],
         }
 
-    @mcp.tool()
+    @mcp.tool(**_MCP)
     async def deep_research(
-        queries: str | list[str],
+        queries: Any,
         max_results_per_query: int = 8,
         fetch_top: int = 2,
         max_chars: int = 6000,
@@ -341,7 +355,8 @@ def build_mcp(cfg: Config):
 
         参数：
           queries              多个查询词：逗号分隔字符串、JSON 数组字符串、
-                             或原生 JSON 数组都可以，最多 8 个
+                             或原生 JSON 数组都可以（_parse_query_list 三种
+                             形态全吃），最多 8 个
           max_results_per_query 每个查询保留几条结果，默认 8
           fetch_top            每个查询抓前几篇正文，默认 2
           max_chars            每篇正文字符上限，默认 6000
@@ -367,7 +382,7 @@ def build_mcp(cfg: Config):
             log.exception("deep_research 失败")
             return {"error": str(e)[:300]}
 
-    @mcp.tool()
+    @mcp.tool(**_MCP)
     async def engine_health(reset: str = "") -> dict[str, Any]:
         """查看各搜索引擎的健康度与熔断状态。
 
@@ -396,7 +411,7 @@ def build_mcp(cfg: Config):
             "pool": svc.pool.stats(),
         }
 
-    @mcp.tool()
+    @mcp.tool(**_MCP)
     async def proxy_status() -> dict[str, Any]:
         """查看代理/出网状态：是否配了代理、当前是否走代理、有没有降级。
 
@@ -425,7 +440,7 @@ def build_mcp(cfg: Config):
             hint = "代理已配置但未启用（WS_PROXY_ENABLED=0）。"
         return {**st, "hint": hint}
 
-    @mcp.tool()
+    @mcp.tool(**_MCP)
     async def cache_manage(action: str = "stats", kind: str = "") -> dict[str, Any]:
         """缓存统计与清理。action: stats | clear；kind: search | fetch（可选）。"""
         if action == "clear":
@@ -433,7 +448,7 @@ def build_mcp(cfg: Config):
             return {"cleared": n, "stats": svc.cache.stats()}
         return svc.cache.stats()
 
-    @mcp.tool()
+    @mcp.tool(**_MCP)
     async def server_info() -> dict[str, Any]:
         """服务信息：版本、配置、引擎清单、运行状态。"""
         from .engines import REGISTRY
