@@ -460,18 +460,231 @@ def parse_node(uri: str, idx: int = 0) -> Node:
     return Node(tag=tag, protocol=ob["type"], outbound=ob, raw=uri)
 
 
+# ══════════════════════ Clash YAML 解析 ══════════════════════
+#
+# 为什么需要：免费节点源里 clash.yaml 与 v2ray.txt 各占半壁（如
+# manifest.dpdns.org 两种都提供）。只支持 URI 订阅会丢掉一半来源。
+# 字段映射按 clash → sing-box 的官方约定，与上面 URI 解析保持同一
+# 目标结构（同样的 tls/transport 形状）。
+
+_CLASH_TYPE_MAP = {
+    "ss": "shadowsocks",
+    "trojan": "trojan",
+    "vmess": "vmess",
+    "vless": "vless",
+    "hysteria2": "hysteria2",
+    "hy2": "hysteria2",
+}
+
+
+def _clash_transport(p: dict[str, Any]) -> dict[str, Any] | None:
+    """clash 的 network + *-opts → sing-box transport。无则返回 None。"""
+    net = str(p.get("network") or "").lower()
+    if net == "ws":
+        opts = p.get("ws-opts") or {}
+        ws: dict[str, Any] = {"type": "ws", "path": str(opts.get("path") or "/")}
+        headers = opts.get("headers") or {}
+        if headers:
+            ws["headers"] = {str(k): str(v) for k, v in headers.items()}
+        return ws
+    if net == "grpc":
+        opts = p.get("grpc-opts") or {}
+        return {"type": "grpc",
+                "service_name": str(opts.get("grpc-service-name") or "")}
+    if net in ("h2", "http"):
+        opts = p.get("h2-opts") or {}
+        hosts = opts.get("host")
+        if isinstance(hosts, list):
+            return {"type": "http", "host": [str(h) for h in hosts]}
+        return {"type": "http", "host": [str(hosts)] if hosts else []}
+    return None
+
+
+def _clash_tls(p: dict[str, Any], *, default_sni: str = "",
+               force: bool = False) -> dict[str, Any] | None:
+    """clash 的 tls/servername/skip-cert-verify/reality-opts → sing-box tls。
+
+    force=True 用于 trojan（协议本身即全 TLS，即使没写 tls: true）。
+    """
+    enabled = bool(p.get("tls")) or force
+    if not enabled:
+        return None
+    sni = str(p.get("servername") or p.get("sni") or default_sni or "")
+    tls: dict[str, Any] = {
+        "enabled": True,
+        "server_name": sni,
+        "insecure": bool(p.get("skip-cert-verify")),
+    }
+    alpn = p.get("alpn")
+    if isinstance(alpn, list) and alpn:
+        tls["alpn"] = [str(a) for a in alpn]
+    fp = p.get("client-fingerprint")
+    if fp:
+        tls["utls"] = {"enabled": True, "fingerprint": str(fp)}
+    ro = p.get("reality-opts") or {}
+    if ro.get("public-key"):
+        tls["reality"] = {
+            "enabled": True,
+            "public_key": str(ro["public-key"]),
+            "short_id": str(ro.get("short-id") or ""),
+        }
+    return tls
+
+
+def _clash_proxy_to_outbound(p: dict[str, Any], idx: int) -> dict[str, Any]:
+    """单个 clash proxy 条目 → sing-box outbound。
+
+    异常消息**不含**任何凭据值（只带类型与字段名）。
+    """
+    if not isinstance(p, dict):
+        raise NodeParseError("条目不是对象")
+    ctype = str(p.get("type") or "").lower()
+    stype = _CLASH_TYPE_MAP.get(ctype)
+    if not stype:
+        raise NodeParseError(f"不支持的 clash 类型 {ctype or '?'}")
+    server = str(p.get("server") or "").strip()
+    try:
+        port = int(p.get("port") or 0)
+    except (TypeError, ValueError):
+        raise NodeParseError("port 不是数字") from None
+    if not server or not port:
+        raise NodeParseError("缺 server 或 port")
+
+    ob: dict[str, Any] = {"type": stype, "server": server, "server_port": port}
+
+    if stype == "shadowsocks":
+        method = str(p.get("cipher") or "")
+        if not method or "password" not in p:
+            raise NodeParseError("ss 缺 cipher 或 password")
+        ob["method"] = method
+        ob["password"] = str(p["password"])
+        plugin = p.get("plugin")
+        if plugin:
+            ob["plugin"] = str(plugin)
+            opts = p.get("plugin-opts") or {}
+            if isinstance(opts, dict) and opts:
+                ob["plugin_opts"] = ";".join(f"{k}={v}" for k, v in opts.items())
+
+    elif stype == "trojan":
+        if "password" not in p:
+            raise NodeParseError("trojan 缺 password")
+        ob["password"] = str(p["password"])
+        tls = _clash_tls(p, default_sni=server, force=True)
+        if tls:
+            ob["tls"] = tls
+
+    elif stype == "vmess":
+        if not p.get("uuid"):
+            raise NodeParseError("vmess 缺 uuid")
+        ob["uuid"] = str(p["uuid"])
+        ob["security"] = str(p.get("cipher") or "auto")
+        try:
+            ob["alter_id"] = int(p.get("alterId") or 0)
+        except (TypeError, ValueError):
+            ob["alter_id"] = 0
+        tls = _clash_tls(p, default_sni=server)
+        if tls:
+            ob["tls"] = tls
+
+    elif stype == "vless":
+        if not p.get("uuid"):
+            raise NodeParseError("vless 缺 uuid")
+        ob["uuid"] = str(p["uuid"])
+        if p.get("flow"):
+            ob["flow"] = str(p["flow"])
+        tls = _clash_tls(p, default_sni=server)
+        if tls:
+            ob["tls"] = tls
+
+    elif stype == "hysteria2":
+        if "password" not in p:
+            raise NodeParseError("hysteria2 缺 password")
+        ob["password"] = str(p["password"])
+        if p.get("obfs"):
+            ob["obfs"] = {"type": str(p["obfs"]),
+                          "password": str(p.get("obfs-password") or "")}
+        tls = _clash_tls(p, default_sni=server, force=True)
+        if tls:
+            ob["tls"] = tls
+
+    transport = _clash_transport(p)
+    if transport:
+        ob["transport"] = transport
+    return ob
+
+
+def parse_clash_yaml(text: str) -> ParseReport:
+    """解析 Clash/Mihomo 的 yaml 配置（取 proxies 段）。
+
+    需要 pyyaml。没装则抛 SubscriptionError（明确告诉调用方装什么），
+    不静默返回空。
+    """
+    try:
+        import yaml
+    except ImportError as e:
+        raise SubscriptionError(
+            "解析 clash yaml 需要 pyyaml：pip install pyyaml") from e
+
+    try:
+        doc = yaml.safe_load(text)
+    except Exception as e:
+        raise SubscriptionError(f"yaml 解析失败: {type(e).__name__}") from e
+    if not isinstance(doc, dict):
+        raise SubscriptionError("clash 配置不是对象")
+    proxies = doc.get("proxies")
+    if not isinstance(proxies, list):
+        raise SubscriptionError("clash 配置里没有 proxies 列表")
+
+    report = ParseReport()
+    for i, p in enumerate(proxies):
+        try:
+            ob = _clash_proxy_to_outbound(p, i)
+        except NodeParseError as e:
+            report.skipped.append({
+                "index": i,
+                "scheme": str((p or {}).get("type") or "?") if isinstance(p, dict) else "?",
+                "reason": str(e),
+            })
+            continue
+        name = str((p or {}).get("name") or f"clash-{i}")
+        report.nodes.append(Node(tag=name, protocol=ob["type"], outbound=ob))
+    if not report.nodes and not report.skipped:
+        raise SubscriptionError("clash 配置的 proxies 是空的")
+    return report
+
+
+def looks_like_clash_yaml(text: str) -> bool:
+    """粗判文本是否为 clash yaml 配置。"""
+    head = (text or "")[:4000]
+    if "proxies:" not in head:
+        return False
+    # 排除 HTML 与纯 URI 列表
+    if head.lstrip().lower().startswith(("<!doctype", "<html")):
+        return False
+    return True
+
+
+# ══════════════════════ 订阅正文解析 ══════════════════════
+
+
 def parse_subscription_text(text: str) -> ParseReport:
     """解析订阅正文。
 
-    两种常见形态：
+    三种常见形态：
       · base64 编码的整块（机场标准）—— 里面每行一个节点
       · 明文每行一个节点（部分自建/分享用）
+      · Clash/Mihomo yaml（免费聚合源常见，取 proxies 段）
 
-    自动判别：整块能 base64 解出含 "://" 的文本就当编码块。
+    自动判别：整块能 base64 解出含 "://" 的文本就当编码块；
+    含 proxies: 的 yaml 走 clash 解析。
     """
     raw = text.strip()
     if not raw:
         raise SubscriptionError("订阅内容为空")
+
+    # Clash yaml 优先判别（它一定不是 base64，也不含 :// 节点行）
+    if looks_like_clash_yaml(raw):
+        return parse_clash_yaml(raw)
 
     body = raw
     # 判别是不是整块 base64

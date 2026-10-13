@@ -100,12 +100,29 @@ class Orchestrator:
         except Exception as e:
             elapsed = int((time.monotonic() - t0) * 1000)
             kind = self._classify_exception(e)
-            # 超时/网络类错误不计入熔断失败（可能只是这次网络抖了）
-            penalize = kind not in ("timeout", "cancel")
-            if penalize:
-                self.gov.record(name, False, elapsed, str(e)[:200])
-            else:
+            # 三类错误，三种记账方式（区分它们是本次修复的核心）：
+            #
+            # · cancel —— 早停主动取消。引擎本身是好的，是我们不等它了。
+            #   必须完全隐形（cancelled=True 不计 total_calls），否则
+            #   「每次搜索都取消慢引擎」会把慢引擎的统计打烂。
+            #
+            # · timeout —— 引擎在预算内真的没回。这是**真实的坏信号**，
+            #   但仍不该喂熔断：网络抖动、代理切换都会造成偶发超时，
+            #   直接喂熔断会误杀健康引擎。
+            #   所以走 soft=True：计入 total_calls、拉低 ema（降权），
+            #   但不增加 consecutive_fail（不熔断）。
+            #   早期实现把它也当 cancelled，导致引擎健康面板显示
+            #   success_rate=1.0 而引擎实际连续超时（实测 bing：
+            #   连超 2 次、返回 0 结果，面板仍报 4/4 全成功），
+            #   运维看面板会被彻底误导。
+            #
+            # · 其他（network/parse/http/unknown）—— 正常计入失败，可熔断。
+            if kind == "cancel":
                 self.gov.record(name, False, elapsed, str(e)[:200], cancelled=True)
+            elif kind == "timeout":
+                self.gov.record(name, False, elapsed, str(e)[:200], soft=True)
+            else:
+                self.gov.record(name, False, elapsed, str(e)[:200])
             return EngineOutcome(
                 engine=name, ok=False, error=str(e)[:200], error_kind=kind,
                 elapsed_ms=elapsed,

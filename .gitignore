@@ -26,3 +26,6 @@ panel.secret
 secrets/
 # 运行时生成的代理配置目录（含节点凭据）
 proxy-run/
+
+# build artifacts
+*.egg-info/

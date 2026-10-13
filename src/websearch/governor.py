@@ -225,10 +225,16 @@ class Governor:
             if blocked:
                 h.total_blocked += 1
             if soft:
-                # 软失败（如 zero_results）：引擎正常响应但没产出。
-                # 可能是查询本身无匹配，也可能是页面结构变更的前兆。
-                # 只降 EMA 权重（降权优于除名），不喂熔断计数——
-                # 否则小众查询会误杀引擎（实测 weixin 被误熔断 600s）。
+                # 软失败：引擎正常响应（或只是慢）但没产出。
+                # 两种来源：
+                #   · zero_results —— 可能查询本身无匹配，也可能是页面结构变更前兆
+                #   · timeout —— 引擎在预算内没回（真实坏信号，但仍可能是网络抖动）
+                # 共同点：都只降 EMA 权重（降权优于除名），不喂熔断计数。
+                # 区别于 cancelled=True：**计入 total_calls**，
+                # 否则健康面板会显示 success_rate=1.0 而引擎实际在连续超时
+                # （实测 bing 连超 2 次、返回 0 结果，面板仍报 4/4 全成功）。
+                # 不喂熔断是为了避免小众查询/偶发抖动误杀引擎
+                # （实测 weixin 被误熔断 600s）。
                 return
             h.consecutive_fail += 1
             if h.consecutive_fail >= self.cfg.cb_failure_threshold:

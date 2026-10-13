@@ -196,6 +196,48 @@ def query_terms(query: str) -> list[str]:
     return out
 
 
+# 泛化词黑名单：这些词在任何网页里都能碰到，命中它们不构成「相关」。
+# 只用于相关性判定，不影响 query_terms 的切分结果（缓存 key 等仍用全量）。
+_GENERIC_TERMS = frozenset(
+    {
+        # 单字虚词/量词
+        "年", "月", "日", "个", "是", "的", "了", "和", "与", "或", "在", "有",
+        # 高频泛义名词：任何一篇行业文章都可能出现
+        "新闻", "最新", "消息", "资讯", "报道", "介绍", "说明", "意思", "意思",
+        "是什么", "怎么样", "为什么", "哪个", "哪些", "多少", "方法", "工具",
+        "官网", "首页", "登录", "注册", "下载", "安装", "教程", "视频", "图片",
+        "2020", "2021", "2022", "2023", "2024", "2025", "2026", "2027",
+    }
+)
+
+
+def _solid_terms(terms: list[str]) -> list[str]:
+    """筛出有区分度的实义词。
+
+    规则（在 query_terms 产出的词上再过一道）：
+      · 命中泛化词黑名单 → 丢
+      · 纯 4 位数字（年份/编号）→ 丢（区分度太低）
+      · 单个汉字 → 丢
+      · 长度 <2 的英文/数字串 → 丢（a、go 之类）
+    全被滤光时返回空列表，调用方负责退回宽松模式。
+    """
+    out: list[str] = []
+    for t in terms:
+        tl = t.lower()
+        if tl in _GENERIC_TERMS:
+            continue
+        if re.fullmatch(r"\d{4}", t):
+            continue
+        if re.fullmatch(rf"[{_CJK}]", t):
+            continue
+        if len(t) < 2:
+            continue
+        if not re.match(rf"^[{_CJK}]+$", t) and len(t) < 3:
+            continue
+        out.append(t)
+    return out
+
+
 def relevance_ratio(query: str, results: list[Any]) -> tuple[float, int]:
     """结果里有多少条和查询相关。返回 (比例, 命中条数)。
 
@@ -203,14 +245,30 @@ def relevance_ratio(query: str, results: list[Any]) -> tuple[float, int]:
     实测必应在识别为爬虫时不返回 403，而是返回一批和查询完全无关的结果
     （查「无人零售 咖啡机 市场」返回「东京爱情故事」「无的汉语解释」）。
     这种响应状态码 200、结构完整、条数正常，只有相关性检查能抓出来。
+
+    **命中判定只看「实义词」，不看泛化词。**
+    早期实现对 query_terms 的任意一个词做子串匹配就算命中，于是：
+      query「2026年 无人零售 行业市场规模」
+      → terms = ['2026', '年', '无人零售', '行业市场规模']
+      → 必应投毒返回一堆 2026 年的日历/百科页，每条都含「2026」
+      → ratio = 1.0，10 条垃圾全部漏过（实测 2026-10-13）。
+    根因是 `any(term in blob)`：只要沾一个最泛的词就算「相关」，
+    而泛化词（年份、单个汉字、常见后缀）在任何网页里都必然出现，
+    根本不携带区分度信息。
+
+    改成：命中任意一个**实义词**才算一条相关。实义词 = 长度 ≥2 的
+    中文词/数字串，或长度 ≥3 的英文词。全部 terms 都是泛化词时
+    （如 query「2026年」）退回原 any 行为，宁可放过也不误杀。
     """
     terms = query_terms(query)
     if not terms or not results:
         return 0.0, 0
+    solid = _solid_terms(terms)
+    probe = solid or terms
     hit = 0
     for r in results:
         blob = ((getattr(r, "title", "") or "") + " " + (getattr(r, "snippet", "") or "")).lower()
-        if any(t.lower() in blob for t in terms):
+        if any(t.lower() in blob for t in probe):
             hit += 1
     return (hit / len(results), hit)
 

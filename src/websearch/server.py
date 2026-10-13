@@ -177,6 +177,57 @@ class Service:
         self.gov = Governor(cfg)
         self.orch = Orchestrator(cfg, self.pool, self.cache, self.gov)
         self.warmup_info: dict[str, Any] | None = None
+        # 节点猎手：全球免费节点自养池（详见 nodes/ 包）
+        self.local_proxy = None
+        self.hunter = self._build_hunter(cfg)
+
+    def _build_hunter(self, cfg: Config):
+        """构造节点猎手 + 本地节点代理。任何失败都不该拖垮搜索服务。"""
+        try:
+            from .nodes.hunter import NodeHunter
+            from .nodes.local_proxy import LocalNodeProxy
+            from .nodes.pool import NodePool
+            from .nodes.probe import NodeProber
+            from .nodes.sources import SourceFetcher
+
+            data_dir = cfg.cache_path()
+            pool = NodePool(cfg.nodes_db_path())
+            prober = NodeProber(
+                singbox_bin=cfg.singbox_bin,
+                work_dir=data_dir,
+                timeout=cfg.node_probe_timeout_ms / 1000.0,
+                concurrency=cfg.node_probe_concurrency,
+            )
+            # 抓源直连（聚合站墙内可达）；传代理反而不稳（代理挂了就全抓不到）
+            fetcher = SourceFetcher(timeout=15.0, cfg=cfg)
+            # 本地节点代理：用户没配代理时，服务用节点库最优节点自养出网
+            self.local_proxy = LocalNodeProxy(
+                singbox_bin=cfg.singbox_bin, work_dir=data_dir,
+            )
+            return NodeHunter(
+                pool=pool, fetcher=fetcher, prober=prober, orch=self.orch,
+                discover=cfg.node_hunt_discover,
+                switch_cb=self._switch_to_node,
+            )
+        except Exception as e:
+            log.warning("节点猎手初始化失败（不影响搜索）: %s", e)
+            self.local_proxy = None
+            return None
+
+    async def _switch_to_node(self, outbound: dict[str, Any]) -> bool:
+        """智能降级的执行端：切到指定节点并让 HttpPool 走它。
+
+        ⚠️ 用户自己配了代理（cfg.proxy）时不抢：返回 True 表示「已处理」
+        （保持用户配置），节点库仅作备份，不自动接管出网。
+        """
+        if self.cfg.proxy:
+            return True
+        if self.local_proxy is None:
+            return False
+        ok = await self.local_proxy.switch_to(outbound)
+        if ok:
+            await self.pool.attach_proxy(self.local_proxy.proxy_url)
+        return ok
 
     async def warmup(self, enabled: bool = True) -> dict[str, Any] | None:
         """启动预热。失败不影响服务启动（网络随时可能恢复）。"""
@@ -194,6 +245,17 @@ class Service:
     async def aclose(self) -> None:
         await self.pool.aclose()
         await self.cache.aclose()
+        if self.hunter is not None:
+            try:
+                await self.hunter.stop_loop()
+                self.hunter.pool.close()
+            except Exception:
+                pass
+        if self.local_proxy is not None:
+            try:
+                await self.local_proxy.stop()
+            except Exception:
+                pass
 
 
 _SERVICE: Service | None = None
@@ -413,32 +475,51 @@ def build_mcp(cfg: Config):
 
     @mcp.tool(**_MCP)
     async def proxy_status() -> dict[str, Any]:
-        """查看代理/出网状态：是否配了代理、当前是否走代理、有没有降级。
+        """查看出网状态：是否走代理、节点库规模、有没有降级。
 
-        **不返回任何凭据**（代理地址里若含密码会被掩码）。
+        **不返回任何凭据**（代理地址里若含密码会被掩码；节点凭据永不出库）。
 
         返回：
-          configured   是否配置了代理
+          configured   是否配置了（用户自己的）代理
           using_proxy  当前请求是否走代理
           bypassed     true = 代理不可用，已降级为直连（搜索仍可用）
           bypass_count 累计降级次数
           last_error   最近一次代理失败原因
+          node_pool    **系统自养的节点库**：总量/存活/最优节点/自动更新状态
           hint         人话解释当前状态该怎么办
         """
+        svc = get_service()
         st = svc.pool.gate.state.to_dict()
-        if not st["proxy_configured"]:
-            hint = ("未配置代理：服务直连出网，只能访问国内可达的源"
-                    "（百度/必应/360/微信等）。想用 Google/DDG 等墙外源，"
-                    "请在管理面板配置机场订阅。")
-        elif st["bypassed"]:
+        pool_info: dict[str, Any] = {}
+        if svc.hunter is not None:
+            ps = svc.hunter.pool.stats().to_dict()
+            pool_info = {
+                "total": ps["total"],
+                "alive": ps["alive"],
+                "best": ps["best"],
+                "by_country": ps["by_country"],
+                "auto_update": svc.hunter.state.loop_active,
+                "interval_sec": svc.hunter.state.interval_sec,
+                "rounds": svc.hunter.state.rounds,
+                "failovers": svc.hunter.state.failovers,
+            }
+        alive = pool_info.get("alive", 0)
+        if st["bypassed"]:
             hint = (f"代理不可用已降级直连（累计 {st['bypass_count']} 次）。"
-                    f"搜索仍可用但墙外源会失败。检查代理进程或订阅是否过期；"
-                    f"服务会每 60 秒自动探活并在恢复后切回。")
+                    f"搜索仍可用但墙外源会失败。节点库现有 {alive} 个存活节点，"
+                    f"后台会持续搜并自动切换。")
         elif st["using_proxy"]:
             hint = "代理正常，请求走代理出网。"
+        elif alive > 0:
+            hint = (f"当前直连出网；节点库已自养 {alive} 个存活免费节点"
+                    f"（自动更新中，无需自己配订阅）。")
+        elif not st["proxy_configured"]:
+            hint = ("未配置代理，节点库暂无存活节点。后台正在持续搜集"
+                    "（每 10 分钟一轮），稍后会自动可用；也可立即调 "
+                    "node_hunt 手动触发一轮。")
         else:
             hint = "代理已配置但未启用（WS_PROXY_ENABLED=0）。"
-        return {**st, "hint": hint}
+        return {**st, "node_pool": pool_info, "hint": hint}
 
     @mcp.tool(**_MCP)
     async def cache_manage(action: str = "stats", kind: str = "") -> dict[str, Any]:
@@ -447,6 +528,106 @@ def build_mcp(cfg: Config):
             n = await svc.cache.clear(kind or None)
             return {"cleared": n, "stats": svc.cache.stats()}
         return svc.cache.stats()
+
+    @mcp.tool(**_MCP)
+    async def node_hunt(
+        max_sources: int = 0,
+        probe_limit: int = 0,
+        discover: bool = True,
+    ) -> dict[str, Any]:
+        """立刻跑一轮「全球节点猎取」：多源搜集 → 解析 → 入库 → 实测出网。
+
+        服务本身已在后台**持续自动**搜节点（每 10 分钟一轮，节点随时失效，
+        必须一直搜）。这个工具用于「现在就想刷新一次」的场景。
+
+        参数：
+          max_sources  本轮最多抓多少个源，0=用默认（24）
+          probe_limit  本轮最多探测多少个节点，0=用默认（120）
+          discover     是否用搜索引擎自举发现新节点源，默认 true
+
+        返回：
+          sources_ok/fail  源抓取成功/失败数（失败隔离，单源挂了不影响其他）
+          parsed           本轮解析出的节点数（含重复）
+          new_nodes        去重后新增入库数
+          probed/alive     探测数 / 实测存活数
+          probe_mode       exit_verified=真验证出网；tcp_only=仅端口可达
+          note             人话说明（如「所有源都抓取失败」）
+
+        注意：免费节点存活率很低（实测 TCP 可达约 14%），
+        一轮下来 alive 为个位数是正常的，不是故障。
+        """
+        svc = get_service()
+        if svc.hunter is None:
+            return {"error": "节点猎手不可用（初始化失败）"}
+        if svc.hunter.state.running:
+            return {"error": "已有一轮 hunt 在跑，请稍后",
+                    "status": svc.hunter.status()}
+        report = await svc.hunter.hunt(
+            trigger="manual",
+            max_sources=max_sources or None,
+            probe_limit=probe_limit or None,
+            discover=discover,
+        )
+        # 跑完顺手自愈一次：换掉失效的当前节点 / 首次接入自养出网
+        try:
+            fo = await svc.hunter.smart_failover(
+                switch_cb=svc.hunter.switch_cb)
+            report["failover"] = fo
+        except Exception as e:
+            report["failover"] = {"switched": False, "reason": str(e)[:100]}
+        report["pool"] = svc.hunter.pool.stats().to_dict()
+        if svc.local_proxy is not None:
+            report["local_proxy"] = svc.local_proxy.status()
+        return report
+
+    @mcp.tool(**_MCP)
+    async def node_pool(action: str = "status", limit: int = 30,
+                        pool: str = "") -> dict[str, Any]:
+        """查看「节点库」——**两个独立池**：客户导入 + 系统自搜。
+
+        · cust  客户导入的节点（机场/自建）。选路**优先**用它，
+                不参与「多久没出现就淘汰」的时效清理。
+        · free  后台自搜的全球免费节点。寿命以小时计，是 cust 全挂时的兜底。
+        两个池物理隔离（同一 sqlite，用 pool 列区分），混在一起会导致
+        免费节点挤掉客户节点的探测预算、选路时把付费节点和免费垃圾
+        平等排序。
+
+        参数：
+          action  status（库统计，默认）| list（节点列表）| sources（源健康度）
+          limit   list/sources 的返回条数上限
+          pool    cust（只看客户池）| free（只看免费池）| 留空=全部
+
+        返回**不含任何节点凭据**（uuid/密码永不外泄），
+        只给协议、地区、延迟、健康分。
+        """
+        svc = get_service()
+        if svc.hunter is None:
+            return {"error": "节点猎手不可用（初始化失败）"}
+        p = svc.hunter.pool
+        limit = max(1, min(int(limit or 30), 200))
+        pool = pool if pool in ("cust", "free") else ""
+        if action == "list":
+            return {
+                "pool": pool or "all",
+                "nodes": p.list_public(limit=limit, only_alive=True, pool=pool),
+                "stats": p.stats().to_dict(),
+            }
+        if action == "sources":
+            return {
+                "sources": p.source_health(limit=limit),
+                "stats": p.stats().to_dict(),
+            }
+        return {
+            "stats": p.stats().to_dict(),
+            "hunter": svc.hunter.status(),
+            "local_proxy": (svc.local_proxy.status()
+                            if svc.local_proxy is not None else None),
+            "hint": ("两个池：cust=客户导入（选路优先，不按时效淘汰）、"
+                     "free=系统自搜的全球免费节点（兜底）。"
+                     "stats.by_pool 分别给出两池的 total/alive/untested。"
+                     "搜到全球节点后会按延迟与成功率自动选最优，"
+                     "但客户池有可用节点时永远优先用它。"),
+        }
 
     @mcp.tool(**_MCP)
     async def server_info() -> dict[str, Any]:
@@ -577,6 +758,14 @@ async def _warmup_now() -> None:
     # 启动代理自动恢复循环：配了代理就必须有，
     # 否则「代理坏了→降级→之后没人搜→永远不恢复」
     svc.pool.start_proxy_recovery_loop()
+    # 启动节点猎手持续搜索循环（用户明确要求：节点随时失效，必须一直搜）
+    if svc.hunter is not None and svc.cfg.node_hunt_enabled:
+        try:
+            await svc.hunter.start_loop(interval=svc.cfg.node_hunt_interval)
+        except Exception as e:
+            log.warning("节点猎手循环启动失败（不影响搜索）: %s", e)
+    else:
+        log.info("节点猎手持续搜索未启用（WS_NODE_HUNT=0）")
 
 
 def build_asgi(cfg: Config):

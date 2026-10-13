@@ -183,6 +183,17 @@ class Config:
     verify_ssl: bool = True
     http2: bool = True
 
+    # ── 节点猎手（免费节点自养池）──
+    # 产品定位：节点从「用户自带」变成「系统自养」——没配订阅也能出墙。
+    node_hunt_enabled: bool = True   # 后台持续搜集（默认开：节点随时失效）
+    node_hunt_interval: int = 600    # 每轮间隔（秒）
+    node_hunt_max_sources: int = 24  # 单轮最多抓多少源
+    node_hunt_probe_limit: int = 120  # 单轮最多探测多少节点
+    node_hunt_discover: bool = True  # 用搜索引擎自举发现新源
+    singbox_bin: str = "/opt/sing-box/sing-box"  # 出网验证用（没有则退化 TCP）
+    node_probe_concurrency: int = 12
+    node_probe_timeout_ms: int = 8000
+
     # ── 安全 ──
     allow_private_net: bool = False  # 默认禁内网（SSRF 防护）
     allow_nonstd_port: bool = False  # 默认只放行 80/443
@@ -273,6 +284,21 @@ class Config:
         c.verify_ssl = _env_bool("WS_VERIFY_SSL", c.verify_ssl)
         c.http2 = _env_bool("WS_HTTP2", c.http2)
 
+        # 节点猎手
+        c.node_hunt_enabled = _env_bool("WS_NODE_HUNT", c.node_hunt_enabled)
+        c.node_hunt_interval = _env_int("WS_NODE_HUNT_INTERVAL", c.node_hunt_interval)
+        c.node_hunt_max_sources = _env_int("WS_NODE_HUNT_MAX_SOURCES",
+                                           c.node_hunt_max_sources)
+        c.node_hunt_probe_limit = _env_int("WS_NODE_HUNT_PROBE_LIMIT",
+                                           c.node_hunt_probe_limit)
+        c.node_hunt_discover = _env_bool("WS_NODE_HUNT_DISCOVER",
+                                         c.node_hunt_discover)
+        c.singbox_bin = _env_str("WS_SINGBOX_BIN", c.singbox_bin)
+        c.node_probe_concurrency = _env_int("WS_NODE_PROBE_CONCURRENCY",
+                                            c.node_probe_concurrency)
+        c.node_probe_timeout_ms = _env_int("WS_NODE_PROBE_TIMEOUT_MS",
+                                           c.node_probe_timeout_ms)
+
         c.allow_private_net = _env_bool("WS_ALLOW_PRIVATE_NET", c.allow_private_net)
         c.allow_nonstd_port = _env_bool("WS_ALLOW_NONSTD_PORT", c.allow_nonstd_port)
         c.domain_blocklist = _env_list("WS_DOMAIN_BLOCKLIST", [])
@@ -293,6 +319,15 @@ class Config:
             p = Path(tempfile.gettempdir()) / "websearch-cache"
         p.mkdir(parents=True, exist_ok=True)
         return p
+
+    def nodes_db_path(self) -> Path:
+        """节点库文件路径。
+
+        ⚠️ 含节点凭据 —— 与缓存同目录，但 NodePool 会强制 600 权限。
+        之所以不单独给配置项：节点库就该跟缓存放一起（都是运行期数据），
+        少一个配置项少一处出错机会。
+        """
+        return self.cache_path() / "nodes.sqlite3"
 
     def active_engines(self) -> list[str]:
         """启用引擎 = 配置列表 - 显式禁用。"""

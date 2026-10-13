@@ -378,6 +378,7 @@ class HttpPool:
         # 手机 ARM 上一次 TCP+TLS 握手 200-400ms，比搜索本身还贵。
         from .proxy.gate import ProxyGate
 
+        self._base_kwargs = kwargs      # 供 attach_proxy 动态重建 client
         self.gate = ProxyGate(cfg.proxy, enabled=bool(cfg.proxy))
 
         self._client = httpx.AsyncClient(**kwargs)
@@ -449,6 +450,38 @@ class HttpPool:
         """旁路状态下定期探活并在恢复后切回代理。搜索前调用，开销极小。"""
         if self.gate.enabled and self.gate.state.bypassed:
             await self.gate.maybe_probe(self.probe_proxy)
+
+    async def attach_proxy(self, proxy_url: str) -> bool:
+        """运行时把出网切到指定代理（用于「服务自养节点」自动出网）。
+
+        为什么需要动态切换：节点猎手在服务进程内用节点库最优节点起了
+        一个 sing-box（见 nodes/local_proxy.py），而起之前 HttpPool 已经
+        按 cfg.proxy 建好了 client。没有这个方法，就得重启服务才能用上
+        自养节点 —— 那「不用用户配节点」就是空话。
+
+        做四件事：关旧 client → 重建走代理 client → 重建直连 client
+        （降级用）→ 重建 gate（重置失败计数与降级状态）。
+        """
+        from .proxy.gate import ProxyGate
+
+        if not proxy_url:
+            return False
+        try:
+            await self._client.aclose()
+            if self._direct_client is not None:
+                await self._direct_client.aclose()
+        except Exception:
+            pass
+        kwargs = dict(self._base_kwargs)
+        kwargs["proxy"] = proxy_url
+        self._client = httpx.AsyncClient(**kwargs)
+        self._client.event_hooks["response"].append(self._guard_redirect)
+        direct_kwargs = {k: v for k, v in kwargs.items() if k != "proxy"}
+        self._direct_client = httpx.AsyncClient(**direct_kwargs)
+        self._direct_client.event_hooks["response"].append(self._guard_redirect)
+        self.gate = ProxyGate(proxy_url, enabled=True)
+        log.info("出网已切到自养节点代理：%s", proxy_url)
+        return True
 
     def start_proxy_recovery_loop(self) -> None:
         """后台探活循环：即使**没有任何搜索请求**，也能自动恢复代理。

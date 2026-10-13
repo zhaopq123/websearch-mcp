@@ -1,0 +1,641 @@
+# -*- coding: utf-8 -*-
+"""节点库 —— 免费节点的持久化层（sqlite）。
+
+产品定位：节点从「用户自带」变成「系统自养」。本模块是那个「自养」的
+粮仓 —— 搜集来的节点在这里去重、记健康分、过期淘汰。
+
+⚠️ 安全红线（本模块是节点凭据落盘的唯一入口）：
+  1. **文件权限强制 600**，目录 700。每次写完都 chmod。
+  2. **对外查询绝不返回凭据** —— 工具/面板走 summary()/list_public()，
+     只给「协议、国家、延迟、健康分」，不给 outbound/raw_uri。
+     取实际配置只有内部接口 outbound_for(fp) 一条路。
+  3. **绝不写日志** —— 本模块的 log 调用只带数量与指纹前缀。
+  4. 节点库文件在 .gitignore（nodes.sqlite3*）。
+
+设计取舍：
+  · 健康分是「成功率 × 延迟」的组合，不是纯延迟 —— 纯延迟会选出
+    「响应快但经常断」的节点，用户体感是「时好时坏」。
+  · 节点短命是免费源的常态（实测：几小时到几天）。所以库设计成
+    「宽进严出」：搜集阶段只做格式校验就入库（宁可多收），
+    存活与否完全由 probe 的实测结果决定，过期自动淘汰。
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import sqlite3
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterable
+
+log = logging.getLogger("websearch.nodes.pool")
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS nodes (
+    fp          TEXT PRIMARY KEY,   -- 指纹（协议+地址+凭据的 sha256 前 16 位）
+    protocol    TEXT NOT NULL,
+    server      TEXT NOT NULL,
+    port        INTEGER NOT NULL,
+    country     TEXT DEFAULT '',    -- 从 tag 里猜的地区标记（尽力而为）
+    tag         TEXT DEFAULT '',
+    pool        TEXT DEFAULT 'free',-- 池归属：cust=客户导入 / free=系统自搜
+    outbound    TEXT NOT NULL,      -- sing-box outbound JSON（含凭据，600 文件内）
+    sources     TEXT DEFAULT '',    -- 来源清单（逗号分隔的源 id）
+    first_seen  REAL NOT NULL,
+    last_seen   REAL NOT NULL,
+    alive       INTEGER DEFAULT 0,  -- 最近一次是否验证出网
+    last_ms     INTEGER DEFAULT 0,  -- 最近一次延迟
+    avg_ms      REAL DEFAULT 0,     -- 延迟 EMA（只统计成功样本）
+    ok_count    INTEGER DEFAULT 0,
+    fail_count  INTEGER DEFAULT 0,
+    streak_fail INTEGER DEFAULT 0,  -- 连续失败次数（智能降级用）
+    last_ok_at  REAL DEFAULT 0,
+    last_probe_at REAL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS sources (
+    sid         TEXT PRIMARY KEY,   -- 源 id（URL 的短哈希）
+    url         TEXT NOT NULL,      -- 源地址（非凭据，可存）
+    kind        TEXT DEFAULT 'sub', -- sub=订阅 / list=URI 列表 / page=网页
+    ok_count    INTEGER DEFAULT 0,
+    fail_count  INTEGER DEFAULT 0,
+    last_ok_at  REAL DEFAULT 0,
+    last_error  TEXT DEFAULT '',
+    nodes_found INTEGER DEFAULT 0,  -- 累计贡献节点数
+    last_fetch_at REAL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS runs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    at          REAL NOT NULL,
+    trigger     TEXT DEFAULT '',    -- manual / auto
+    sources_ok  INTEGER DEFAULT 0,
+    sources_fail INTEGER DEFAULT 0,
+    parsed      INTEGER DEFAULT 0,
+    new_nodes   INTEGER DEFAULT 0,
+    probed      INTEGER DEFAULT 0,
+    alive       INTEGER DEFAULT 0,
+    elapsed_ms  INTEGER DEFAULT 0,
+    note        TEXT DEFAULT ''
+);
+"""
+
+# ⚠️ 索引必须与建表**分开**执行：老库（无 pool 列）在 executescript 建表阶段
+# 就会因「CREATE INDEX ... ON nodes(pool, alive)」报 no such column 而整体失败。
+# 顺序必须是 建表 → 迁移加列 → 建索引。踩过（2026-10-13）。
+_SCHEMA_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_alive ON nodes(alive, avg_ms);
+CREATE INDEX IF NOT EXISTS idx_last_seen ON nodes(last_seen);
+CREATE INDEX IF NOT EXISTS idx_pool ON nodes(pool, alive);
+"""
+
+
+def fingerprint(protocol: str, outbound: dict[str, Any]) -> str:
+    """节点指纹：协议 + 服务地址端口 + 凭据关键字段。
+
+    为什么不直接哈希 outbound JSON 原文：同一节点在不同源里字段顺序、
+    多余字段都可能不同，原文哈希去不了重。只取**标识性字段**才能把
+    「同一个节点」在不同源里认出来。
+    """
+    server = str(outbound.get("server", ""))
+    port = str(outbound.get("server_port", outbound.get("port", "")))
+    secret = ""
+    for k in ("uuid", "password", "method", "alter_id", "auth_str",
+              "flow", "security", "obfs", "path", "host", "service_name"):
+        v = outbound.get(k)
+        if v not in (None, ""):
+            secret += f"|{k}={v}"
+    raw = f"{protocol}|{server}|{port}{secret}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def _guess_country(tag: str) -> str:
+    """从节点 tag 里猜地区（尽力而为，猜不出返回空）。"""
+    t = (tag or "").upper()
+    table = {
+        "HK": "香港", "香港": "香港", "HONGKONG": "香港", "HONG KONG": "香港",
+        "TW": "台湾", "台湾": "台湾", "TAIWAN": "台湾",
+        "JP": "日本", "日本": "日本", "JAPAN": "日本", "东京": "日本",
+        "SG": "新加坡", "新加坡": "新加坡", "SINGAPORE": "新加坡", "狮城": "新加坡",
+        "US": "美国", "美国": "美国", "UNITED STATES": "美国", "洛杉矶": "美国",
+        "KR": "韩国", "韩国": "韩国", "KOREA": "韩国", "首尔": "韩国",
+        "UK": "英国", "英国": "英国", "GB": "英国", "LONDON": "英国",
+        "DE": "德国", "德国": "德国", "GERMANY": "德国",
+        "FR": "法国", "法国": "法国", "FRANCE": "法国",
+        "RU": "俄罗斯", "俄罗斯": "俄罗斯", "RUSSIA": "俄罗斯",
+        "CA": "加拿大", "加拿大": "加拿大", "CANADA": "加拿大",
+        "AU": "澳大利亚", "澳大利亚": "澳大利亚", "AUSTRALIA": "澳大利亚",
+        "IN": "印度", "印度": "印度", "INDIA": "印度",
+        "TR": "土耳其", "土耳其": "土耳其", "TURKEY": "土耳其",
+        "VN": "越南", "越南": "越南", "VIETNAM": "越南",
+        "MY": "马来西亚", "马来西亚": "马来西亚", "MALAYSIA": "马来西亚",
+        "TH": "泰国", "泰国": "泰国", "THAILAND": "泰国",
+        "PH": "菲律宾", "菲律宾": "菲律宾",
+        "ID": "印尼", "印尼": "印尼", "INDONESIA": "印尼",
+        "BR": "巴西", "巴西": "巴西", "BRAZIL": "巴西",
+        "AR": "阿根廷", "阿根廷": "阿根廷",
+        "NL": "荷兰", "荷兰": "荷兰", "NETHERLANDS": "荷兰",
+        "CH": "瑞士", "瑞士": "瑞士", "SWITZERLAND": "瑞士",
+        "SE": "瑞典", "瑞典": "瑞典",
+        "PL": "波兰", "波兰": "波兰",
+        "UA": "乌克兰", "乌克兰": "乌克兰",
+        "IR": "伊朗", "伊朗": "伊朗",
+        "AE": "阿联酋", "迪拜": "阿联酋", "DUBAI": "阿联酋",
+    }
+    for k, v in table.items():
+        if k in t:
+            return v
+    return ""
+
+
+@dataclass
+class PoolStats:
+    """节点库统计（**无凭据**，可给工具/面板）。"""
+
+    total: int = 0
+    alive: int = 0
+    dead: int = 0
+    untested: int = 0
+    by_protocol: dict[str, int] | None = None
+    by_country: dict[str, int] | None = None
+    by_pool: dict[str, dict[str, int]] = field(default_factory=dict)
+    best: dict[str, Any] | None = None
+    source_count: int = 0
+    healthy_sources: int = 0
+    last_run: dict[str, Any] | None = None
+    db_bytes: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "total": self.total,
+            "alive": self.alive,
+            "dead": self.dead,
+            "untested": self.untested,
+            "by_protocol": self.by_protocol or {},
+            "by_country": self.by_country or {},
+            "by_pool": self.by_pool or {},
+            "best": self.best,
+            "source_count": self.source_count,
+            "healthy_sources": self.healthy_sources,
+            "last_run": self.last_run,
+            "db_bytes": self.db_bytes,
+        }
+
+
+class NodePool:
+    """节点库。一个实例绑定一个 sqlite 文件。"""
+
+    # 过期阈值：多久没在任何源里再出现、且探测失败，就该淘汰。
+    # 免费节点短命是常态，但阈值别太激进 —— 源本身可能几天不更新。
+    PRUNE_AFTER_SEC = 7 * 24 * 3600
+    # 连续失败多少次判定「节点死了」（智能降级的触发线）
+    DEAD_STREAK = 3
+
+    def __init__(self, db_path: Path | str):
+        self.path = Path(db_path)
+        self._conn: sqlite3.Connection | None = None
+        self._ensure()
+
+    # ── 生命周期 ──
+
+    def _ensure(self) -> sqlite3.Connection:
+        if self._conn is not None:
+            return self._conn
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self.path.parent, 0o700)
+        except OSError:
+            pass
+        conn = sqlite3.connect(
+            str(self.path), timeout=5.0, isolation_level=None,
+            check_same_thread=False,
+        )
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.executescript(_SCHEMA)
+        self._migrate(conn)
+        conn.executescript(_SCHEMA_INDEX)
+        self._conn = conn
+        self._secure()
+        return conn
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """加列迁移。`CREATE TABLE IF NOT EXISTS` 不会给已存在的表补列。
+
+        ⚠️ 老库的默认归属必须是 **cust** 而不是 free：
+        建 `pool` 列这个功能之前，库里已有的节点全是客户导入的
+        （那是节点库唯一的来源）。若按 schema 默认值补成 free，
+        一次 prune 就会把客户的付费节点当过期免费节点清掉。
+        """
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(nodes)")}
+        if "pool" not in cols:
+            # DEFAULT 'cust'：历史节点一律归客户池
+            conn.execute(
+                "ALTER TABLE nodes ADD COLUMN pool TEXT DEFAULT 'cust'"
+            )
+            log.info("节点库迁移：新增 pool 列，历史节点归入 cust 池")
+
+    def _secure(self) -> None:
+        """强制 600 —— 库里含节点凭据。"""
+        for suffix in ("", "-wal", "-shm"):
+            p = Path(str(self.path) + suffix)
+            if p.exists():
+                try:
+                    os.chmod(p, 0o600)
+                except OSError:
+                    pass
+
+    def close(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+
+    # ── 写入 ──
+
+    def upsert_nodes(self, nodes: Iterable[tuple[str, str, dict[str, Any]]],
+                     source_sid: str = "", pool: str = "free") -> int:
+        """批量入库。nodes 每项 = (tag, protocol, outbound)。
+
+        返回**新增**条数（已存在的只更新 last_seen 与 sources）。
+        宽进：只做格式校验（必须有 server/port），不判存活 ——
+        存活由 probe 的实测结果决定。
+
+        `pool` 决定节点归哪个池（'cust' 客户导入 / 'free' 系统自搜），
+        见 _SCHEMA.nodes.pool。同一节点被两个来源同时提供时，
+        **已有记录不覆盖归属**：客户池优先，避免客户付费节点
+        被一次免费源命中就降级成 free（进而被 prune 淘汰）。
+        """
+        conn = self._ensure()
+        now = time.time()
+        added = 0
+        for tag, protocol, outbound in nodes:
+            server = str(outbound.get("server", "")).strip()
+            port = outbound.get("server_port", outbound.get("port", 0))
+            try:
+                port = int(port)
+            except (TypeError, ValueError):
+                continue
+            if not server or not port:
+                continue
+            fp = fingerprint(protocol, outbound)
+            country = _guess_country(tag)
+            exists = conn.execute(
+                "SELECT sources, pool FROM nodes WHERE fp=?", (fp,)
+            ).fetchone()
+            if exists:
+                srcs = set(filter(None, (exists[0] or "").split(",")))
+                if source_sid:
+                    srcs.add(source_sid)
+                # 归属只升不降：free 命中已有 cust 节点时保留 cust
+                keep = exists[1] or "free"
+                if pool == "cust":
+                    keep = "cust"
+                conn.execute(
+                    "UPDATE nodes SET last_seen=?, sources=?, tag=?, pool=?"
+                    " WHERE fp=?",
+                    (now, ",".join(sorted(srcs)), tag, keep, fp),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO nodes (fp, protocol, server, port, country, tag,"
+                    " pool, outbound, sources, first_seen, last_seen)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (fp, protocol, server, port, country, tag, pool,
+                     json.dumps(outbound, ensure_ascii=False),
+                     source_sid, now, now),
+                )
+                added += 1
+        self._secure()
+        return added
+
+    def record_probe(self, fp: str, ok: bool, ms: int = 0) -> None:
+        """记录一次探测结果，更新健康分。
+
+        avg_ms 用 EMA（只统计成功样本）。选节点时综合成功率与延迟，
+        避免选出「快但常断」的节点。
+        """
+        conn = self._ensure()
+        now = time.time()
+        row = conn.execute(
+            "SELECT ok_count, fail_count, avg_ms, streak_fail FROM nodes WHERE fp=?",
+            (fp,),
+        ).fetchone()
+        if not row:
+            return
+        ok_count, fail_count, avg_ms, streak = row
+        if ok:
+            # 延迟 EMA，alpha=0.4（新样本权重大，快速反映节点当前状态）
+            avg_ms = (ms if not avg_ms else avg_ms * 0.6 + ms * 0.4)
+            conn.execute(
+                "UPDATE nodes SET alive=1, last_ms=?, avg_ms=?, ok_count=?,"
+                " streak_fail=0, last_ok_at=?, last_probe_at=? WHERE fp=?",
+                (ms, avg_ms, ok_count + 1, now, now, fp),
+            )
+        else:
+            streak = (streak or 0) + 1
+            alive = 0 if streak >= self.DEAD_STREAK else None
+            if alive is None:
+                conn.execute(
+                    "UPDATE nodes SET fail_count=?, streak_fail=?,"
+                    " last_probe_at=? WHERE fp=?",
+                    (fail_count + 1, streak, now, fp),
+                )
+            else:
+                conn.execute(
+                    "UPDATE nodes SET alive=0, fail_count=?, streak_fail=?,"
+                    " last_probe_at=? WHERE fp=?",
+                    (fail_count + 1, streak, now, fp),
+                )
+        self._secure()
+
+    def upsert_source(self, sid: str, url: str, kind: str = "sub") -> None:
+        conn = self._ensure()
+        conn.execute(
+            "INSERT INTO sources (sid, url, kind) VALUES (?,?,?)"
+            " ON CONFLICT(sid) DO UPDATE SET url=excluded.url",
+            (sid, url, kind),
+        )
+        self._secure()
+
+    def record_source_fetch(self, sid: str, ok: bool, nodes_found: int = 0,
+                            error: str = "") -> None:
+        """记录一次源抓取结果。源健康度用于给源排序/降权。"""
+        conn = self._ensure()
+        now = time.time()
+        if ok:
+            conn.execute(
+                "UPDATE sources SET ok_count=ok_count+1, last_ok_at=?,"
+                " last_error='', nodes_found=nodes_found+?, last_fetch_at=?"
+                " WHERE sid=?",
+                (now, nodes_found, now, sid),
+            )
+        else:
+            # 错误信息脱敏：只留类型化短语，防 URL 里的 token 进库
+            conn.execute(
+                "UPDATE sources SET fail_count=fail_count+1, last_error=?,"
+                " last_fetch_at=? WHERE sid=?",
+                (error[:120], now, sid),
+            )
+        self._secure()
+
+    def record_run(self, run: dict[str, Any]) -> None:
+        conn = self._ensure()
+        conn.execute(
+            "INSERT INTO runs (at, trigger, sources_ok, sources_fail, parsed,"
+            " new_nodes, probed, alive, elapsed_ms, note)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (run.get("at", time.time()), run.get("trigger", ""),
+             run.get("sources_ok", 0), run.get("sources_fail", 0),
+             run.get("parsed", 0), run.get("new_nodes", 0),
+             run.get("probed", 0), run.get("alive", 0),
+             run.get("elapsed_ms", 0), run.get("note", "")),
+        )
+        self._secure()
+
+    # ── 查询（内部，含凭据）──
+
+    def candidates_for_probe(self, limit: int = 200,
+                             prefer_untested: bool = True,
+                             pool: str = "") -> list[dict[str, Any]]:
+        """挑一批候选节点去探测。
+
+        优先级：从未测过的 > 很久没测的 > 曾经活的。
+        为什么优先未测的：免费源一次能收到几百个节点，全测一轮太久；
+        先把「未知」变「已知」比重复测已知的更划算。
+
+        `pool` 传 'cust'/'free' 只探测某个池；留空 = 全部。
+        调用方（hunter）应当**分池各取一批**：客户节点只有几十个，
+        却会被免费源的数百个候选挤出探测预算 —— 那等于让付费节点
+        永远处于「未知」状态，选路时也就无从比较。
+        """
+        conn = self._ensure()
+        where = ""
+        params: list[Any] = []
+        if pool in ("cust", "free"):
+            where = "WHERE pool=?"
+            params.append(pool)
+        order = ("last_probe_at ASC, " if prefer_untested else "")
+        rows = conn.execute(
+            f"SELECT fp, protocol, server, port, country, tag, outbound,"
+            f" alive, avg_ms, last_probe_at, pool FROM nodes"
+            f" {where} ORDER BY {order}alive DESC, last_probe_at ASC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+        return [
+            {
+                "fp": r[0], "protocol": r[1], "server": r[2], "port": r[3],
+                "country": r[4], "tag": r[5],
+                "outbound": json.loads(r[6]),
+                "alive": bool(r[7]), "avg_ms": r[8], "last_probe_at": r[9],
+                "pool": r[10] or "free",
+            }
+            for r in rows
+        ]
+
+    def outbound_for(self, fp: str) -> dict[str, Any] | None:
+        """取某个节点的 sing-box outbound（**含凭据**，仅内部用）。"""
+        conn = self._ensure()
+        row = conn.execute(
+            "SELECT outbound, tag FROM nodes WHERE fp=?", (fp,)
+        ).fetchone()
+        if not row:
+            return None
+        ob = json.loads(row[0])
+        return {"tag": row[1] or fp, **ob}
+
+    def best(self, *, only_alive: bool = True,
+            prefer: str = "cust") -> dict[str, Any] | None:
+        """选最优节点（**无凭据**摘要 + fp）。
+
+        评分 = 成功率 × 1000 − 延迟ms。只有 alive=1 的参与（默认）。
+
+        **客户池优先（prefer='cust'，默认）**：
+        先只在 cust 池里选；cust 池没有任何活节点时，才回落到 free 池。
+        为什么不合并评分：免费节点和客户付费节点混在一个排序里，
+        比延迟低不代表能长期用 —— 免费源的节点寿命以小时计，
+        一个 200ms 的免费节点随时会消失，而客户节点有服务承诺。
+        宁可慢一点，也要稳定。
+        """
+        conn = self._ensure()
+        pools = (["cust", "free"] if prefer == "cust" else ["free", "cust"])
+        for pool in pools:
+            picked = self._best_in(conn, pool, only_alive)
+            if picked:
+                picked["pool"] = pool
+                return picked
+        return None
+
+    def _best_in(self, conn: sqlite3.Connection, pool: str,
+                 only_alive: bool) -> dict[str, Any] | None:
+        """在单个池内选最优节点（内部）。"""
+        where = "WHERE pool=?"
+        params: list[Any] = [pool]
+        if only_alive:
+            where += " AND alive=1"
+        rows = conn.execute(
+            f"SELECT fp, protocol, server, port, country, tag, avg_ms,"
+            f" ok_count, fail_count, alive, last_ok_at FROM nodes {where}"
+            f" ORDER BY (CASE WHEN avg_ms>0 THEN avg_ms ELSE 99999 END) ASC"
+            f" LIMIT 20",
+            params,
+        ).fetchall()
+        if not rows:
+            return None
+        scored = []
+        for r in rows:
+            ok_c, fail_c = r[7] or 0, r[8] or 0
+            total = ok_c + fail_c
+            rate = (ok_c / total) if total else 0.5
+            ms = r[6] or 99999
+            score = rate * 1000 - ms
+            scored.append((score, r))
+        scored.sort(key=lambda x: -x[0])
+        r = scored[0][1]
+        return {
+            "fp": r[0], "protocol": r[1], "server": r[2], "port": r[3],
+            "country": r[4], "tag": r[5], "avg_ms": int(r[6] or 0),
+            "ok_count": r[7] or 0, "fail_count": r[8] or 0,
+            "alive": bool(r[9]), "last_ok_at": r[10] or 0,
+        }
+
+    # ── 清理 ──
+
+    def prune(self, *, max_age_sec: int | None = None,
+             pool: str = "free") -> int:
+        """淘汰过期节点：很久没在源里出现、且探测也早已失败。
+
+        用 `<=` 而非 `<`：让 max_age_sec=0 的语义是「立刻全部过期」
+        （测试与运维手动清库都用得上），正常 7 天阈值下两者无差别。
+
+        **默认只清 free 池（pool='free'）**。
+        客户导入的节点不能按「多久没出现在订阅里」来淘汰 —— 客户可能
+        半年不换订阅，但那些付费节点一直可用；免费源的时效逻辑套到
+        客户池上就是误杀。要清客户池必须显式传 pool='cust'
+        （例如客户明确要求清空自己的节点时）。
+        """
+        conn = self._ensure()
+        cutoff = time.time() - (
+            self.PRUNE_AFTER_SEC if max_age_sec is None else max(0, max_age_sec)
+        )
+        cur = conn.execute(
+            "DELETE FROM nodes WHERE pool=? AND last_seen <= ? AND last_ok_at <= ?",
+            (pool, cutoff, cutoff),
+        )
+        n = cur.rowcount or 0
+        if n:
+            log.info("节点库清理：淘汰 %d 个过期 %s 池节点", n, pool)
+        self._secure()
+        return n
+
+    # ── 对外视图（无凭据）──
+
+    def list_public(self, limit: int = 50, *,
+                    only_alive: bool = True,
+                    pool: str = "") -> list[dict[str, Any]]:
+        """节点列表（**无凭据**）—— 给工具/面板。
+
+        地址本身不算敏感（公开源里就有），真正敏感的是 uuid/password；
+        所以给完整地址便于用户判断，但**绝不给 outbound/raw_uri**。
+        `pool` 传 'cust'/'free' 过滤某个池，留空 = 全部。
+        """
+        conn = self._ensure()
+        where = "WHERE 1=1"
+        params: list[Any] = []
+        if only_alive:
+            where += " AND alive=1"
+        if pool in ("cust", "free"):
+            where += " AND pool=?"
+            params.append(pool)
+        rows = conn.execute(
+            f"SELECT fp, protocol, server, port, country, tag, avg_ms,"
+            f" ok_count, fail_count, alive, last_ok_at, sources, pool"
+            f" FROM nodes {where}"
+            f" ORDER BY (CASE WHEN avg_ms>0 THEN avg_ms ELSE 99999 END)"
+            f" ASC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+        return [
+            {
+                "fp": r[0], "protocol": r[1], "server": r[2], "port": r[3],
+                "country": r[4], "tag": r[5], "avg_ms": int(r[6] or 0),
+                "ok_count": r[7] or 0, "fail_count": r[8] or 0,
+                "alive": bool(r[9]), "last_ok_at": r[10] or 0,
+                "sources": len([s for s in (r[11] or "").split(",") if s]),
+                "pool": r[12] or "free",
+            }
+            for r in rows
+        ]
+
+    def source_health(self, limit: int = 100) -> list[dict[str, Any]]:
+        """源健康度（无凭据）。"""
+        conn = self._ensure()
+        rows = conn.execute(
+            "SELECT sid, url, kind, ok_count, fail_count, last_ok_at,"
+            " last_error, nodes_found FROM sources"
+            " ORDER BY (ok_count*1.0/(ok_count+fail_count+0.1)) DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [
+            {
+                "sid": r[0], "url": r[1], "kind": r[2],
+                "ok": r[3], "fail": r[4], "last_ok_at": r[5],
+                "last_error": r[6], "nodes_found": r[7],
+            }
+            for r in rows
+        ]
+
+    def stats(self) -> PoolStats:
+        conn = self._ensure()
+        total = conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
+        alive = conn.execute("SELECT COUNT(*) FROM nodes WHERE alive=1").fetchone()[0]
+        untested = conn.execute(
+            "SELECT COUNT(*) FROM nodes WHERE last_probe_at=0").fetchone()[0]
+        by_proto = dict(conn.execute(
+            "SELECT protocol, COUNT(*) FROM nodes WHERE alive=1"
+            " GROUP BY protocol ORDER BY COUNT(*) DESC").fetchall())
+        by_country = dict(conn.execute(
+            "SELECT country, COUNT(*) FROM nodes WHERE alive=1 AND country<>''"
+            " GROUP BY country ORDER BY COUNT(*) DESC LIMIT 12").fetchall())
+        src_total = conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0]
+        src_ok = conn.execute(
+            "SELECT COUNT(*) FROM sources WHERE ok_count>0").fetchone()[0]
+        last_run_row = conn.execute(
+            "SELECT at, trigger, sources_ok, sources_fail, parsed, new_nodes,"
+            " probed, alive, elapsed_ms, note FROM runs"
+            " ORDER BY id DESC LIMIT 1").fetchone()
+        last_run = None
+        if last_run_row:
+            last_run = {
+                "at": last_run_row[0], "trigger": last_run_row[1],
+                "sources_ok": last_run_row[2], "sources_fail": last_run_row[3],
+                "parsed": last_run_row[4], "new_nodes": last_run_row[5],
+                "probed": last_run_row[6], "alive": last_run_row[7],
+                "elapsed_ms": last_run_row[8], "note": last_run_row[9],
+            }
+        db_bytes = self.path.stat().st_size if self.path.exists() else 0
+        # 分池统计：面板上要能一眼看出「客户池 18 个全活 / 免费池 3 个活的」
+        by_pool: dict[str, dict[str, int]] = {}
+        for p in ("cust", "free"):
+            t = conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(alive=1),0),"
+                " COALESCE(SUM(last_probe_at=0),0) FROM nodes WHERE pool=?",
+                (p,),
+            ).fetchone()
+            by_pool[p] = {"total": t[0] or 0, "alive": t[1] or 0,
+                          "untested": t[2] or 0}
+        return PoolStats(
+            total=total, alive=alive, dead=max(0, total - alive - untested),
+            untested=untested, by_protocol=by_proto, by_country=by_country,
+            by_pool=by_pool,
+            best=self.best(), source_count=src_total, healthy_sources=src_ok,
+            last_run=last_run, db_bytes=db_bytes,
+        )
