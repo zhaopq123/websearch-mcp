@@ -92,3 +92,82 @@ def test_no_local_proxy_returns_false():
     s = _svc("", bypassed=False)
     s.local_proxy = None
     assert asyncio.run(s._switch_to_node({"tag": "x"})) is False
+
+
+# ── 主动接管：无用户代理时开机即用池（2026-10-14）──────────────────
+# 回归背景：清空机场后，「只用节点池」不能等猎手首轮抓源（数分钟）跑完
+# 才靠 smart_failover 接管——那期间出网是直连，墙外站点不可达。
+# ensure_pool_takeover 让池里有活节点就立刻接管。
+
+
+class _Hunter:
+    """假猎手：pool.best 可控；smart_failover 会回调 switch_cb。"""
+
+    def __init__(self, alive: bool):
+        self._alive = alive
+        self.failovers = 0
+
+        class _P:
+            def __init__(self, alive):
+                self._alive = alive
+
+            def best(self, only_alive=True):
+                return {"fp": "abc"} if self._alive else None
+
+        self.pool = _P(alive)
+
+    async def smart_failover(self, *, switch_cb=None):
+        if switch_cb is not None:
+            if not await switch_cb({"tag": "n1"}):
+                return {"switched": False}
+        self.failovers += 1
+        return {"switched": True}
+
+
+def _svc2(user_proxy: str, alive: bool, *, hunter: bool = True) -> Service:
+    s = Service.__new__(Service)
+    s.local_proxy = _LP()
+    s._user_proxy_url = user_proxy
+    s._on_node_pool = False
+    s.pool = _Pool(False)
+    s.hunter = _Hunter(alive) if hunter else None
+    return s
+
+
+def test_ensure_takeover_no_user_proxy_switches():
+    """无用户代理 + 池里有活节点 → 立即接管。"""
+    s = _svc2("", alive=True)
+    assert asyncio.run(s.ensure_pool_takeover()) is True
+    assert s._on_node_pool is True
+    assert s.local_proxy.calls == 1
+    assert s.pool.attached == "http://127.0.0.1:17892"
+
+
+def test_ensure_takeover_respects_user_proxy():
+    """配了用户代理 → 主动接管不动作（尊重用户配置）。"""
+    s = _svc2("http://127.0.0.1:17890", alive=True)
+    assert asyncio.run(s.ensure_pool_takeover()) is False
+    assert s._on_node_pool is False
+    assert s.local_proxy.calls == 0
+
+
+def test_ensure_takeover_empty_pool_noop():
+    """池里暂无活节点 → 不接管（交给猎手循环稍后）。"""
+    s = _svc2("", alive=False)
+    assert asyncio.run(s.ensure_pool_takeover()) is False
+    assert s._on_node_pool is False
+    assert s.local_proxy.calls == 0
+
+
+def test_ensure_takeover_already_on_pool_noop():
+    """已在池上 → 幂等，不重复切。"""
+    s = _svc2("", alive=True)
+    s._on_node_pool = True
+    assert asyncio.run(s.ensure_pool_takeover()) is False
+    assert s.local_proxy.calls == 0
+
+
+def test_ensure_takeover_no_hunter_noop():
+    """节点猎手初始化失败（None）→ 安全返回 False。"""
+    s = _svc2("", alive=True, hunter=False)
+    assert asyncio.run(s.ensure_pool_takeover()) is False

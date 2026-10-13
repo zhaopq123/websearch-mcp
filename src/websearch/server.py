@@ -262,12 +262,15 @@ class Service:
             log.info("用户代理已恢复，出网切回用户代理")
 
     async def start_tier_recovery(self) -> None:
-        """后台回升循环：挂在自养池上时定期试用户代理，好了就切回。
+        """后台回升循环（每 60s）。做两件事：
 
-        与 pool.start_proxy_recovery_loop 同思路：回升不能只挂在搜索路径上，
-        否则「切到自养池后一直没人搜」就永远不回升。
+        1. 挂在自养池上时定期试用户代理，好了就切回（三级兜底的回升）。
+           与 pool.start_proxy_recovery_loop 同思路：回升不能只挂在搜索路径上，
+           否则「切到自养池后一直没人搜」就永远不回升。
+        2. **未配置用户代理时**，若尚未由节点池接管（例如启动时撞上端口竞态
+           导致接管失败、掉回直连），定期重试接管 —— 杜绝「一次失败 → 永久直连」。
         """
-        if self._tier_task is not None or not self._user_proxy_url:
+        if self._tier_task is not None:
             return
 
         async def loop() -> None:
@@ -275,12 +278,35 @@ class Service:
                 try:
                     await asyncio.sleep(60)
                     await self._maybe_restore_user_proxy()
+                    if not self._user_proxy_url and not self._on_node_pool:
+                        await self.ensure_pool_takeover()
                 except asyncio.CancelledError:
                     return
                 except Exception:
                     continue
 
         self._tier_task = asyncio.create_task(loop())
+
+    async def ensure_pool_takeover(self) -> bool:
+        """无用户代理时，让自养节点池**立即**接管出网（池即首选）。
+
+        为什么不等猎手首轮的 smart_failover：那一轮要抓源+探测，可能数分钟；
+        期间出网走直连，墙外站点直接不可达。用户诉求是「只用节点池的节点」，
+        所以只要池里已有实测活节点，开机就接管，不等降级触发。
+        配置了用户代理时不动（尊重用户配置）。
+        """
+        if self._user_proxy_url or self._on_node_pool:
+            return False
+        if self.hunter is None or self.local_proxy is None:
+            return False
+        if not self.hunter.pool.best(only_alive=True):
+            return False        # 池里暂无活节点，交给猎手循环稍后接管
+        try:
+            res = await self.hunter.smart_failover(switch_cb=self._switch_to_node)
+        except Exception as e:
+            log.warning("节点池立即接管失败（不影响搜索）: %s", e)
+            return False
+        return bool(res.get("switched"))
 
     async def warmup(self, enabled: bool = True) -> dict[str, Any] | None:
         """启动预热。失败不影响服务启动（网络随时可能恢复）。"""
@@ -562,8 +588,12 @@ def build_mcp(cfg: Config):
         on_pool = bool(getattr(svc, "_on_node_pool", False))
         lp = svc.local_proxy.status() if svc.local_proxy is not None else {}
         if on_pool and lp.get("running"):
-            hint = (f"用户代理不可用，已由**自养节点池**接管出网"
-                    f"（现有 {alive} 个存活节点，自动轮换；用户代理恢复后自动切回）。")
+            if getattr(svc, "_user_proxy_url", ""):
+                hint = (f"用户代理不可用，已由**自养节点池**接管出网"
+                        f"（现有 {alive} 个存活节点，自动轮换；用户代理恢复后自动切回）。")
+            else:
+                hint = (f"未配置用户代理，出网由**自养节点池**承担"
+                        f"（现有 {alive} 个存活节点，自动轮换，无需自配订阅）。")
         elif st["bypassed"]:
             hint = (f"代理不可用（累计降级 {st['bypass_count']} 次）。"
                     f"节点库有 {alive} 个存活节点，下一轮猎取会自动接管出网。")
@@ -823,6 +853,15 @@ async def _warmup_now() -> None:
     """真正跑预热（lifespan 正常时由它调用）。"""
     on = os.environ.get("WS_WARMUP", "1").strip().lower() not in ("0", "false", "no")
     svc = get_service()
+    # 无用户代理 → 自养节点池即首选：**先**接管出网再预热。
+    # 否则预热先在直连上探测，切换时 http client 被重建，
+    # 在途请求报「client has been closed」，把正常引擎误判成熔断 60s。
+    if svc.hunter is not None and svc.cfg.node_hunt_enabled:
+        try:
+            if await svc.ensure_pool_takeover():
+                log.info("出网已由自养节点池接管（未配置用户代理）")
+        except Exception as e:
+            log.warning("节点池立即接管异常（不影响搜索）: %s", e)
     info = await svc.warmup(enabled=on)
     if info and info.get("available"):
         log.info("预热可用引擎: %s", ", ".join(info["available"]))

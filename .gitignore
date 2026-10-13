@@ -29,3 +29,6 @@ proxy-run/
 
 # build artifacts
 *.egg-info/
+
+# 运维备份（可能含凭据）：绝不入库
+backups/

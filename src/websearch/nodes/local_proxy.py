@@ -135,41 +135,79 @@ class LocalNodeProxy:
             return False
         tmp.replace(self._cfg_path)
 
-        await self._kill()
-        logf = open(self._log_path, "ab", buffering=0)
-        try:
-            os.chmod(self._log_path, 0o600)
-        except OSError:
-            pass
-        try:
-            self._proc = await asyncio.create_subprocess_exec(
-                self.singbox_bin, "run", "-c", str(self._cfg_path),
-                stdout=logf, stderr=logf, stdin=asyncio.subprocess.DEVNULL,
-            )
-        except Exception as e:
-            self.state.last_error = f"启动失败: {type(e).__name__}"
-            return False
-        finally:
+        # 端口竞态防护（实测踩到）：服务重启时旧实例的 sing-box 可能还没被
+        # proot 收掉，端口仍被占用 → 新实例 bind 失败 → **静默掉回直连**。
+        # 起前先清孤儿、等端口释放；起不来再重试一次，别静默失败。
+        for attempt in (1, 2):
+            await self._kill()
+            await self._kill_stale()
+            await self._wait_port_free(self.http_port, timeout=8.0)
+            logf = open(self._log_path, "ab", buffering=0)
             try:
-                logf.close()
-            except Exception:
+                os.chmod(self._log_path, 0o600)
+            except OSError:
                 pass
+            try:
+                self._proc = await asyncio.create_subprocess_exec(
+                    self.singbox_bin, "run", "-c", str(self._cfg_path),
+                    stdout=logf, stderr=logf, stdin=asyncio.subprocess.DEVNULL,
+                )
+            except Exception as e:
+                self.state.last_error = f"启动失败: {type(e).__name__}"
+                return False
+            finally:
+                try:
+                    logf.close()
+                except Exception:
+                    pass
 
-        ready = await self._wait_port(self.http_port, timeout=8.0)
-        self.state.running = ready
-        self.state.pid = self._proc.pid or 0
-        self.state.node_fp = tag
-        self.state.node_desc = desc or tag[:40]
-        self.state.started_at = time.time()
-        if ready:
-            self.state.switches += 1
-            self.state.last_error = ""
-            log.info("本地节点代理已启动：%s（端口 %d）",
-                     self.state.node_desc, self.http_port)
-        else:
-            self.state.last_error = "端口未监听（sing-box 启动失败）"
-            log.warning("本地节点代理启动后端口未就绪")
-        return ready
+            ready = await self._wait_port(self.http_port, timeout=8.0)
+            if ready:
+                self.state.running = True
+                self.state.pid = self._proc.pid or 0
+                self.state.node_fp = tag
+                self.state.node_desc = desc or tag[:40]
+                self.state.started_at = time.time()
+                self.state.switches += 1
+                self.state.last_error = ""
+                log.info("本地节点代理已启动：%s（端口 %d）",
+                         self.state.node_desc, self.http_port)
+                return True
+            log.warning("本地节点代理启动后端口未就绪（第 %d 次尝试）", attempt)
+
+        self.state.running = False
+        self.state.last_error = "端口未监听（sing-box 启动失败）"
+        log.warning("本地节点代理启动失败（已重试）")
+        return False
+
+    async def _kill_stale(self) -> None:
+        """清掉仍在跑的本代理 sing-box（含上一服务实例遗留的孤儿）。
+
+        用配置路径精确匹配，[.] 转义防 pkill 自匹配（本仓库踩过一次）。
+        误伤面：仅匹配命令行含本代理配置路径的进程，不碰别的服务。
+        """
+        pat = str(self._cfg_path).replace(".", "[.]")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "pkill", "-f", pat,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL)
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except Exception:
+            pass
+
+    async def _wait_port_free(self, port: int, timeout: float = 8.0) -> bool:
+        import socket
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+                    pass                     # 仍有人在监听
+            except OSError:
+                return True                  # 端口已释放
+            await asyncio.sleep(0.2)
+        return False
 
     async def stop(self) -> None:
         await self._kill()
