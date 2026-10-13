@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import json
 import logging
 import os
 import secrets
@@ -91,6 +92,49 @@ class Panel:
 
     def clear_fails(self, ip: str) -> None:
         self.fails.pop(ip, None)
+
+
+def _detect_lan_ip_safe() -> str:
+    """探测局域网 IP（失败返回空串，不抛异常）。"""
+    import socket
+
+    for target in (("8.8.8.8", 80), ("223.5.5.5", 80)):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(0.5)
+            s.connect(target)
+            ip = s.getsockname()[0]
+            s.close()
+            if ip and not ip.startswith("127."):
+                return ip
+        except Exception:
+            continue
+    return ""
+
+
+def _read_mcp_token() -> str:
+    """从 .tokens 读 MCP 服务 token。
+
+    只取第一个非注释行的 token 部分。读不到返回空串。
+    注意：这个值会出现在客户端配置片段里（客户端必须要有它），
+    所以只在已登录的会话里返回。
+    """
+    import os as _os
+    from pathlib import Path as _Path
+
+    for p in (_Path(_os.environ.get("WS_TOKEN_FILE", "/opt/websearch-mcp/.tokens")),
+              _Path("/opt/websearch-mcp/.tokens")):
+        try:
+            if not p.exists():
+                continue
+            for line in p.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                return line.split(":")[-1].strip()
+        except Exception:
+            continue
+    return ""
 
 
 def build_panel_app(store: Store, manager: ProxyManager, *, require_token: bool = True):
@@ -184,6 +228,84 @@ def build_panel_app(store: Store, manager: ProxyManager, *, require_token: bool 
         data = store.read_public()
         data["proxy"] = manager.summary()
         return JSONResponse({"ok": True, "config": data})
+
+    async def api_client_config(request):
+        """**最后一公里**：生成「复制到 AI 客户端」的配置片段。
+
+        为什么这个接口最重要：服务跑起来了，但用户不知道怎么把它接到
+        自己的 AI 客户端 —— 这是从「安装成功」到「真正用上」之间那道墙。
+
+        返回多种客户端格式（Claude Desktop / Cursor / 通用 JSON /
+        命令行），用户复制粘贴即可，不需要理解 MCP 协议。
+
+        ⚠️ 这个响应**含访问 token**（客户端需要它才能连）——
+        所以必须登录后才能取，且只回给已认证的会话。
+        """
+        if not authed(request):
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+
+        # 服务地址：优先用请求 Host（用户就是从那个地址访问的，说明可达）
+        req_host = request.headers.get("host", "")
+        port = store.get_int("WS_PORT", 8300)
+        # 面板端口可能是 8500，但 MCP 服务是 8300 —— 取请求 Host 的 IP 部分
+        ip = req_host.split(":")[0] if req_host else ""
+        if not ip or ip in ("localhost", "127.0.0.1"):
+            lan = _detect_lan_ip_safe()
+            ip = lan or "127.0.0.1"
+        url = f"http://{ip}:{port}/mcp"
+
+        token = store.get("WS_MCP_TOKEN", "")
+        if not token:
+            token = _read_mcp_token()
+        if not token:
+            return JSONResponse({
+                "ok": False,
+                "error": "读不到 MCP 服务 token（检查 .tokens 文件是否存在）",
+            }, status_code=400)
+
+        server_name = "websearch"
+        entry = {"url": url, "headers": {"Authorization": f"Bearer {token}"}}
+
+        return JSONResponse({
+            "ok": True,
+            "url": url,
+            "snippets": {
+                # 通用 JSON（多数客户端可粘贴）
+                "generic_json": json.dumps(
+                    {"mcpServers": {server_name: entry}},
+                    ensure_ascii=False, indent=2,
+                ),
+                # Claude Desktop（claude_desktop_config.json）
+                "claude_desktop": json.dumps(
+                    {"mcpServers": {server_name: {
+                        "command": "npx",
+                        "args": ["-y", "mcp-remote", url,
+                                 "--header", f"Authorization: Bearer {token}"],
+                    }}},
+                    ensure_ascii=False, indent=2,
+                ),
+                # DSH / dsh-mcp-manager 的格式
+                "dsh": json.dumps({
+                    "name": server_name,
+                    "transport": "streamable-http",
+                    "enabled": True,
+                    "url": url,
+                    "headers": {"Authorization": f"Bearer {token}"},
+                    "toolCallTimeoutMs": 120000,
+                    "description": "多引擎聚合联网搜索",
+                }, ensure_ascii=False, indent=2),
+                # 命令行自检
+                "curl": (
+                    f'curl -s -X POST {url} \\\n'
+                    f'  -H "Content-Type: application/json" \\\n'
+                    f'  -H "Accept: application/json, text/event-stream" \\\n'
+                    f'  -H "Authorization: Bearer {token}" \\\n'
+                    f"  -d '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\","
+                    f"\"params\":{{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{{}},"
+                    f"\"clientInfo\":{{\"name\":\"test\",\"version\":\"1\"}}}}}}'"
+                ),
+            },
+        })
 
     async def api_save(request):
         """保存订阅/设置。凭据只在此刻从浏览器流向服务器，不落日志。"""
@@ -299,6 +421,7 @@ def build_panel_app(store: Store, manager: ProxyManager, *, require_token: bool 
         Route("/api/login", api_login, methods=["POST"]),
         Route("/api/logout", api_logout, methods=["POST"]),
         Route("/api/config", api_config),
+        Route("/api/client-config", api_client_config),
         Route("/api/save", api_save, methods=["POST"]),
         Route("/api/subscription/clear", api_clear_subscription, methods=["POST"]),
         Route("/api/proxy/start", api_proxy_start, methods=["POST"]),
@@ -444,6 +567,23 @@ td:first-child{color:#8b93a3;width:38%}
     <p class="hint">只显示名称与协议。凭据不出现在页面里。</p>
     <div id="nodes"><span style="color:#8b93a3">代理未启动</span></div>
   </div>
+
+  <div class="card" id="connectCard">
+    <h2>把它接到你的 AI 客户端</h2>
+    <p class="hint">复制下面任意一段，粘到你的 AI 客户端配置里，就能开始用搜索了。</p>
+    <div class="btns" style="margin-top:0;margin-bottom:12px">
+      <button class="ghost" data-fmt="dsh">DSH / dsh-mcp-manager</button>
+      <button class="ghost" data-fmt="generic_json">通用 JSON</button>
+      <button class="ghost" data-fmt="claude_desktop">Claude Desktop</button>
+      <button class="ghost" data-fmt="curl">命令行自检</button>
+    </div>
+    <div class="mono" id="snippet" style="background:#0f1115;border:1px solid #2d3340;
+      border-radius:9px;padding:14px;white-space:pre-wrap;max-height:320px;overflow:auto">加载中…</div>
+    <div class="btns">
+      <button id="btnCopy">复制</button>
+    </div>
+    <div class="msg" id="copyMsg"></div>
+  </div>
 </div>
 <script>
 const $=id=>document.getElementById(id);
@@ -514,5 +654,39 @@ async function loadNodes(){
     `<tr><td>${n.tag}</td><td><span class="mono">${n.protocol}</span></td></tr>`).join('')+'</table>';
 }
 $('logout').onclick=async()=>{await post('/api/logout');location.href='/login';};
-load();loadNodes();
+
+// ── 接入 AI 客户端（最后一公里）──
+let snippets={},curFmt='dsh';
+async function loadSnippets(){
+  const r=await fetch('/api/client-config');
+  if(r.status===401){return;}
+  const d=await r.json();
+  if(!d.ok){$('snippet').textContent=d.error||'读取失败';return;}
+  snippets=d.snippets||{};
+  render();
+}
+function render(){
+  $('snippet').textContent=snippets[curFmt]||'（无此格式）';
+}
+document.querySelectorAll('[data-fmt]').forEach(b=>{
+  b.onclick=()=>{
+    curFmt=b.dataset.fmt;
+    document.querySelectorAll('[data-fmt]').forEach(x=>x.className='ghost');
+    b.className='';
+    render();
+  };
+});
+$('btnCopy').onclick=async()=>{
+  const t=snippets[curFmt]||'';
+  try{
+    await navigator.clipboard.writeText(t);
+    setMsg($('copyMsg'),'已复制到剪贴板',true);
+  }catch(e){
+    // 非 HTTPS 环境下 clipboard API 不可用 —— 退化到选中文本让用户手动复制
+    const r=document.createRange();r.selectNodeContents($('snippet'));
+    const s=getSelection();s.removeAllRanges();s.addRange(r);
+    setMsg($('copyMsg'),'已选中文本，请按 Ctrl+C 复制',true);
+  }
+};
+load();loadNodes();loadSnippets();
 </script></body></html>"""

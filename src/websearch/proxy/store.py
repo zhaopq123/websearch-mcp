@@ -54,6 +54,10 @@ DEFAULTS: dict[str, str] = {
     "WS_SOCKS_PROXY_PORT": "17891",
     "WS_PROXY_AUTO_START": "1",
     "WS_PROXY_HEALTH_INTERVAL": "300",
+    "WS_PANEL_HOST": "127.0.0.1",
+    "WS_PANEL_PORT": "8500",
+    # MCP 搜索服务端口（面板生成客户端配置时要用）
+    "WS_PORT": "8300",
 }
 
 

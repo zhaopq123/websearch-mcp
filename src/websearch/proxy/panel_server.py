@@ -164,10 +164,16 @@ def main() -> None:
     from .store import Store
 
     cfg_file = Path(os.environ.get("WS_CONFIG_FILE", "/opt/websearch-mcp/.env"))
-    host = os.environ.get("WS_PANEL_HOST", "127.0.0.1")
-    port = int(os.environ.get("WS_PANEL_PORT", "8500"))
 
     store = Store(cfg_file)
+
+    # ⚠️ 配置读取必须**先 .env 后环境变量**，而不是只读 os.environ。
+    # 曾经只读环境变量，导致用户在面板/配置文件里改了监听地址、
+    # 重启后毫无变化 —— 用户会认为「程序坏了」。
+    # 这是产品级缺陷，不是小事。
+    # Store.get() 的优先级：环境变量 > .env > 默认值（运维临时覆盖仍可用）。
+    host = store.get("WS_PANEL_HOST", "127.0.0.1")
+    port = store.get_int("WS_PANEL_PORT", 8500)
 
     # ── 启动自检：这些检查失败就不该继续 ──
 
