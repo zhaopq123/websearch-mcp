@@ -460,6 +460,14 @@ def parse_subscription_text(text: str) -> ParseReport:
             })
     if not report.nodes and not report.skipped:
         raise SubscriptionError("订阅里没有识别到任何节点")
+    # 区分两种「零节点」：
+    #   · 一行都不像节点链接（HTML 错误页、纯说明文字）→ 这压根不是订阅，报错
+    #   · 有像节点链接的行但都解析失败/不支持（如整份都是 ssr）→ 返回报告，
+    #     让用户看到具体原因，而不是一句含糊的「没有节点」
+    if not report.nodes and not any(s["scheme"] != "?" for s in report.skipped):
+        raise SubscriptionError(
+            "订阅内容不像节点列表（可能链接失效、返回了网页或错误信息）"
+        )
     return report
 
 
