@@ -245,6 +245,54 @@ class Store:
             return False
         return secrets.compare_digest(real, given)
 
+    # ── 一键登录票据（免手工复制口令）──
+
+    def issue_login_ticket(self, ttl_sec: int = 300) -> str:
+        """签发一次性登录票据，用于生成「点开即登录」的链接。
+
+        为什么需要它：让用户去 grep 口令再手工粘贴，是典型的
+        「运维视角」而非「产品视角」——非技术用户第一步就卡死。
+        票据把口令藏进 URL，点一下就进面板。
+
+        安全设计：
+          · 一次性（用过即废，见 consume_login_ticket）
+          · 短时效（默认 5 分钟）
+          · 存的是**哈希**不是明文 —— 即使 .env 泄露也拿不到票据
+          · 与面板口令分离：票据泄露不能改口令
+        """
+        import hashlib
+        import time
+
+        raw = secrets.token_urlsafe(32)
+        digest = hashlib.sha256(raw.encode()).hexdigest()
+        expiry = int(time.time()) + ttl_sec
+        self.set_many({
+            "WS_LOGIN_TICKET_HASH": digest,
+            "WS_LOGIN_TICKET_EXP": str(expiry),
+        })
+        return raw
+
+    def consume_login_ticket(self, ticket: str) -> bool:
+        """校验并**作废**登录票据。返回是否有效。"""
+        import hashlib
+        import time
+
+        if not ticket:
+            return False
+        stored = self._cache.get("WS_LOGIN_TICKET_HASH", "")
+        if not stored:
+            return False
+        try:
+            exp = int(self._cache.get("WS_LOGIN_TICKET_EXP", "0"))
+        except ValueError:
+            exp = 0
+        # 先作废再判定：即使校验失败也不留下可重试的票据
+        self.delete(["WS_LOGIN_TICKET_HASH", "WS_LOGIN_TICKET_EXP"])
+        if exp and time.time() > exp:
+            return False
+        digest = hashlib.sha256(ticket.encode()).hexdigest()
+        return secrets.compare_digest(stored, digest)
+
     # ── 安全自检 ──
 
     def check_gitignored(self, repo_root: Path | str | None = None) -> tuple[bool, str]:

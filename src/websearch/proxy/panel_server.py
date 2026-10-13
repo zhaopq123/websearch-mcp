@@ -83,6 +83,79 @@ async def _health_loop(store, manager, stop_event: asyncio.Event) -> None:
             log.warning("健康检查异常：%s", type(e).__name__)
 
 
+def _detect_lan_ip() -> str:
+    """探测本机在局域网里的 IP。
+
+    用一个连向公网地址的 UDP socket 拿到「出口网卡」的 IP ——
+    UDP 不真正发包，只是让内核选出路由，所以不需要网络可达。
+    比解析 `hostname -I` / 遍历网卡可靠得多（容器里常有多个虚拟网卡）。
+    """
+    import socket
+
+    for target in (("8.8.8.8", 80), ("1.1.1.1", 80), ("223.5.5.5", 80)):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(0.5)
+            s.connect(target)
+            ip = s.getsockname()[0]
+            s.close()
+            if ip and not ip.startswith("127."):
+                return ip
+        except Exception:
+            continue
+    return ""
+
+
+def _print_access_info(store, host: str, port: int) -> None:
+    """打印访问方式 —— 尽量让用户「点一下就进去」。
+
+    这是安装体验的关键：不要求用户去 grep 口令、不要求手工建隧道。
+    生成一次性登录链接，点开即登录。
+    """
+    print("═" * 62)
+    print(" websearch-mcp 管理面板")
+    print()
+
+    # 本机访问地址
+    local_url = f"http://127.0.0.1:{port}"
+
+    # 局域网访问地址（面板绑非回环时才有意义）
+    lan_ip = _detect_lan_ip()
+    lan_url = f"http://{lan_ip}:{port}" if lan_ip else ""
+
+    if host in ("127.0.0.1", "localhost", "::1"):
+        # 只绑回环：只有本机能访问
+        print(f" ⚠️  面板只监听本机（{host}）")
+        print(f"     本机访问:  {local_url}")
+        print()
+        print("     要从其他设备访问，两种方式：")
+        print(f"       A) SSH 端口转发（推荐，面板不暴露）")
+        print(f"          ssh -N -L {port}:127.0.0.1:{port} <user>@<服务器>")
+        print(f"          然后浏览器开 {local_url}")
+        print(f"       B) 改监听地址（面板暴露到局域网，需靠口令保护）")
+        print(f"          在 {store.path} 里加：WS_PANEL_HOST=0.0.0.0")
+        print(f"          重启面板后即可用 {lan_url or 'http://<服务器IP>:' + str(port)} 访问")
+    else:
+        # 绑了非回环：可直接访问
+        print(f" 访问地址: {lan_url or f'http://{host}:{port}'}")
+
+    # 一键登录链接（免手工复制口令）
+    try:
+        ticket = store.issue_login_ticket(ttl_sec=300)
+        base = lan_url if (host not in ("127.0.0.1", "localhost", "::1") and lan_url) else local_url
+        print()
+        print(" ┌─ 点这个链接直接进面板（5 分钟内有效，一次性）─────────")
+        print(f" │ {base}/_open?t={ticket}")
+        print(" └──────────────────────────────────────────────────────")
+    except Exception as e:
+        log.warning("生成一键登录链接失败：%s", type(e).__name__)
+
+    print()
+    print(f" 配置:   {store.path}")
+    print(f" 口令:   {store.path} 里的 WS_PANEL_TOKEN（遗失可删该行重新生成）")
+    print("═" * 62)
+
+
 def main() -> None:
     setup_logging(os.environ.get("LOG_LEVEL", "info"))
 
@@ -143,13 +216,10 @@ def main() -> None:
     async def on_startup() -> None:
         await _auto_start_proxy(store, manager)
 
-    print("═" * 62)
-    print(" websearch-mcp 管理面板")
-    print(f" 地址:   http://{host}:{port}")
-    print(f" 配置:   {cfg_file}")
     print(f" 代理:   HTTP 127.0.0.1:{manager.http_port} / SOCKS5 127.0.0.1:{manager.socks_port}")
     print(f" sing-box: {'已找到' if manager.available else '未找到（代理功能不可用）'}")
-    print("═" * 62)
+    # 访问方式（含一键登录链接）—— 这是安装体验的关键，别让用户去 grep 口令
+    _print_access_info(store, host, port)
 
     import uvicorn
     from contextlib import asynccontextmanager

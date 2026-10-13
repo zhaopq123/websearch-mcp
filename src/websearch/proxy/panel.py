@@ -115,6 +115,28 @@ def build_panel_app(store: Store, manager: ProxyManager, *, require_token: bool 
     async def login_page(request):
         return HTMLResponse(_LOGIN_HTML)
 
+    async def magic_login(request):
+        """一键登录：用 URL 里的票据换会话，然后跳转到面板。
+
+        这是给「安装完直接能用」体验用的 —— 用户不需要去 grep 口令、
+        不需要手工粘贴。票据一次性、5 分钟失效、存哈希。
+
+        跳转时用 303 把带票据的 URL 换成干净的 /，避免票据留在
+        浏览器历史里。
+        """
+        ticket = request.query_params.get("t", "")
+        if not store.consume_login_ticket(ticket):
+            # 票据无效/过期：退回正常登录页，不提示细节（防探测）
+            return RedirectResponse("/login?expired=1", status_code=303)
+        sid = panel.new_session()
+        resp = RedirectResponse("/", status_code=303)
+        resp.set_cookie(
+            SESSION_COOKIE, sid,
+            httponly=True, samesite="strict", max_age=SESSION_TTL,
+        )
+        log.info("面板：一键登录成功")
+        return resp
+
     # ── API ──
 
     async def api_login(request):
@@ -273,6 +295,7 @@ def build_panel_app(store: Store, manager: ProxyManager, *, require_token: bool 
     routes = [
         Route("/", index),
         Route("/login", login_page),
+        Route("/_open", magic_login),        # 一键登录（票据换会话）
         Route("/api/login", api_login, methods=["POST"]),
         Route("/api/logout", api_logout, methods=["POST"]),
         Route("/api/config", api_config),
