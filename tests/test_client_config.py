@@ -28,10 +28,9 @@ FAKE_MCP_TOKEN = "fake-mcp-token-for-test-abcdef123456"
 @pytest.fixture
 def store(tmp_path):
     s = Store(tmp_path / ".env")
-    s.set_many({
-        "WS_PANEL_TOKEN": FAKE_PANEL_TOKEN,
-        "WS_PORT": "8300",
-    })
+    # 注意：WS_PORT 是**只读**配置（面板不该能改服务端口），
+    # 所以只能写面板口令；端口靠 DEFAULTS / 环境变量提供。
+    s.set_many({"WS_PANEL_TOKEN": FAKE_PANEL_TOKEN})
     return s
 
 
