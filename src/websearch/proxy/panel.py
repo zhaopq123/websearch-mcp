@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import asyncio
 import json
 import logging
 import os
@@ -44,6 +45,22 @@ SESSION_COOKIE = "ws_panel_sid"
 SESSION_TTL = 12 * 3600          # 会话 12 小时
 LOGIN_MAX_FAILS = 5              # 连续失败次数
 LOGIN_LOCK_SEC = 300             # 锁定时长
+
+
+async def _tcp_ok(host: str, port: int, timeout: float = 1.5) -> bool:
+    """探 TCP 端口是否可连（判断服务在不在跑）。
+
+    为什么不用 HTTP 探活：搜索服务要带 token 才能探，而面板判断
+    「服务在不在」不该依赖 token；TCP 层足够且更快。
+    """
+    try:
+        _, w = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout
+        )
+        w.close()
+        return True
+    except Exception:
+        return False
 
 
 class Panel:
@@ -228,6 +245,151 @@ def build_panel_app(store: Store, manager: ProxyManager, *, require_token: bool 
         data = store.read_public()
         data["proxy"] = manager.summary()
         return JSONResponse({"ok": True, "config": data})
+
+    async def api_health_summary(request):
+        """**产品视角的状态**：用人话告诉用户「现在能不能用、哪里坏了、怎么办」。
+
+        为什么不用原始字段：用户看到 {"bypassed": true, "consecutive_failures": 3}
+        不知道该怎么办。产品应该直接说：
+          「🟢 一切正常，可以开始用」
+          「🟡 能用，但只搜到国内网站（墙外源没开）」
+          「🔴 搜索服务没在跑 —— 点这里启动」
+
+        返回 items 列表，每项含 level（ok/warn/error）+ 标题 + 说明 + 可选操作。
+        """
+        if not authed(request):
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+
+        items: list[dict[str, Any]] = []
+
+        # 1) 搜索服务是否在跑（探 TCP，不依赖它是否响应正确）
+        svc_port = store.get_int("WS_PORT", 8300)
+        svc_up = await _tcp_ok("127.0.0.1", svc_port, timeout=1.5)
+        if svc_up:
+            items.append({
+                "level": "ok", "title": "搜索服务正在运行",
+                "detail": f"监听 {svc_port} 端口，可以接受 AI 客户端连接。",
+            })
+        else:
+            items.append({
+                "level": "error", "title": "搜索服务没有运行",
+                "detail": "AI 客户端现在连不上。请启动搜索服务。",
+                "action": {"label": "启动搜索服务", "id": "start_search"},
+            })
+
+        # 2) 代理/出网状态
+        st = manager.state
+        if not st.running:
+            items.append({
+                "level": "warn", "title": "没有配置代理（只搜国内网站）",
+                "detail": ("现在能搜到百度、必应、360、微信等国内源。"
+                           "想搜 Google、DuckDuckGo 这些墙外源，需要填一个订阅链接。"),
+                "action": {"label": "去配置", "id": "focus_sub"},
+            })
+        elif st.last_check_ok:
+            items.append({
+                "level": "ok", "title": "代理工作正常，能访问墙外网站",
+                "detail": (f"出口 IP {st.exit_ip} {st.exit_country}"
+                           if st.exit_ip else "已通过健康检查。"),
+            })
+        else:
+            items.append({
+                "level": "error", "title": "代理配置了但连不上",
+                "detail": (f"原因：{st.last_error or '未知'}。"
+                           "可能是节点失效或订阅过期 —— 换个节点或更新订阅。"
+                           "搜索会自动降级为直连，不会完全用不了。"),
+                "action": {"label": "重新检测", "id": "recheck_proxy"},
+            })
+
+        # 3) 配置安全
+        pub = store.read_public()
+        if pub["file_permissions"]["secure"]:
+            items.append({
+                "level": "ok", "title": "凭据文件权限安全",
+                "detail": "订阅链接和口令只存在本机，权限 600，不会被别人读到。",
+            })
+        else:
+            items.append({
+                "level": "warn", "title": "凭据文件权限过宽",
+                "detail": f"{pub['file_permissions']['detail']} —— 建议收紧。",
+                "action": {"label": "修复权限", "id": "fix_perm"},
+            })
+
+        # 4) sing-box
+        if not manager.available:
+            items.append({
+                "level": "warn", "title": "未安装 sing-box（代理功能不可用）",
+                "detail": "没有它就无法使用墙外搜索源，但国内源仍可用。",
+            })
+
+        # 总体结论
+        levels = {i["level"] for i in items}
+        if "error" in levels:
+            overall = "error"
+        elif "warn" in levels:
+            overall = "warn"
+        else:
+            overall = "ok"
+
+        return JSONResponse({"ok": True, "overall": overall, "items": items})
+
+    async def api_fix_permissions(request):
+        """一键修复凭据文件权限（用户不用懂 chmod）。"""
+        if not authed(request):
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+        import os as _os
+
+        try:
+            _os.chmod(store.path, 0o600)
+            _os.chmod(store.path.parent, 0o700)
+            ok, detail = store.check_permissions()
+            return JSONResponse({"ok": ok, "detail": detail})
+        except Exception as e:
+            return JSONResponse(
+                {"ok": False, "detail": f"修复失败：{type(e).__name__}"}, status_code=500
+            )
+
+    async def api_search_restart(request):
+        """重启搜索服务 —— 用户不用懂 tmux / 看门狗。
+
+        做法：杀掉搜索进程，宿主看门狗会在 10-20 秒内重拉。
+        这是这个部署环境里最可靠的「重启」方式（proot 没有 systemd）。
+        """
+        if not authed(request):
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+
+        import subprocess
+
+        try:
+            # 只杀 websearch.server 进程，不动别的服务
+            r = subprocess.run(
+                ["pkill", "-f", "websearch.server"],
+                capture_output=True, timeout=5,
+            )
+            killed = r.returncode == 0
+        except Exception as e:
+            return JSONResponse({
+                "ok": False,
+                "error": f"执行失败：{type(e).__name__}",
+            }, status_code=500)
+
+        if not killed:
+            return JSONResponse({
+                "ok": False,
+                "error": "没找到搜索服务进程 —— 它可能本来就没在跑，或需要手工启动",
+            }, status_code=400)
+
+        # 等服务回来（最多 40 秒）
+        svc_port = store.get_int("WS_PORT", 8300)
+        for _ in range(20):
+            await asyncio.sleep(2)
+            if await _tcp_ok("127.0.0.1", svc_port, timeout=1.0):
+                log.info("面板：搜索服务已重启")
+                return JSONResponse({"ok": True, "message": "搜索服务已重启"})
+        return JSONResponse({
+            "ok": False,
+            "error": "搜索服务重启后没有回来，请检查服务器上的看门狗（tmux 会话 websearch）",
+        }, status_code=500)
 
     async def api_client_config(request):
         """**最后一公里**：生成「复制到 AI 客户端」的配置片段。
@@ -422,6 +584,9 @@ def build_panel_app(store: Store, manager: ProxyManager, *, require_token: bool 
         Route("/api/logout", api_logout, methods=["POST"]),
         Route("/api/config", api_config),
         Route("/api/client-config", api_client_config),
+        Route("/api/health-summary", api_health_summary),
+        Route("/api/fix-permissions", api_fix_permissions, methods=["POST"]),
+        Route("/api/search/restart", api_search_restart, methods=["POST"]),
         Route("/api/save", api_save, methods=["POST"]),
         Route("/api/subscription/clear", api_clear_subscription, methods=["POST"]),
         Route("/api/proxy/start", api_proxy_start, methods=["POST"]),
@@ -531,6 +696,15 @@ td:first-child{color:#8b93a3;width:38%}
     <button class="ghost" id="logout" style="flex:0 0 auto">退出</button>
   </header>
   <p class="sub">代理与订阅只保存在本机（600 权限、不入 git）。面板永不回显凭据原文。</p>
+
+  <div class="card" id="healthCard">
+    <h2>现在能不能用</h2>
+    <p class="hint">用人话告诉你当前状态；有问题会直接给出该做什么。</p>
+    <div id="health"><span style="color:#8b93a3">检查中…</span></div>
+    <div class="btns">
+      <button class="ghost" id="btnRefreshHealth">重新检查</button>
+    </div>
+  </div>
 
   <div class="card">
     <h2>代理状态</h2>
@@ -688,5 +862,38 @@ $('btnCopy').onclick=async()=>{
     setMsg($('copyMsg'),'已选中文本，请按 Ctrl+C 复制',true);
   }
 };
-load();loadNodes();loadSnippets();
+// ── 人话状态（产品视角：告诉用户能不能用、哪里坏了、怎么办）──
+function healthIcon(lv){return lv==='ok'?'🟢':(lv==='warn'?'🟡':'🔴');}
+async function loadHealth(){
+  const r=await fetch('/api/health-summary');
+  if(r.status===401){return;}
+  const d=await r.json();
+  if(!d.ok){$('health').textContent='读取失败';return;}
+  $('health').innerHTML=d.items.map(it=>{
+    const act=it.action
+      ? `<button class="ghost" style="margin-top:8px;padding:6px 12px;font-size:13px"
+           data-action="${it.action.id}">${it.action.label}</button>` : '';
+    return `<div style="padding:10px 0;border-bottom:1px solid #22262f">
+      <div style="font-weight:600">${healthIcon(it.level)} ${it.title}</div>
+      <div style="color:#8b93a3;font-size:13px;margin-top:4px">${it.detail}</div>
+      ${act}</div>`;
+  }).join('');
+  $('health').querySelectorAll('[data-action]').forEach(b=>{
+    b.onclick=()=>doAction(b.dataset.action,b);
+  });
+}
+async function doAction(id,btn){
+  const old=btn.textContent; btn.textContent='处理中…'; btn.disabled=true;
+  if(id==='start_search'){ await post('/api/proxy/start'); }
+  else if(id==='recheck_proxy'){ await post('/api/proxy/check'); }
+  else if(id==='fix_perm'){ await post('/api/fix-permissions'); }
+  else if(id==='focus_sub'){
+    $('sub').focus(); $('sub').scrollIntoView({behavior:'smooth'});
+    btn.textContent=old; btn.disabled=false; return;
+  }
+  btn.textContent=old; btn.disabled=false;
+  loadHealth(); load(); loadNodes();
+}
+$('btnRefreshHealth').onclick=()=>loadHealth();
+load();loadNodes();loadSnippets();loadHealth();
 </script></body></html>"""
