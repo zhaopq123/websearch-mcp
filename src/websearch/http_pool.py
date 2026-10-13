@@ -393,6 +393,8 @@ class HttpPool:
         self._sem = asyncio.Semaphore(cfg.max_concurrency)
         self.inflight = 0
         self.total_requests = 0
+        # 代理自动恢复的后台任务（配了代理才启动）
+        self._recovery_task: asyncio.Task | None = None
 
     async def _guard_redirect(self, response: httpx.Response) -> None:
         """httpx 的 response event hook：自动跟随重定向前逐跳校验 SSRF。
@@ -447,6 +449,32 @@ class HttpPool:
         """旁路状态下定期探活并在恢复后切回代理。搜索前调用，开销极小。"""
         if self.gate.enabled and self.gate.state.bypassed:
             await self.gate.maybe_probe(self.probe_proxy)
+
+    def start_proxy_recovery_loop(self) -> None:
+        """后台探活循环：即使**没有任何搜索请求**，也能自动恢复代理。
+
+        为什么必须有这个：恢复逻辑原来只挂在搜索路径上
+        （maybe_recover_proxy 由 orchestrator 调）。于是
+        「代理坏了 → 降级 → 之后没人搜 → 永远不恢复」。
+        实测踩坑：代理明明正常，服务却一直直连，且没有任何自愈迹象。
+
+        无流量时每 15 秒探一次（有流量时由搜索路径探，不重复）。
+        """
+        if not self.gate.enabled or self._recovery_task is not None:
+            return
+
+        async def loop() -> None:
+            while True:
+                try:
+                    await asyncio.sleep(15)
+                    if self.gate.state.bypassed:
+                        await self.gate.maybe_probe(self.probe_proxy)
+                except asyncio.CancelledError:
+                    return
+                except Exception:
+                    continue
+
+        self._recovery_task = asyncio.create_task(loop())
 
     @property
     def sem(self) -> asyncio.Semaphore:
@@ -532,6 +560,9 @@ class HttpPool:
                 self.inflight -= 1
 
     async def aclose(self) -> None:
+        if self._recovery_task is not None:
+            self._recovery_task.cancel()
+            self._recovery_task = None
         await self._client.aclose()
         if self._direct_client is not None:
             await self._direct_client.aclose()

@@ -555,9 +555,13 @@ class WarmupMiddleware:
 async def _warmup_now() -> None:
     """真正跑预热（lifespan 正常时由它调用）。"""
     on = os.environ.get("WS_WARMUP", "1").strip().lower() not in ("0", "false", "no")
-    info = await get_service().warmup(enabled=on)
+    svc = get_service()
+    info = await svc.warmup(enabled=on)
     if info and info.get("available"):
         log.info("预热可用引擎: %s", ", ".join(info["available"]))
+    # 启动代理自动恢复循环：配了代理就必须有，
+    # 否则「代理坏了→降级→之后没人搜→永远不恢复」
+    svc.pool.start_proxy_recovery_loop()
 
 
 def build_asgi(cfg: Config):

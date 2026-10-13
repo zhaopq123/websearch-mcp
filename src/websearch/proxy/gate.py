@@ -87,8 +87,18 @@ def _mask_proxy(url: str) -> str:
 class ProxyGate:
     """代理健康门（纯决策，不持有连接）。"""
 
-    FAIL_THRESHOLD = 3        # 连续失败多少次就旁路
-    PROBE_INTERVAL = 60.0     # 旁路后多久探活一次
+    # ⚠️ 阈值 5 而非 3：实测冷启动竞态下 3 次就够降级了。
+    # 典型场景：服务重启时代理（sing-box）还在启动，头 2-3 个请求
+    # 打不通就被判「代理坏了」，于是搜索服务降级直连，
+    # 而代理其实几秒后就绪了 —— 表现为「代理明明正常，
+    # 但搜索服务说什么都不走代理」。
+    # 代价是：真坏时代理要多失败 2 次才降级（约 2 个请求周期，可接受）。
+    FAIL_THRESHOLD = 5
+    # 旁路后多久探活一次。30s 而非 60s：恢复要更快，
+    # 因为「代理好了但搜索还直连」是最容易被误判成「服务坏了」的状态。
+    PROBE_INTERVAL = 30.0
+    # 探活宽限期：启动后这段时间内不判代理故障（给代理留启动时间）
+    WARMUP_GRACE = 20.0
     PROBE_URL = "https://www.google.com/generate_204"
 
     def __init__(self, proxy_url: str, *, enabled: bool = True):
@@ -101,6 +111,8 @@ class ProxyGate:
         )
         self._last_probe_mono = 0.0
         self._lock = asyncio.Lock()
+        # 启动时刻：宽限期内不判代理故障（见 note_result）
+        self._born_mono = time.monotonic()
 
     # ── 决策 ──
 
@@ -109,19 +121,34 @@ class ProxyGate:
         """当前该不该走代理。"""
         return self.enabled and not self.state.bypassed
 
+    @property
+    def in_warmup(self) -> bool:
+        """是否还在启动宽限期内。"""
+        return (time.monotonic() - self._born_mono) < self.WARMUP_GRACE
+
     # ── 结果反馈 ──
 
     def note_result(self, ok: bool, error: str = "") -> None:
         """报告一次请求结果，用于判断代理是否健康。
 
-        注意：**只有指向代理自身的失败才算数**。引擎被反爬（403、
-        验证码、marker）是目标站的行为，不是代理的问题 —— 把它算成
-        代理故障会导致误降级（明明代理好好的，却因为百度封了就直连）。
+        两条规则：
+        1. **只有指向代理自身的失败才算数**。引擎被反爬（403、
+           验证码、marker）是目标站的行为，不是代理的问题 —— 把它算成
+           代理故障会导致误降级（明明代理好好的，却因为百度封了就直连）。
+        2. **启动宽限期内不判故障**。服务与代理同时启动时，头几个请求
+           打不通是正常的（代理进程还在初始化、节点还在握手）。
+           实测踩坑：宽限期不存在时，服务重启后 2-3 个请求就够降级，
+           而代理几秒后就绪了 —— 表现是「代理明明正常，
+           但搜索服务说什么都不走代理」，且**永远不会自己恢复**。
         """
         if not self.enabled or self.state.bypassed:
             return
         if ok:
             self.state.consecutive_failures = 0
+            return
+        if self.in_warmup:
+            # 宽限期内只记录不降级
+            self.state.last_error = f"启动宽限期内（{error or '连接失败'}）"
             return
         if error and not _is_proxy_failure(error):
             return
