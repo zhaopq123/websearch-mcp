@@ -48,6 +48,23 @@ SEED_SOURCES: list[dict[str, str]] = [
     # GitHub 聚合仓库 README：里面指向当日订阅地址
     {"url": "https://raw.githubusercontent.com/openRunner/clash-freenode/main/README.md",
      "kind": "page", "note": "clash-freenode README"},
+    # ── 全球知名聚合仓库（2026-10-13 实测可达，解码后含节点）──
+    # 加这些是为了冲「100 活节点」：免费节点实测存活率仅 ~5%，
+    # 池子越大越能凑够活节点（600 节点 → ~30 活；目标 2000+ 节点）。
+    {"url": "https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.txt",
+     "kind": "sub", "note": "NoMoreWalls 大列表（实测 ~440 节点）"},
+    {"url": "https://raw.githubusercontent.com/mahdibland/ShadowsocksAggregator/master/Eternity.txt",
+     "kind": "sub", "note": "ShadowsocksAggregator Eternity（实测 ~200 节点）"},
+    {"url": "https://raw.githubusercontent.com/ermaozi/get_subscribe/main/subscribe/v2ray.txt",
+     "kind": "sub", "note": "ermaozi 订阅（实测 ~60 节点）"},
+    {"url": "https://raw.githubusercontent.com/ripaojiedian/freenode/main/sub",
+     "kind": "sub", "note": "ripaojiedian freenode"},
+    {"url": "https://raw.githubusercontent.com/freefq/free/master/v2",
+     "kind": "sub", "note": "freefq free"},
+    {"url": "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub",
+     "kind": "sub", "note": "Pawdroid Free-servers"},
+    {"url": "https://raw.githubusercontent.com/yaney01/Yaney01/main/yaney_01",
+     "kind": "sub", "note": "yaney01（ssr 为主）"},
 ]
 
 # 自举搜索词：发现新聚合站。多词覆盖不同表述（免费节点/白嫖/每日更新）
