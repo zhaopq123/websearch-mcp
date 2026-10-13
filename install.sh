@@ -143,19 +143,27 @@ else
   die "面板启动失败。看日志：tail -30 $APP/panel.log"
 fi
 
+# 等一秒让面板稳定 —— 若有看门狗在管，它可能还会拉起自己的实例，
+# 而**新实例签发的票据会让旧的失效**。所以票据由 ticket 工具
+# 在面板稳定后单独签发，而不是靠面板启动日志里的那个。
+sleep 2
+
 echo
 say "═══ 安装完成 ═══"
 echo
-echo "访问方式与直达链接（打印在启动日志里）："
-echo
-sed -n '/websearch-mcp 管理面板/,/^═/p' "$APP/panel.log" | tail -25
+# 用 ticket 工具签发链接（比面板启动日志里的可靠：
+# 看门狗重启面板会让启动时签的票据失效）
+"$PY" -m websearch.proxy.ticket --config "$ENVFILE" 2>&1 || {
+  echo "（自动签发链接失败，可以手动跑：$PY -m websearch.proxy.ticket）"
+}
 echo
 echo "常用命令："
-echo "  看状态:   bash $APP/scripts/panel-ctl.sh status"
-echo "  重启面板: bash $APP/scripts/panel-ctl.sh restart"
-echo "  看日志:   bash $APP/scripts/panel-ctl.sh logs"
+echo "  拿新登录链接: $PY -m websearch.proxy.ticket"
+echo "  看状态:       bash $APP/scripts/panel-ctl.sh status"
+echo "  重启面板:     bash $APP/scripts/panel-ctl.sh restart"
+echo "  看日志:       bash $APP/scripts/panel-ctl.sh logs"
 echo
 echo "下一步："
-echo "  1. 打开上面那个「点这个链接直接进面板」的地址"
+echo "  1. 点开上面那个链接（自动登录）"
 echo "  2. 在「机场订阅」填你的订阅链接 → 保存 → 启动代理"
 echo "  3. 在「把它接到你的 AI 客户端」里复制配置，粘到你的 AI 客户端"
