@@ -359,6 +359,70 @@ async def test_hunter_build_sources_dedup(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_discover_via_search_filters_junk(tmp_path):
+    """源发现必须挡掉搜索引擎跳转/门户噪声。
+
+    2026-10-14 实测：bing.com/ck/a 追踪链接、baike.baidu.com 词条被当成
+    聚合站入库，每轮空转抓取烧预算。这里钉死：垃圾 URL 不进、正常聚合站进。
+    """
+    class _FakeOrch:
+        async def search(self, q, max_results=6, fresh=True):
+            return {"results": [
+                {"url": "https://www.bing.com/ck/a?!&&p=deadbeef&u=a1aHR0"},
+                {"url": "https://baike.baidu.com/item/free!/2929353"},
+                {"url": "https://baiduvideo.cn/"},
+                {"url": "https://www.zhihu.com/question/123"},
+                {"url": "https://aggregator.example.org/subscribe"},   # 合法
+                {"url": "https://sub.example.net/free/latest/"},        # 合法
+            ]}
+
+    found = await node_sources.discover_via_search(_FakeOrch(), max_queries=1)
+    hosts = [u.split("/")[2] for u in found]
+    assert "aggregator.example.org" in "".join(found)
+    assert "sub.example.net" in "".join(found)
+    assert not any("bing.com" in h for h in hosts)
+    assert not any("baidu.com" in h for h in hosts)
+    assert not any("baiduvideo.cn" in h for h in hosts)
+    assert not any("zhihu.com" in h for h in hosts)
+
+
+@pytest.mark.asyncio
+async def test_build_sources_skips_dead_sources(tmp_path):
+    """从未成功且反复失败的「死源」不再进组源清单。"""
+    from websearch.nodes.hunter import (
+        DEAD_SOURCE_MIN_FAILS, NodeHunter,
+    )
+    from websearch.nodes.probe import NodeProber
+
+    pool = NodePool(tmp_path / "p.sqlite3")
+    pool.upsert_source("dead_sid", "https://junk.example/dead", "page")
+    for _ in range(DEAD_SOURCE_MIN_FAILS):
+        pool.record_source_fetch("dead_sid", False, error="fetch fail")
+    pool.upsert_source("ok_sid", "https://good.example/sub.txt", "sub")
+    pool.record_source_fetch("ok_sid", True, nodes_found=12)
+
+    hunter = NodeHunter(
+        pool=pool, fetcher=SourceFetcher(timeout=1),
+        prober=NodeProber(singbox_bin="", work_dir=tmp_path), orch=None,
+    )
+    urls = [s["url"] for s in await hunter._build_sources(discover=False, report={})]
+    assert "https://junk.example/dead" not in urls, "死源应被跳过"
+    assert "https://good.example/sub.txt" in urls, "健康源应保留"
+
+    # 反例：还没到阈值（失败 DEAD-1 次）仍应保留，避免误伤偶发失败
+    pool2 = NodePool(tmp_path / "p2.sqlite3")
+    pool2.upsert_source("flaky_sid", "https://flaky.example/sub.txt", "sub")
+    for _ in range(DEAD_SOURCE_MIN_FAILS - 1):
+        pool2.record_source_fetch("flaky_sid", False, error="fetch fail")
+    h2 = NodeHunter(
+        pool=pool2, fetcher=SourceFetcher(timeout=1),
+        prober=NodeProber(singbox_bin="", work_dir=tmp_path), orch=None,
+    )
+    urls2 = [s["url"] for s in await h2._build_sources(discover=False, report={})]
+    assert "https://flaky.example/sub.txt" in urls2, "未到阈值的源不应被跳过"
+
+
+@pytest.mark.asyncio
 async def test_smart_failover_no_alive_returns_none(tmp_path):
     """池里无存活节点 → 报告「应降级直连」，不假装切换。"""
     from websearch.nodes.hunter import NodeHunter

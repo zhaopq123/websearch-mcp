@@ -51,6 +51,14 @@ DEFAULT_FETCH_CONCURRENCY = 6   # 源抓取并发
 DEFAULT_LOOP_INTERVAL = 600     # 持续搜索间隔（秒）——10 分钟一轮
 LOOP_FAIL_BACKOFF_MAX = 3600    # 连续失败时最长退避到 1 小时
 
+# 「死源」判定：从未成功过、且累计失败到这个数，就不再重复抓。
+# 为什么：历史源清单按「成功率」排序取前 N，但总源数不足 N 时，
+# 从未成功的高失败源会挤进来，每轮空转烧抓取预算（实测 bing 追踪链接
+# 空转 45 次、百度百科词条 403 44 次）。只淘汰「零成功」的源，避免
+# 误伤「偶发失败但曾成功」的正常源。已入库的旧垃圾由 source_health
+# 按成功率沉底 + 本阈值双重兜底。
+DEAD_SOURCE_MIN_FAILS = 8
+
 # ── 保活闭环（维持 N 个活节点）──
 #
 # 为什么需要单独一套参数：默认配置是「随便搜搜」，一轮 120 个探测、
@@ -356,6 +364,9 @@ class NodeHunter:
 
         # 历史源：健康度高的在前（失败多的自然沉底）
         for s in self.pool.source_health(limit=60):
+            # 死源（从未成功且反复失败）不再重抓，避免挤占预算空转
+            if (s.get("ok") or 0) == 0 and (s.get("fail") or 0) >= DEAD_SOURCE_MIN_FAILS:
+                continue
             kind = s.get("kind") or "sub"
             add(s["url"], kind, "history")
 

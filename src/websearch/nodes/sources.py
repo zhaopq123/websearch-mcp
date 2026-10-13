@@ -110,6 +110,22 @@ _NOISE_DOMAINS = (
     "apple.com", "microsoft.com", "cloudflare.com", "jsdelivr.net",
     "unpkg.com", "bootcdn.net", "staticfile.org", "baidu.com",
     "bing.com", "mozilla.org", "facebook.com", "instagram.com",
+    # 搜索引擎域：搜索结果里常混入**自己的跳转/追踪链接**
+    # （如 bing.com/ck/a?...、so.com/link?url=），误当源会每轮空转。
+    # 2026-10-14 实测：bing.com/ck/a 空转 45 次、baidu.com/item/* 403 44 次。
+    "sogou.com", "so.com", "360.cn", "sm.cn", "yandex.com",
+    "duckduckgo.com", "mojeek.com", "brave.com", "startpage.com",
+    "ecosia.org",
+    # 门户/社媒/视频：不是节点源，只是结果噪声
+    "douyin.com", "kuaishou.com", "weibo.com", "xiaohongshu.com",
+    "bilibili.com", "toutiao.com", "qq.com", "zhihu.com", "juejin.cn",
+    "csdn.net", "baiduvideo.cn", "iqiyi.com", "youku.com", "mgtv.com",
+)
+
+# URL 里出现即强烈暗示是「跳转/追踪」而非真实站点（搜索结果的中间页）。
+_JUNK_URL_MARKERS = (
+    "/ck/a", "/link?", "/redirect", "/jump?", "returl=",
+    "target=http", "url=http%3a", "url=http", "&url=http",
 )
 
 
@@ -328,16 +344,19 @@ async def discover_via_search(orch, *, max_queries: int = 3,
             if not url or url in seen:
                 continue
             try:
-                host = urlsplit(url).hostname or ""
+                host = (urlsplit(url).hostname or "").lower()
             except Exception:
                 continue
             if not host:
                 continue
-            # 只收「站点首页/栏目页」级别，不要深链
-            if any(host.endswith(x) for x in (
-                    "github.com", "t.me", "twitter.com", "x.com",
-                    "youtube.com", "zhihu.com", "juejin.cn", "csdn.net")):
-                # GitHub 仓库页可能是源，但噪声大，跳过（种子源已覆盖）
+            # 噪声域（搜索引擎/社媒/门户）：搜索结果里的跳转与门户页
+            # 会被误当聚合站。这里与 _looks_like_subscription_url 共用
+            # 同一份 _NOISE_DOMAINS，避免两处黑名单漂移（2026-10-14 修：
+            # 原先 discover 用的是另一套内联名单，漏了搜索域 → bing 追踪
+            # 链接、百度百科词条被当源入库，每轮空转烧探测预算）。
+            if any(_host_matches(host, d) for d in _NOISE_DOMAINS):
+                continue
+            if any(m in url.lower() for m in _JUNK_URL_MARKERS):
                 continue
             seen.add(url)
             found.append(url)
