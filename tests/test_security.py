@@ -91,8 +91,18 @@ def test_token_auth_requires_token_when_enabled():
 
 
 def test_token_auth_public_paths():
+    """免鉴权路径收敛到只回 {ok:true} 的 /healthz。
+
+    /health 曾经也在免鉴权集合里，但它会暴露引擎可用性、请求统计、
+    内网运行状态 —— 那是标准的侦察面。现在它必须带 token。
+    """
     auth = TokenAuth({"s"}, required=True)
-    assert auth.check({}, "/health")[0] is True
+    assert auth.check({}, "/healthz")[0] is True
+    # /health 与 /warmup 现在都要鉴权
+    assert auth.check({}, "/health")[0] is False
+    assert auth.check({}, "/warmup")[0] is False
+    assert auth.check({}, "/docs")[0] is False
+    assert auth.check({}, "/")[0] is False
 
 
 def test_token_auth_disabled():
@@ -126,3 +136,69 @@ def test_missing_token_refuses_to_start_when_required():
     finally:
         if old:
             os.environ["WS_TOKEN"] = old
+
+
+# ══════════════════ 2026-10-13 修复的 bypass 回归 ══════════════════
+
+
+def test_block_ipv4_mapped_ipv6():
+    """::ffff:127.0.0.1 这类地址必须拦住。
+
+    IPv4-mapped IPv6 是经典 SSRF 绕过手法：它的 is_loopback / is_private
+    对映射部分**不生效**，直接判会把内网地址当公网放过去。
+    """
+    c = cfg()
+    for u in ("http://[::ffff:127.0.0.1]/", "http://[::ffff:169.254.169.254]/",
+              "http://[::ffff:10.0.0.1]/", "http://[::ffff:192.168.3.35]/"):
+        ok, reason = check_url(u, c)
+        assert not ok, f"{u} 应被拒绝（IPv4-mapped IPv6 绕过）"
+        assert "private" in reason
+
+
+async def test_check_redirect_blocks_private_target():
+    """重定向逐跳校验：跳到内网/元数据地址的目标必须被拒。
+
+    这条防线针对的是：follow_redirects=True 时 httpx 自动跟随跳转，
+    而 assert_url_async 只校验了最初那个公网 URL。
+    """
+    from websearch.http_pool import check_redirect_sync
+
+    c = cfg()
+    ok, reason = await check_redirect_sync("http://169.254.169.254/", c)
+    assert not ok, "元数据地址必须拒"
+    assert "redirect_private_ip" in reason
+
+    ok, _ = await check_redirect_sync("http://127.0.0.1:8080/", c)
+    assert not ok, "loopback 必须拒"
+
+    # allow_private_net 打开时应放行（显式关闭防护的部署）
+    c2 = cfg(allow_private_net=True)
+    ok, _ = await check_redirect_sync("http://169.254.169.254/", c2)
+    assert ok
+
+
+async def test_guard_redirect_hook_blocks_private_location():
+    """event hook 本体：3xx + 危险 Location → 抛 BlockedRedirectError。"""
+    import httpx
+
+    from websearch.http_pool import BlockedRedirectError, HttpPool
+
+    pool = HttpPool(cfg())
+    try:
+        req = httpx.Request("GET", "https://public.example.com/")
+        resp = httpx.Response(302, request=req,
+                              headers={"location": "http://169.254.169.254/latest/"})
+        with pytest.raises(BlockedRedirectError):
+            await pool._guard_redirect(resp)
+
+        # 非 3xx 不该触发校验
+        resp200 = httpx.Response(200, request=req,
+                                 headers={"location": "http://169.254.169.254/"})
+        await pool._guard_redirect(resp200)  # 不抛即通过
+
+        # 公网重定向放行
+        resp_ok = httpx.Response(302, request=req,
+                                 headers={"location": "https://example.org/"})
+        await pool._guard_redirect(resp_ok)
+    finally:
+        await pool.aclose()

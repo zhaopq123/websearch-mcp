@@ -115,6 +115,53 @@ def _fastmcp_version() -> str:
         return "unknown"
 
 
+# ══════════════════════ 参数解析 ══════════════════════
+
+
+def _parse_url_list(urls: Any) -> list[str]:
+    """把 urls 参数解析成 URL 列表。
+
+    接受三种形态（调用方 schema 已声明 `str | list[str]`，但老客户端
+    仍可能只发字符串，而且工具描述一直承诺「也可传 JSON 数组字符串」）：
+      · 原生 list  → 逐项 strip
+      · JSON 数组字符串 → 解析后逐项 strip
+      · 逗号分隔字符串 → split
+    坏 JSON 不抛异常，退化成「当整体是一个 URL」，跟修复前行为一致。
+    """
+    if isinstance(urls, list):
+        items = [str(u).strip() for u in urls]
+    else:
+        raw = (str(urls) if urls is not None else "").strip()
+        if raw.startswith("["):
+            try:
+                parsed = json.loads(raw)
+                items = ([str(u).strip() for u in parsed]
+                         if isinstance(parsed, list) else [raw])
+            except Exception:
+                items = [raw]
+        else:
+            items = [x.strip() for x in raw.split(",") if x.strip()]
+    return [u for u in items if u]
+
+
+def _parse_query_list(queries: Any, cap: int = 8) -> list[str]:
+    """queries 参数同上，三种形态都接受。cap 限制条数上限。"""
+    if isinstance(queries, list):
+        items = [str(q).strip() for q in queries]
+    else:
+        raw = (str(queries) if queries is not None else "").strip()
+        if raw.startswith("["):
+            try:
+                parsed = json.loads(raw)
+                items = ([str(q).strip() for q in parsed]
+                         if isinstance(parsed, list) else [raw])
+            except Exception:
+                items = [raw]
+        else:
+            items = [x.strip() for x in raw.split(",") if x.strip()]
+    return [q for q in items if q][:cap]
+
+
 # ══════════════════════ 服务容器 ══════════════════════
 
 
@@ -259,21 +306,7 @@ def build_mcp(cfg: Config):
         安全：内网地址、非 80/443 端口、带用户名密码的 URL 一律拒绝；
         重定向每一跳都会重新校验，防止 302 跳内网绕过。
         """
-        # urls 兼容三种形态：原生 list、JSON 数组字符串、逗号分隔字符串。
-        # schema 已经用 anyOf 声明了 list 合法，但老客户端仍可能只发字符串。
-        if isinstance(urls, list):
-            lst = [str(u).strip() for u in urls]
-        else:
-            raw = (urls or "").strip()
-            if raw.startswith("["):
-                try:
-                    parsed = json.loads(raw)
-                    lst = [str(u).strip() for u in parsed] if isinstance(parsed, list) else [raw]
-                except Exception:
-                    lst = [raw]
-            else:
-                lst = [x.strip() for x in raw.split(",") if x.strip()]
-        lst = [u for u in lst if u][:10]
+        lst = _parse_url_list(urls)[:10]
 
         if not lst:
             return {"error": "urls 不能为空", "results": []}
@@ -317,19 +350,7 @@ def build_mcp(cfg: Config):
           fresh                默认 true（实时）。深度检索本来就是现查现用，
                                没必要吃缓存；要连续查同一个问题时再关掉。
         """
-        if isinstance(queries, list):
-            lst = [str(q).strip() for q in queries]
-        else:
-            raw = (queries or "").strip()
-            if raw.startswith("["):
-                try:
-                    parsed = json.loads(raw)
-                    lst = [str(q).strip() for q in parsed] if isinstance(parsed, list) else [raw]
-                except Exception:
-                    lst = [raw]
-            else:
-                lst = [x.strip() for x in raw.split(",") if x.strip()]
-        lst = [q for q in lst if q][:8]
+        lst = _parse_query_list(queries)
         if not lst:
             return {"error": "queries 不能为空"}
 
