@@ -22,25 +22,30 @@ from websearch.proxy.store import Store
 SRC = Path(__file__).resolve().parents[1] / "src"
 
 
-def run_ticket(cfg_path: Path, *args: str) -> subprocess.CompletedProcess:
+def run_ticket(cfg_path: Path, *args: str, extra_env: dict | None = None) -> subprocess.CompletedProcess:
     """以子进程方式跑 ticket 工具（模拟用户敲命令）。"""
+    env = {"PYTHONPATH": str(SRC), "PATH": "/usr/bin:/bin"}
+    if extra_env:
+        env.update(extra_env)
     return subprocess.run(
         [sys.executable, "-m", "websearch.proxy.ticket",
          "--config", str(cfg_path), *args],
-        capture_output=True, text=True, timeout=30,
-        env={"PYTHONPATH": str(SRC), "PATH": "/usr/bin:/bin"},
+        capture_output=True, text=True, timeout=30, env=env,
     )
 
 
 @pytest.fixture
 def cfg(tmp_path):
+    """建一个配置文件。
+
+    ⚠️ 只写**面板可写**的键（WS_PANEL_TOKEN）。
+    WS_PANEL_HOST / WS_PANEL_PORT 是只读配置 —— 面板不该能改自己的
+    监听地址（改了会导致面板重启后失联）。它们由 DEFAULTS 或环境变量提供。
+    这个约束踩过三次（票据键、WS_PORT、WS_PANEL_HOST），写测试时注意。
+    """
     p = tmp_path / ".env"
     s = Store(p)
-    s.set_many({
-        "WS_PANEL_TOKEN": "panel-token-for-test-only-0123456789",
-        "WS_PANEL_HOST": "0.0.0.0",
-        "WS_PANEL_PORT": "8500",
-    })
+    s.set_many({"WS_PANEL_TOKEN": "panel-token-for-test-only-0123456789"})
     return p
 
 
@@ -64,7 +69,11 @@ def test_ticket_tool_link_is_actually_usable(cfg):
 
 
 def test_ticket_tool_uses_saved_host_and_port(cfg):
-    r = run_ticket(cfg)
+    """用环境变量提供 host/port（它们是只读配置，只能这样注入）。"""
+    r = run_ticket(cfg, extra_env={
+        "WS_PANEL_HOST": "0.0.0.0", "WS_PANEL_PORT": "8500",
+    })
+    assert r.returncode == 0, r.stderr
     assert ":8500" in r.stdout, "没用配置里的端口"
     assert "/_open" in r.stdout
 
