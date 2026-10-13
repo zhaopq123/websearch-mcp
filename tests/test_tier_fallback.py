@@ -171,3 +171,117 @@ def test_ensure_takeover_no_hunter_noop():
     """节点猎手初始化失败（None）→ 安全返回 False。"""
     s = _svc2("", alive=True, hunter=False)
     assert asyncio.run(s.ensure_pool_takeover()) is False
+
+
+# ── 死节点自愈：当前节点死了就换（2026-10-14）──────────────────────
+# 回归背景：实测节点 6a03d7d5（韩国）在池里仍 alive=1 且均延迟最优，
+# 但它已死 —— smart_failover 认为「当前仍最优」不换，服务卡死节点上，
+# 所有走代理的墙外引擎全挂 → 用户拿到 server_busy。重选原本只发生
+# 在 hunt 轮（数百秒一次），太慢。这里锁定 recover_dead_node 的行为。
+
+
+class _Gate3:
+    def __init__(self, bypassed: bool, enabled: bool = True):
+        self.enabled = enabled
+        self.state = type("S", (), {"bypassed": bypassed})()
+
+
+class _NodePool3:
+    DEAD_STREAK = 3
+
+    def __init__(self):
+        self.recorded: list[tuple[str, bool]] = []
+
+    def record_probe(self, fp, ok, ms=0):
+        self.recorded.append((fp, bool(ok)))
+
+    def best(self, only_alive=True):
+        return {"fp": "new1"}
+
+
+class _Pool3:
+    def __init__(self, bypassed: bool, enabled: bool = True):
+        self.gate = _Gate3(bypassed, enabled)
+        self.attached: str | None = None
+        self.probe_ok = True
+        self.probed = 0
+
+    async def attach_proxy(self, url: str) -> bool:
+        self.attached = url
+        return True
+
+    async def probe_proxy(self) -> bool:
+        self.probed += 1
+        return self.probe_ok
+
+
+class _Hunter3:
+    def __init__(self, cur: str | None, switch_ok: bool = True):
+        self.pool = _NodePool3()
+        self.state = type("S", (), {"current_node_fp": cur})()
+        self.switched = False
+        self._switch_ok = switch_ok
+
+    async def smart_failover(self, *, switch_cb=None):
+        if switch_cb is not None and not await switch_cb({"tag": "n"}):
+            return {"switched": False, "reason": "切换失败"}
+        self.switched = True
+        return {"switched": True, "fp": "new1", "reason": "切到 香港 5227ms"}
+
+
+def _svc3(*, bypassed: bool, on_pool: bool = True, cur: str | None = "dead1",
+           hunter: bool = True, enabled: bool = True) -> Service:
+    s = Service.__new__(Service)
+    s.local_proxy = _LP()
+    s._user_proxy_url = ""
+    s._on_node_pool = on_pool
+    s._last_node_recover_mono = 0.0
+    s.pool = _Pool3(bypassed, enabled)
+    s.hunter = _Hunter3(cur) if hunter else None
+    return s
+
+
+def test_recover_dead_node_switches_when_bypassed():
+    """代理进旁路（当前节点已死）→ 标死旧节点并换新节点。"""
+    s = _svc3(bypassed=True, cur="dead1")
+    assert asyncio.run(s.recover_dead_node()) is True
+    assert s.hunter.switched is True
+    # 旧节点被标死 DEAD_STREAK 次，否则 best() 仍会选它
+    assert s.hunter.pool.recorded == [("dead1", False)] * 3
+    assert s.pool.attached == "http://127.0.0.1:17892"
+
+
+def test_recover_dead_node_noop_when_healthy():
+    """代理健康（未旁路）→ 不动，避免无谓重启代理。"""
+    s = _svc3(bypassed=False)
+    assert asyncio.run(s.recover_dead_node()) is False
+    assert s.hunter.switched is False
+    assert s.hunter.pool.recorded == []
+
+
+def test_recover_dead_node_noop_when_not_on_pool():
+    """未挂在节点池上（例如走用户代理）→ 不动作。"""
+    s = _svc3(bypassed=True, on_pool=False)
+    assert asyncio.run(s.recover_dead_node()) is False
+    assert s.hunter.switched is False
+
+
+def test_recover_dead_node_noop_when_gate_disabled():
+    """gate 未启用（没配任何代理）→ 不动作。"""
+    s = _svc3(bypassed=True, enabled=False)
+    assert asyncio.run(s.recover_dead_node()) is False
+
+
+def test_recover_dead_node_cooldown():
+    """同一坏节点在冷却窗口内不反复换节点（防抖）。"""
+    s = _svc3(bypassed=True)
+    assert asyncio.run(s.recover_dead_node()) is True
+    s.hunter.switched = False
+    assert asyncio.run(s.recover_dead_node()) is False   # 冷却内
+    assert s.hunter.switched is False
+
+
+def test_recover_dead_node_no_hunter_noop():
+    """猎手初始化失败 → 安全返回 False。"""
+    s = _svc3(bypassed=True, hunter=False)
+    assert asyncio.run(s.recover_dead_node()) is False

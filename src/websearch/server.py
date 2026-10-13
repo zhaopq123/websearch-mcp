@@ -183,6 +183,8 @@ class Service:
         self._user_proxy_url = (cfg.proxy or "").strip()
         self._on_node_pool = False
         self._tier_task: asyncio.Task | None = None
+        # 死节点自愈：上一次换节点的时刻（单调钟），用于冷却防抖
+        self._last_node_recover_mono = 0.0
         self.hunter = self._build_hunter(cfg)
 
     def _build_hunter(self, cfg: Config):
@@ -280,12 +282,63 @@ class Service:
                     await self._maybe_restore_user_proxy()
                     if not self._user_proxy_url and not self._on_node_pool:
                         await self.ensure_pool_takeover()
+                    # 已挂在节点池上：当前节点被代理失败证明已死时换一个，
+                    # 不等下一轮 hunt（那要数分钟，期间墙外引擎全挂）
+                    if self._on_node_pool:
+                        await self.recover_dead_node()
                 except asyncio.CancelledError:
                     return
                 except Exception:
                     continue
 
         self._tier_task = asyncio.create_task(loop())
+
+    async def recover_dead_node(self) -> bool:
+        """当前节点池节点被判定不可用时，立刻换一个活节点（自愈）。
+
+        为什么需要：免费节点随时会死。重选原本只发生在 hunt 轮
+        （150-330s 一轮），死节点期间**所有走代理的墙外引擎全挂** →
+        用户拿到 server_busy 或空结果。实测：节点 6a03d7d5（韩国）在池里
+        仍是 alive=1 且均延迟最优，故 smart_failover 认为「当前仍最优」
+        不换 —— 必须先把死节点标死，才换得动。
+
+        判据用 gate 的旁路信号：连续 ≥FAIL_THRESHOLD 次**指向代理本身**的
+        失败（连不上/超时/隧道失败，反爬 403 不算）才会进旁路。
+        换节点后 attach_proxy 会重建 gate 重置旁路，天然限流：
+        新节点若也坏，要再攒够失败才二次触发，不会来回抖。
+        """
+        if self.hunter is None or self.local_proxy is None:
+            return False
+        gate = self.pool.gate
+        if not (gate.enabled and gate.state.bypassed):
+            return False        # 代理健康，不动
+        now = time.monotonic()
+        if now - self._last_node_recover_mono < 60.0:
+            return False        # 冷却：与看门狗同频，防抖
+        self._last_node_recover_mono = now
+
+        cur = self.hunter.state.current_node_fp
+        # ① 把当前节点标死，否则 best() 仍选它、smart_failover 不换
+        if cur:
+            for _ in range(self.hunter.pool.DEAD_STREAK):
+                self.hunter.pool.record_probe(cur, False, 0)
+        # ② 选下一个最优活节点并切换（attach_proxy 会重置 gate 的旁路）
+        try:
+            res = await self.hunter.smart_failover(switch_cb=self._switch_to_node)
+        except Exception as e:
+            log.warning("死节点自愈失败（不影响搜索）: %s", e)
+            return False
+        if not res.get("switched"):
+            return False
+        log.info("当前节点不可用，已自动换节点：%s", res.get("reason", ""))
+        # ③ 探一次新代理，仅作可观测性（attach_proxy 已重建 gate、旁路已清）
+        try:
+            if not await self.pool.probe_proxy():
+                log.warning("换节点后新代理仍未探通（%s），将继续等待下一次自愈",
+                            res.get("fp", "")[:8])
+        except Exception:
+            pass
+        return True
 
     async def ensure_pool_takeover(self) -> bool:
         """无用户代理时，让自养节点池**立即**接管出网（池即首选）。
