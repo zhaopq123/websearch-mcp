@@ -230,16 +230,30 @@ class NodeProber:
         try:
             # 端口竞态防护（同 LocalNodeProxy，实测踩到）：上一轮探测实例可能
             # 还没被 proot 收掉，占住 20000 段 → 本批 sing-box bind 失败 →
-            # **整批 0 存活**（原本还是静默的，最难查）。起前清孤儿 + 等端口。
-            await self._kill_stale_probe()
-            await self._wait_port_free(PROBE_PORT_BASE, timeout=6.0)
-            proc = await asyncio.create_subprocess_exec(
-                self.singbox_bin, "run", "-c", str(cfg_path),
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-                stdin=asyncio.subprocess.DEVNULL,
-            )
-            if not await self._wait_port(PROBE_PORT_BASE, timeout=8.0):
+            # **整批 0 存活**（原本还是静默的，最难查）。起前清孤儿 + 等端口，
+            # 起不来再重试一次（重启 churn 期间该竞态会变频繁）。
+            started = False
+            for attempt in (1, 2):
+                await self._kill_stale_probe()
+                await self._wait_port_free(PROBE_PORT_BASE, timeout=6.0)
+                proc = await asyncio.create_subprocess_exec(
+                    self.singbox_bin, "run", "-c", str(cfg_path),
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                    stdin=asyncio.subprocess.DEVNULL,
+                )
+                if await self._wait_port(PROBE_PORT_BASE, timeout=8.0):
+                    started = True
+                    break
+                log.warning("探测实例启动失败（第 %d 次尝试）：端口 %d 未就绪",
+                            attempt, PROBE_PORT_BASE)
+                try:
+                    proc.terminate()
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except Exception:
+                    pass
+                proc = None
+            if not started:
                 log.warning(
                     "探测实例启动失败：端口 %d 未就绪，本批 %d 个判失败"
                     "（疑似端口竞态/实例崩溃）", PROBE_PORT_BASE, len(nodes))
