@@ -241,10 +241,53 @@ def test_save_response_has_no_secret(client):
 
 
 def test_save_updates_config(client, store):
+    """保存要真的写进配置键。
+
+    曾经的 bug：面板把前端字段名（proxy_enabled）当成配置键写进去，
+    结果 set_many 抛 ConfigError → 面板返回 400，而测试只断言配置值，
+    表现为「保存失败但没人发现」。所以这里**必须同时断言返回码**。
+    """
     client.post("/api/login", json={"token": FAKE_PANEL_TOKEN})
-    client.post("/api/save", json={"proxy_enabled": True, "http_port": 17900})
+    r = client.post("/api/save", json={"proxy_enabled": True, "http_port": 17900})
+    assert r.status_code == 200, f"保存失败: {r.text}"
     assert store.get_bool("WS_PROXY_ENABLED") is True
     assert store.get_int("WS_HTTP_PROXY_PORT") == 17900
+
+
+def test_save_never_writes_unknown_keys(client, store):
+    """保存后配置文件里不能出现白名单外的键。
+
+    这是上面那个 bug 的直接回归：前端字段名绝不能落到文件里。
+    """
+    client.post("/api/login", json={"token": FAKE_PANEL_TOKEN})
+    client.post("/api/save", json={
+        "proxy_enabled": True, "auto_start": True,
+        "http_port": 17901, "socks_port": 17902, "health_interval": 600,
+    })
+    content = store.path.read_text(encoding="utf-8")
+    for bogus in ("proxy_enabled", "auto_start", "http_port",
+                  "socks_port", "health_interval"):
+        # 不能出现 "proxy_enabled=" 这种前端字段名做键的行
+        assert f"\n{bogus}=" not in content, f"写入了非法键 {bogus}"
+    # 正确的键要在
+    for good in ("WS_PROXY_ENABLED", "WS_HTTP_PROXY_PORT",
+                 "WS_SOCKS_PROXY_PORT", "WS_PROXY_HEALTH_INTERVAL"):
+        assert good in content, f"缺少配置键 {good}"
+
+
+def test_save_all_fields_roundtrip(client, store):
+    """所有可保存字段都要能读回来（防止漏改某个字段的键名）。"""
+    client.post("/api/login", json={"token": FAKE_PANEL_TOKEN})
+    r = client.post("/api/save", json={
+        "proxy_enabled": True, "auto_start": False,
+        "http_port": 17911, "socks_port": 17912, "health_interval": 900,
+    })
+    assert r.status_code == 200, r.text
+    assert store.get_bool("WS_PROXY_ENABLED") is True
+    assert store.get_bool("WS_PROXY_AUTO_START") is False
+    assert store.get_int("WS_HTTP_PROXY_PORT") == 17911
+    assert store.get_int("WS_SOCKS_PROXY_PORT") == 17912
+    assert store.get_int("WS_PROXY_HEALTH_INTERVAL") == 900
 
 
 def test_proxy_start_without_subscription_fails_cleanly(client):

@@ -188,7 +188,11 @@ def build_panel_app(store: Store, manager: ProxyManager, *, require_token: bool 
             ("auto_start", "WS_PROXY_AUTO_START"),
         ):
             if field in body:
-                values[key] = "1" if body[field] else "0"
+                # 注意：键名用 field（配置键），不是 key（前端字段名）。
+                # 曾经误写成 values[key]，写进去一个无意义的 "proxy_enabled"，
+                # 白名单外——但因为 set_many 的校验只看 key，这个键被静默写入
+                # 且永远读不到，表现为「保存成功但设置没生效」。
+                values[field] = "1" if body[field] else "0"
         for key, field in (
             ("http_port", "WS_HTTP_PROXY_PORT"),
             ("socks_port", "WS_SOCKS_PROXY_PORT"),
@@ -196,7 +200,7 @@ def build_panel_app(store: Store, manager: ProxyManager, *, require_token: bool 
         ):
             if field in body:
                 try:
-                    values[key] = str(int(body[field]))
+                    values[field] = str(int(body[field]))
                 except (TypeError, ValueError):
                     return JSONResponse(
                         {"ok": False, "error": f"{field} 必须是整数"}, status_code=400
