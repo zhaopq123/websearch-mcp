@@ -286,7 +286,10 @@ class NodeHunter:
                 # 3) 探测候选（cust 配额 + free 补量）
                 probe_report = await self._probe_candidates(probe_limit)
                 report.update(probe_report)
-                self._update_alive_rate(report["probed"], report["alive"])
+                # 探测实例没起来（端口竞态等）造成的 0 存活不是「节点都差」，
+                # 别喂给存活率 EMA —— 否则坏一轮就让下轮 batch 缩水（负反馈）
+                if not report.get("probe_start_failed"):
+                    self._update_alive_rate(report["probed"], report["alive"])
 
                 # 4) 清理。保活模式要**激进淘汰**：死节点堆积会拖慢
                 #    候选查询，且免费节点本就该按小时计寿命。
@@ -482,18 +485,24 @@ class NodeHunter:
         for batch, _pool in parts:
             cands.extend(batch)
         if not cands:
-            return {"probed": 0, "alive": 0}
+            return {"probed": 0, "alive": 0, "probe_start_failed": False}
         nodes = [{"fp": c["fp"], "outbound": c["outbound"]} for c in cands]
         results = await self.prober.probe_batch(nodes)
         alive = 0
+        start_failed = 0
         for r in results:
             self.pool.record_probe(r.fp, r.ok, r.ms)
             if r.ok:
                 alive += 1
+            elif getattr(r, "error", "") == "探测实例启动失败":
+                start_failed += 1
+        # 整批因实例起不来而判失败 ≠ 节点都差：单独标记，别污染存活率 EMA
+        systemic = bool(results) and start_failed == len(results)
         return {
             "probed": len(results),
             "alive": alive,
             "probe_mode": "exit_verified" if self.prober.has_singbox else "tcp_only",
+            "probe_start_failed": systemic,
         }
 
     # ══════════════════ 持续搜索循环 ══════════════════

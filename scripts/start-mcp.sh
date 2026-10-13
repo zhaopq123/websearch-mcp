@@ -60,6 +60,10 @@ export WS_CACHE_FETCH_TTL="${WS_CACHE_FETCH_TTL:-1800}"
 # 预热：启动时并发探测全部引擎，不可用���直接熔断，省掉每次搜索的超时等待
 export WS_WARMUP="${WS_WARMUP:-1}"
 
+# 节点探测并发：单轮 = probe_limit/并发 × 每次耗时。12 时单轮要 300s+，
+# 提到 20（探测是网络 I/O 为主，vivo 8 核扛得住）把单轮压到 ~200s。
+export WS_NODE_PROBE_CONCURRENCY="${WS_NODE_PROBE_CONCURRENCY:-20}"
+
 export PYTHONPATH="$APP/src"
 export PYTHONUNBUFFERED=1
 

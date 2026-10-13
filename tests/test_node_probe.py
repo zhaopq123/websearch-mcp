@@ -256,3 +256,119 @@ def test_drop_poison_all_good_is_noop(tmp_path):
     nodes = [{"fp": "a"}, {"fp": "b"}]
     assert p._drop_poison(nodes, lambda ns: {}) is nodes
 
+
+
+# ── 毒节点回报失败 / 系统性失败标记（2026-10-14）──────────────────
+# 回归背景：探测实例（20000 段端口）因 proot 端口竞态起不来时，整批被判失败，
+# 但既不记日志、又被当作「节点都差」喂进存活率 EMA → 下一轮 batch 反而缩水。
+# 另：被 _drop_poison 剔除的毒节点从不记失败，永远停在「未测」，每轮重复占预算。
+
+class _Noop:
+    def __init__(self, ret=True):
+        self.ret = ret
+        self.calls = 0
+
+    async def __call__(self, *a, **k):
+        self.calls += 1
+        return self.ret
+
+
+class _FakeProc2:
+    returncode = None
+    pid = 999
+
+    async def wait(self):
+        self.returncode = 0
+        return 0
+
+    def terminate(self):
+        self.returncode = 0
+
+    def kill(self):
+        self.returncode = 0
+
+
+def test_poison_node_reported_as_failure(tmp_path, monkeypatch):
+    """被剔除的毒节点也要回报 ok=False/poison_config，别让它永远「未测」。"""
+    import asyncio
+    from websearch.nodes.probe import NodeProber, ProbeEnv
+
+    p = NodeProber(singbox_bin="/bin/sh", work_dir=tmp_path)
+    nodes = [{"fp": "good", "outbound": {"type": "direct"}},
+             {"fp": "bad", "outbound": {"type": "direct"}}]
+    p._drop_poison = lambda ns, build: [n for n in ns if n["fp"] == "good"]  # type: ignore
+    p._kill_stale_probe = _Noop()          # type: ignore
+    p._wait_port_free = _Noop(True)        # type: ignore
+    p._wait_port = _Noop(True)             # type: ignore
+
+    async def fake_check(port, timeout, env):
+        return True, True, ""
+
+    p._check_via_proxy = fake_check         # type: ignore
+
+    async def fake_exec(*a, **k):
+        return _FakeProc2()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    res = asyncio.run(p._probe_via_singbox(nodes, 1.0, 2,
+                                           ProbeEnv(checked=True)))
+    by = {r.fp: r for r in res}
+    assert len(res) == 2
+    assert by["good"].ok is True
+    assert by["bad"].ok is False
+    assert by["bad"].error == "poison_config"
+
+
+def _hunter_with(prober):
+    from websearch.nodes.hunter import NodeHunter
+
+    class _Pool:
+        def candidates_for_probe(self, limit=200, prefer_untested=True,
+                                 pool=""):
+            if pool == "free":
+                return [{"fp": "n1", "outbound": {}},
+                        {"fp": "n2", "outbound": {}}]
+            return []
+
+        def record_probe(self, fp, ok, ms=0):
+            pass
+
+    h = NodeHunter.__new__(NodeHunter)      # 跳过 __init__（不建真连接池）
+    h.prober = prober
+    h.pool = _Pool()
+    return h
+
+
+def test_probe_start_failed_flag_true():
+    """整批都是「探测实例启动失败」→ 标记 systemic，供上层跳过 EMA。"""
+    import asyncio
+    from websearch.nodes.probe import ProbeResult
+
+    class _P:
+        has_singbox = True
+
+        async def probe_batch(self, nodes, **kw):
+            return [ProbeResult(fp=n["fp"], ok=False,
+                                error="探测实例启动失败") for n in nodes]
+
+    rep = asyncio.run(_hunter_with(_P())._probe_candidates(100))
+    assert rep["probe_start_failed"] is True
+    assert rep["probed"] == 2
+    assert rep["alive"] == 0
+
+
+def test_probe_start_failed_flag_false_when_nodes_really_dead():
+    """普通连接失败（节点真差）→ 不算 systemic，正常喂 EMA。"""
+    import asyncio
+    from websearch.nodes.probe import ProbeResult
+
+    class _P:
+        has_singbox = True
+
+        async def probe_batch(self, nodes, **kw):
+            return [ProbeResult(fp=n["fp"], ok=False,
+                                error="ConnectError") for n in nodes]
+
+    rep = asyncio.run(_hunter_with(_P())._probe_candidates(100))
+    assert rep["probe_start_failed"] is False
+    assert rep["probed"] == 2

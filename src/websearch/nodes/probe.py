@@ -207,9 +207,14 @@ class NodeProber:
 
         self.work_dir.mkdir(parents=True, exist_ok=True)
         # 剔除会让整批实例起不来的非法节点（一个坏节点全批判死，见 sanitize 注释）
+        before = list(nodes)
         nodes = self._drop_poison(nodes, build)
+        kept = {n["fp"] for n in nodes}
+        dropped = [n for n in before if n["fp"] not in kept]
         if not nodes:
-            return []
+            # 全被剔除也要回报失败，否则它们永远停在「未测」、每轮重复占预算
+            return [ProbeResult(fp=n["fp"], ok=False, error="poison_config")
+                    for n in dropped]
         cfg = build(nodes)
         port_map: dict[int, str] = {
             PROBE_PORT_BASE + i: n["fp"] for i, n in enumerate(nodes)
@@ -223,6 +228,11 @@ class NodeProber:
 
         proc = None
         try:
+            # 端口竞态防护（同 LocalNodeProxy，实测踩到）：上一轮探测实例可能
+            # 还没被 proot 收掉，占住 20000 段 → 本批 sing-box bind 失败 →
+            # **整批 0 存活**（原本还是静默的，最难查）。起前清孤儿 + 等端口。
+            await self._kill_stale_probe()
+            await self._wait_port_free(PROBE_PORT_BASE, timeout=6.0)
             proc = await asyncio.create_subprocess_exec(
                 self.singbox_bin, "run", "-c", str(cfg_path),
                 stdout=asyncio.subprocess.DEVNULL,
@@ -230,6 +240,9 @@ class NodeProber:
                 stdin=asyncio.subprocess.DEVNULL,
             )
             if not await self._wait_port(PROBE_PORT_BASE, timeout=8.0):
+                log.warning(
+                    "探测实例启动失败：端口 %d 未就绪，本批 %d 个判失败"
+                    "（疑似端口竞态/实例崩溃）", PROBE_PORT_BASE, len(nodes))
                 return [ProbeResult(fp=n["fp"], ok=False,
                                     error="探测实例启动失败") for n in nodes]
 
@@ -248,9 +261,12 @@ class NodeProber:
             await asyncio.gather(*(one(p, fp) for p, fp in port_map.items()))
             # 保持与输入同序，便于上层对齐
             by_fp = {r.fp: r for r in results}
+            for n in dropped:      # 毒节点也记失败，别让它们永远是「未测」
+                by_fp[n["fp"]] = ProbeResult(fp=n["fp"], ok=False,
+                                             error="poison_config")
             return [by_fp.get(n["fp"], ProbeResult(fp=n["fp"], ok=False,
                                                    error="未探测"))
-                    for n in nodes]
+                    for n in before]
         finally:
             if proc is not None and proc.returncode is None:
                 try:
@@ -374,4 +390,30 @@ class NodeProber:
                     return True
             except OSError:
                 await asyncio.sleep(0.15)
+        return False
+
+    async def _kill_stale_probe(self) -> None:
+        """清掉仍在跑的本探测实例（上一轮 proot 未及时收掉的孤儿）。
+
+        探测实例按每节点一个 inbound 占住 20000 段；孤儿没退，新实例 bind
+        失败 → 整批 0 存活。用配置文件名精确匹配，[.] 防 pkill 自匹配。
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "pkill", "-f", "probe_nodes[.]json",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL)
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except Exception:
+            pass
+
+    async def _wait_port_free(self, port: int, timeout: float = 6.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+                    pass
+            except OSError:
+                return True
+            await asyncio.sleep(0.2)
         return False
