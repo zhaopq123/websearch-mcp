@@ -69,11 +69,17 @@ def test_empty_ticket_rejected(store):
     assert store.consume_login_ticket(None) is False  # type: ignore[arg-type]
 
 
-def test_failed_consume_also_invalidates(store):
-    """校验失败也要作废 —— 否则给了暴力尝试的窗口。"""
+def test_wrong_ticket_does_not_invalidate_valid_one(store):
+    """用错票据来试，不能把有效票据搞失效。
+
+    这是踩过的坑：原实现「失败即作废」看起来更安全，但会导致
+    拿旧票据试一下就把刚签发的新票据删掉 —— 用户点链接进不去。
+    票据是 32 字节随机数 + 5 分钟时效，暴力猜测不现实，
+    不需要靠「失败即废」兜底。
+    """
     t = store.issue_login_ticket()
-    store.consume_login_ticket("wrong")          # 用错票据
-    assert store.consume_login_ticket(t) is False, "失败尝试后原票据仍可用"
+    assert store.consume_login_ticket("wrong") is False
+    assert store.consume_login_ticket(t) is True, "错误尝试误伤了有效票据"
 
 
 def test_second_ticket_replaces_first(store):

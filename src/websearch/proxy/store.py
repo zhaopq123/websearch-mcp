@@ -279,7 +279,16 @@ class Store:
         return raw
 
     def consume_login_ticket(self, ticket: str) -> bool:
-        """校验并**作废**登录票据。返回是否有效。"""
+        """校验并**作废**登录票据。返回是否有效。
+
+        安全与可用性的取舍（这里踩过一次坑）：
+          · 「校验失败就作废」能防暴力尝试 —— 但**不能无条件作废**，
+            否则拿一个旧票据来试，会把刚签发的新票据一起删掉，
+            表现为「点了链接进不去」（可用性事故）。
+          · 正确做法：**只有校验通过（成功消费）才作废**。
+            票据本身是 32 字节随机数 + 5 分钟时效，暴力猜测不现实，
+            不需要靠「失败即废」来兜。
+        """
         import hashlib
         import time
 
@@ -292,12 +301,19 @@ class Store:
             exp = int(self._cache.get("WS_LOGIN_TICKET_EXP", "0"))
         except ValueError:
             exp = 0
-        # 先作废再判定：即使校验失败也不留下可重试的票据
-        self.delete(["WS_LOGIN_TICKET_HASH", "WS_LOGIN_TICKET_EXP"])
-        if exp and time.time() > exp:
-            return False
+
         digest = hashlib.sha256(ticket.encode()).hexdigest()
-        return secrets.compare_digest(stored, digest)
+        matched = secrets.compare_digest(stored, digest)
+        expired = bool(exp) and time.time() > exp
+
+        if matched and not expired:
+            # 只在成功消费时作废（一次性）
+            self.delete(["WS_LOGIN_TICKET_HASH", "WS_LOGIN_TICKET_EXP"])
+            return True
+        if matched and expired:
+            # 票据对但过期：清掉它，避免继续占位
+            self.delete(["WS_LOGIN_TICKET_HASH", "WS_LOGIN_TICKET_EXP"])
+        return False
 
     # ── 安全自检 ──
 
