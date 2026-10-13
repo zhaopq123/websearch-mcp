@@ -5,9 +5,31 @@
 ## 基本信息
 
 - 端口 **8300**，Bearer token 鉴权（密钥在 `.tokens`，勿入 git）
-- 工具 6 个：`web_search` / `web_fetch` / `deep_research` / `engine_health` / `cache_manage` / `server_info`
+- 工具 7 个：`web_search` / `web_fetch` / `deep_research` / `engine_health` /
+  `cache_manage` / `server_info` / `proxy_status`
+- 管理面板端口 **8500**（可选，用于配置代理/订阅，见下）
 - 生产部署：vivo 容器 `/opt/websearch-mcp/`；版本权威副本 = Termux 宿主 `~/git/websearch-mcp.git`（bare）
 - serverInfo 报的 `4.1.0` 是 fastmcp 库版本，不是项目版本
+
+## 出网能力（可选增强）
+
+零 Key 爬虫式搜索有个绕不过的现实：**Google / DuckDuckGo / Brave 在墙内
+不可达**，只能拿到百度 / 必应 / 360 / 微信等国内源。
+
+想用墙外源，需要**你自己的节点**：
+
+```bash
+# 1. 装 sing-box（支持 ss/vmess/trojan/vless+reality/hysteria2/tuic）
+# 2. 启动管理面板：python -m websearch.proxy.panel_server
+# 3. 浏览器打开 :8500，填订阅链接，启动代理
+# 4. 搜索服务加环境变量：WS_PROXY=http://127.0.0.1:17890
+```
+
+**本服务不内置、不收集、不代理任何人的节点。** 订阅链接只写进你服务器上
+600 权限的 `.env`，不入 git、不进日志、面板不回显。
+
+**代理挂了不影响搜索**：连续失败 3 次自动降级直连（仍能用国内源），
+每 60s 探活，恢复后自动切回。详见 [docs/代理与出网配置.md](docs/代理与出网配置.md)。
 
 ## 引擎态势（2026-10-13 实测）
 
@@ -19,6 +41,15 @@
 | 不可达 | duckduckgo / mojeek / brave（国内网络，熔断自动隔离） |
 
 搜索靠 so360 + weixin 出结果；`/health` 的 `warmup.available` 是当前真正能用的源。
+配上代理后 Google / DDG / Brave 会重新可用（它们的失败原因是网络不可达，
+不是反爬）。
+
+**已实测证伪的两条路**（别重复投入）：
+
+- 公开免费代理池：19710 个样本测 1800 个，能通 Google 的 **0 个**
+  （连不需翻墙的 httpbin.org 都连不上，池子本身已死）
+- 公共 SearXNG 实例：12 个全部不可达，根因是**域名被 DNS 投毒**
+  （`priv.au` 被解析到 Facebook 的 IP 段 `2a03:2880:...face:b00c`）
 
 ## 反爬核心认知（重写一次要几天，别自己重试）
 
