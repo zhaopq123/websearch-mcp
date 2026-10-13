@@ -6,6 +6,7 @@ sing-box 被 OOM），如果代理失效就让搜索不可用，那是把增强�
 单点故障。这里钉住降级与恢复的行为。
 """
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -13,6 +14,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import pytest
 
 from websearch.proxy.gate import ProxyGate, _is_proxy_failure
+
+
+def aged_gate(url: str = "http://127.0.0.1:17890") -> ProxyGate:
+    """造一个**已过启动宽限期**的门。
+
+    为什么需要：门有 WARMUP_GRACE（默认 20 秒），启动宽限期内
+    连打多少次失败都不会降级 —— 那是刻意的（服务与代理同时启动时，
+    头几个请求打不通是正常的）。测试要验证「稳态下连续失败会降级」，
+    就必须先把宽限期跳过去，否则测的是宽限期而不是降级逻辑。
+    """
+    g = ProxyGate(url)
+    g._born_mono = time.monotonic() - (ProxyGate.WARMUP_GRACE + 1)
+    return g
+
+
+def warm_gate(url: str = "http://127.0.0.1:17890") -> ProxyGate:
+    """造一个**仍在启动宽限期**的门。"""
+    return ProxyGate(url)
 
 
 # ══════════════════ 未配代理：完全不影响原行为 ══════════════════
@@ -36,8 +55,8 @@ def test_disabled_flag_overrides_url():
 
 
 def test_bypass_after_consecutive_proxy_failures():
-    """连续代理类失败达到阈值 → 降级直连。"""
-    g = ProxyGate("http://127.0.0.1:17890")
+    """连续代理类失败达到阈值 → 降级直连（稳态下，即已过启动宽限期）。"""
+    g = aged_gate()
     assert g.use_proxy is True
     for _ in range(ProxyGate.FAIL_THRESHOLD):
         g.note_result(False, "ConnectError: connection refused")
@@ -46,9 +65,29 @@ def test_bypass_after_consecutive_proxy_failures():
     assert g.state.bypass_count == 1
 
 
+def test_startup_grace_prevents_false_bypass():
+    """启动宽限期内**不该**降级（这是本次修复的核心）。
+
+    实测踩坑：服务与代理同时启动时，头 2-3 个请求打不通是正常的
+    （sing-box 还在起、节点还在握手）。没有宽限期就会被判「代理坏了」，
+    于是服务永久降级直连，而代理几秒后就绪了 ——
+    表现是「代理明明正常，但搜索服务说什么都不走代理」。
+    """
+    g = warm_gate()          # 仍在宽限期内
+    for _ in range(ProxyGate.FAIL_THRESHOLD * 3):
+        g.note_result(False, "ConnectTimeout")
+    assert g.state.bypassed is False, "宽限期内就降级了 —— 冷启动会被误判"
+    assert g.use_proxy is True
+    # 宽限期过后，同样的失败就该触发降级
+    g._born_mono = time.monotonic() - (ProxyGate.WARMUP_GRACE + 1)
+    for _ in range(ProxyGate.FAIL_THRESHOLD):
+        g.note_result(False, "ConnectTimeout")
+    assert g.state.bypassed is True, "过了宽限期仍不降级 —— 降级逻辑坏了"
+
+
 def test_success_resets_failure_counter():
     """中间成功一次就清零，避免「偶发失败累积」误降级。"""
-    g = ProxyGate("http://127.0.0.1:17890")
+    g = aged_gate()
     g.note_result(False, "ConnectError")
     g.note_result(False, "ConnectError")
     g.note_result(True)
@@ -63,7 +102,7 @@ def test_engine_block_does_not_trigger_bypass():
     这是最容易搞错的地方：百度返回验证码说明代理工作正常
     （请求确实到了百度），把它算成代理故障会导致「代理好好的却被直连」。
     """
-    g = ProxyGate("http://127.0.0.1:17890")
+    g = aged_gate()
     for _ in range(10):
         g.note_result(False, "marker:verify.css")
         g.note_result(False, "http_403")
@@ -91,7 +130,7 @@ def test_proxy_failure_classification(err, expected):
 
 def test_no_bypass_when_already_bypassed():
     """已在旁路状态时不再重复计数（避免 bypass_count 虚高）。"""
-    g = ProxyGate("http://127.0.0.1:17890")
+    g = aged_gate()
     for _ in range(ProxyGate.FAIL_THRESHOLD):
         g.note_result(False, "ConnectError")
     assert g.state.bypass_count == 1
@@ -104,7 +143,7 @@ def test_no_bypass_when_already_bypassed():
 
 
 def test_restore_clears_bypass():
-    g = ProxyGate("http://127.0.0.1:17890")
+    g = aged_gate()
     for _ in range(ProxyGate.FAIL_THRESHOLD):
         g.note_result(False, "ConnectError")
     assert g.state.bypassed is True
@@ -119,7 +158,7 @@ def test_maybe_probe_recovers_when_healthy():
     """旁路期间探活成功 → 自动恢复走代理。"""
     import asyncio
 
-    g = ProxyGate("http://127.0.0.1:17890")
+    g = aged_gate()
     for _ in range(ProxyGate.FAIL_THRESHOLD):
         g.note_result(False, "ConnectError")
     assert g.state.bypassed is True
@@ -138,7 +177,7 @@ def test_maybe_probe_recovers_when_healthy():
 def test_maybe_probe_keeps_bypass_when_unhealthy():
     import asyncio
 
-    g = ProxyGate("http://127.0.0.1:17890")
+    g = aged_gate()
     for _ in range(ProxyGate.FAIL_THRESHOLD):
         g.note_result(False, "ConnectError")
     g._last_probe_mono = 0.0
@@ -155,7 +194,7 @@ def test_maybe_probe_swallows_probe_exception():
     """探活本身抛异常不能影响搜索。"""
     import asyncio
 
-    g = ProxyGate("http://127.0.0.1:17890")
+    g = aged_gate()
     for _ in range(ProxyGate.FAIL_THRESHOLD):
         g.note_result(False, "ConnectError")
     g._last_probe_mono = 0.0
@@ -171,7 +210,7 @@ def test_probe_respects_interval():
     """间隔未到不该频繁探活（否则旁路期间每次搜索都多付一次超时）。"""
     import asyncio
 
-    g = ProxyGate("http://127.0.0.1:17890")
+    g = aged_gate()
     for _ in range(ProxyGate.FAIL_THRESHOLD):
         g.note_result(False, "ConnectError")
 
