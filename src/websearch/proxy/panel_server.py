@@ -152,10 +152,15 @@ def main() -> None:
     print("═" * 62)
 
     import uvicorn
+    from contextlib import asynccontextmanager
 
-    # 用 lifespan 跑自动启动 + 健康检查循环
     stop_event = asyncio.Event()
 
+    # ⚠️ 必须加 @asynccontextmanager —— Starlette 的 lifespan_context
+    # 要求的是一个「异步上下文管理器」，裸的 async 生成器函数赋给它
+    # 会在启动时报 TypeError: 'async_generator' object does not support
+    # the asynchronous context manager protocol。
+    @asynccontextmanager
     async def lifespan(app):  # type: ignore[no-untyped-def]
         await on_startup()
         task = asyncio.create_task(_health_loop(store, manager, stop_event))
