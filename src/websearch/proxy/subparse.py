@@ -277,7 +277,12 @@ def _parse_trojan_like(uri: str, scheme: str, idx: int) -> dict[str, Any]:
             ob["flow"] = flow
 
     # TLS / Reality
-    if security in ("tls", "reality", "xtls"):
+    # ⚠️ trojan 协议本身就是「全 TLS 传输」—— 即使订阅不写 security=tls，
+    # 也**必须**开 TLS。之前写成 `if security in (...)` 才生成 tls 段，
+    # 导致不写 security 的 trojan 节点完全没有 TLS，既连不上也不安全。
+    # vless 则相反：只有明确声明 security=tls/reality 才开。
+    need_tls = (scheme == "trojan") or security in ("tls", "reality", "xtls")
+    if need_tls:
         # ⚠️ insecure 必须读订阅里的 allowInsecure，**不能硬编码 false**。
         # 实测踩坑（2026-10-13）：订阅里 allowInsecure=1 的节点，
         # 硬编码 insecure:false 会导致 TLS 校验失败 → 连接建不起来 →
