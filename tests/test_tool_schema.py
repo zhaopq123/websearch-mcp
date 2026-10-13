@@ -21,7 +21,9 @@ import pytest
 from websearch.config import Config
 from websearch.server import build_mcp
 
-pytestmark = pytest.mark.asyncio
+# 注意：pytest 已配置 asyncio_mode=auto，async 测试自动生效。
+# 这里刻意不再写模块级 pytestmark —— 会把同步测试也标成 asyncio，
+# 触发 "marked with '@pytest.mark.asyncio' but it is not an async function" 警告。
 
 
 def _walk(node, key):
