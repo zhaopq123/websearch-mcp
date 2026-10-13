@@ -372,8 +372,23 @@ class HttpPool:
                 self.http2_enabled = False
         else:
             self.http2_enabled = False
+
+        # 代理健康门：只管决策（该走代理还是直连），client 由这里建。
+        # 为什么不在 gate 里建 client：会变成两套连接池，keepalive 复用失效。
+        # 手机 ARM 上一次 TCP+TLS 握手 200-400ms，比搜索本身还贵。
+        from .proxy.gate import ProxyGate
+
+        self.gate = ProxyGate(cfg.proxy, enabled=bool(cfg.proxy))
+
         self._client = httpx.AsyncClient(**kwargs)
         self._client.event_hooks["response"].append(self._guard_redirect)
+        # 直连 client：仅当配了代理时才需要（用于降级）。
+        # 未配代理时 _client 本身就是直连，不重复建。
+        self._direct_client: httpx.AsyncClient | None = None
+        if self.gate.enabled:
+            direct_kwargs = {k: v for k, v in kwargs.items() if k != "proxy"}
+            self._direct_client = httpx.AsyncClient(**direct_kwargs)
+            self._direct_client.event_hooks["response"].append(self._guard_redirect)
         # 并发闸门：限制同时在飞的请求数，保护 vivo 的 3.7G 内存和有限 fd
         self._sem = asyncio.Semaphore(cfg.max_concurrency)
         self.inflight = 0
@@ -404,6 +419,34 @@ class HttpPool:
     @property
     def client(self) -> httpx.AsyncClient:
         return self._client
+
+    def active_client(self) -> httpx.AsyncClient:
+        """当前该用哪个 client（代理 or 直连）。
+
+        未配代理时恒返回主 client，行为与加代理功能之前完全一致。
+        """
+        if self.gate.enabled and self.gate.state.bypassed and self._direct_client:
+            return self._direct_client
+        return self._client
+
+    async def probe_proxy(self) -> bool:
+        """探活：经代理访问墙外站点，判定代理是否真能出网。
+
+        不用「TCP 端口通」判定：sing-box 进程活着但节点失效时端口照样
+        监听，那种「健康」会让服务一直走死代理。
+        """
+        try:
+            r = await self._client.get(
+                self.gate.PROBE_URL, timeout=8.0, follow_redirects=False
+            )
+            return r.status_code in (200, 204)
+        except Exception:
+            return False
+
+    async def maybe_recover_proxy(self) -> None:
+        """旁路状态下定期探活并在恢复后切回代理。搜索前调用，开销极小。"""
+        if self.gate.enabled and self.gate.state.bypassed:
+            await self.gate.maybe_probe(self.probe_proxy)
 
     @property
     def sem(self) -> asyncio.Semaphore:
@@ -449,14 +492,23 @@ class HttpPool:
                         pool=2.0,
                     )
 
-                if method.upper() == "POST":
-                    resp = await self._client.post(
-                        url, headers=req_headers, data=data, params=params, **kw
-                    )
-                else:
-                    resp = await self._client.get(
-                        url, headers=req_headers, params=params, **kw
-                    )
+                # 按代理健康状态选 client（未配代理时恒为主 client，行为不变）
+                client = self.active_client()
+                try:
+                    if method.upper() == "POST":
+                        resp = await client.post(
+                            url, headers=req_headers, data=data, params=params, **kw
+                        )
+                    else:
+                        resp = await client.get(
+                            url, headers=req_headers, params=params, **kw
+                        )
+                except Exception as e:
+                    # 把失败反馈给代理门：连续「代理类」失败会触发降级直连。
+                    # 非代理类错误（如 DNS 解析失败）不计入，避免误降级。
+                    self.gate.note_result(False, f"{type(e).__name__}: {e}")
+                    raise
+                self.gate.note_result(True)
 
                 # 体积预检：Content-Length 超标直接放弃，省掉传输。
                 # ⚠️ 必须 await resp.aclose() —— httpx.Response.close() 是**同步**
@@ -481,10 +533,13 @@ class HttpPool:
 
     async def aclose(self) -> None:
         await self._client.aclose()
+        if self._direct_client is not None:
+            await self._direct_client.aclose()
 
     def stats(self) -> dict[str, Any]:
         return {
             "inflight": self.inflight,
             "total_requests": self.total_requests,
             "max_concurrency": self.cfg.max_concurrency,
+            "proxy": self.gate.state.to_dict(),
         }

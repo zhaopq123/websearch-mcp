@@ -397,6 +397,35 @@ def build_mcp(cfg: Config):
         }
 
     @mcp.tool()
+    async def proxy_status() -> dict[str, Any]:
+        """查看代理/出网状态：是否配了代理、当前是否走代理、有没有降级。
+
+        **不返回任何凭据**（代理地址里若含密码会被掩码）。
+
+        返回：
+          configured   是否配置了代理
+          using_proxy  当前请求是否走代理
+          bypassed     true = 代理不可用，已降级为直连（搜索仍可用）
+          bypass_count 累计降级次数
+          last_error   最近一次代理失败原因
+          hint         人话解释当前状态该怎么办
+        """
+        st = svc.pool.gate.state.to_dict()
+        if not st["proxy_configured"]:
+            hint = ("未配置代理：服务直连出网，只能访问国内可达的源"
+                    "（百度/必应/360/微信等）。想用 Google/DDG 等墙外源，"
+                    "请在管理面板配置机场订阅。")
+        elif st["bypassed"]:
+            hint = (f"代理不可用已降级直连（累计 {st['bypass_count']} 次）。"
+                    f"搜索仍可用但墙外源会失败。检查代理进程或订阅是否过期；"
+                    f"服务会每 60 秒自动探活并在恢复后切回。")
+        elif st["using_proxy"]:
+            hint = "代理正常，请求走代理出网。"
+        else:
+            hint = "代理已配置但未启用（WS_PROXY_ENABLED=0）。"
+        return {**st, "hint": hint}
+
+    @mcp.tool()
     async def cache_manage(action: str = "stats", kind: str = "") -> dict[str, Any]:
         """缓存统计与清理。action: stats | clear；kind: search | fetch（可选）。"""
         if action == "clear":
@@ -432,6 +461,7 @@ def build_mcp(cfg: Config):
             "search_count": svc.orch.searches,
             "fetch_count": svc.orch.fetches,
             "early_stops": svc.orch.early_stops,
+            "proxy": svc.pool.gate.state.to_dict(),
             "cache": svc.cache.stats(),
             "limits": {
                 "max_results": cfg.max_results,

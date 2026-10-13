@@ -335,6 +335,13 @@ class Orchestrator:
         queued = self._adm.locked()
         if queued:
             self.admission_queued += 1
+        # 代理恢复检查：若代理处于旁路（降级直连）状态，这里会按间隔
+        # 探活一次并在恢复后自动切回。开销极小（绝大多数情况只做一次
+        # 时间比较），但能让「代理恢复了却一直直连」不至于持续到重启。
+        try:
+            await self.pool.maybe_recover_proxy()
+        except Exception:
+            pass
         try:
             await asyncio.wait_for(
                 self._adm.acquire(), timeout=self.cfg.search_queue_timeout
