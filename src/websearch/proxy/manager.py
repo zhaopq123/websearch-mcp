@@ -50,6 +50,8 @@ class ProxyState:
     # 出口 IP 的国家/地区（用来判断代理是否真的生效）
     exit_ip: str = ""
     exit_country: str = ""
+    # 最近一次节点探测结果（无凭据，可给面板展示）
+    probe_result: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -108,6 +110,8 @@ class ProxyManager:
         self.state = ProxyState(http_port=http_port, socks_port=socks_port)
         self._proc: asyncio.subprocess.Process | None = None
         self._last_report: ParseReport | None = None
+        # 节点探测结果（给面板读；无凭据）
+        self.probe_result: dict[str, Any] = {}
 
     # ── 可用性 ──
 
@@ -349,4 +353,232 @@ class ProxyManager:
             "available": self.available,
             "state": self.state.to_dict(),
             "nodes": self.list_nodes(),
+            "probe": self.probe_result,
         }
+
+    # ── 节点探测与自动选择（「自动更新节点」的核心）──
+
+    async def probe_nodes(
+        self,
+        *,
+        timeout: float = 6.0,
+        concurrency: int = 8,
+        max_probe: int = 30,
+    ) -> dict[str, Any]:
+        """并发探测每个节点，找出**能真正出网**的那个。
+
+        为什么必须做这一步：机场订阅里常有失效节点、限速节点、
+        以及占位条目。不探测就随机选一个的话，用户看到的是
+        「代理配了但上不了网」，而真实原因只是**选错了节点**。
+
+        实测踩坑（2026-10-13）：订阅第一个节点 server=0.0.0.0，
+        被选成 default 后所有流量发往 0.0.0.0:443 →
+        "connect: connection refused"，看起来像「全部节点不通」。
+
+        做法：
+          1. 起一个**临时** sing-box 实例，每个节点单独一个 inbound 端口
+          2. 并发请求探测目标，看哪个端口能通
+          3. 记录延迟，按延迟排序
+          4. 返回最快的节点 tag（调用方据此重建正式配置）
+
+        返回（**不含凭据**）：
+          {"ok": bool, "best": "节点名", "tested": N,
+           "alive": [{"tag","ms"}...], "dead": ["节点名"...],
+           "error": "..."}
+        """
+        if not self._last_report or not self._last_report.nodes:
+            return {"ok": False, "error": "没有可用节点（先加载订阅）"}
+        if not self.available:
+            return {"ok": False, "error": "sing-box 不可用"}
+
+        nodes = self._last_report.nodes[:max_probe]
+        base_port = 20000  # 探测用端口段，避开正式端口
+
+        # 为每个节点建一个独立 http inbound，端口递增
+        inbounds = []
+        port_map: dict[int, str] = {}
+        for i, n in enumerate(nodes):
+            p = base_port + i
+            port_map[p] = n.tag
+            inbounds.append({
+                "type": "http", "tag": f"probe-{i}",
+                "listen": "127.0.0.1", "listen_port": p,
+            })
+
+        outbounds = [n.to_outbound() for n in nodes]
+        outbounds.append({"type": "direct", "tag": "direct"})
+
+        # 每个节点一个 route rule：把该端口的流量导向该节点
+        rules = []
+        for i, n in enumerate(nodes):
+            rules.append({
+                "inbound": [f"probe-{i}"],
+                "outbound": n.tag,
+            })
+
+        cfg = {
+            "log": {"level": "error"},
+            "inbounds": inbounds,
+            "outbounds": outbounds,
+            "route": {"rules": rules, "final": "direct"},
+        }
+
+        probe_cfg = self.dir / "probe.json"
+        probe_cfg.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+        try:
+            os.chmod(probe_cfg, 0o600)
+        except OSError:
+            pass
+
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self.singbox_bin, "run", "-c", str(probe_cfg),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                stdin=asyncio.subprocess.DEVNULL,
+            )
+            # 等第一个端口就绪（说明 sing-box 起来了）
+            if not await self._wait_port(base_port, timeout=8.0):
+                return {"ok": False, "error": "探测实例启动失败（端口未监听）"}
+
+            sem = asyncio.Semaphore(concurrency)
+            results: list[dict[str, Any]] = []
+
+            async def one(port: int, tag: str) -> None:
+                async with sem:
+                    t0 = time.monotonic()
+                    try:
+                        async with httpx.AsyncClient(
+                            proxy=f"http://127.0.0.1:{port}", timeout=timeout,
+                            follow_redirects=False,
+                        ) as c:
+                            r = await c.get(self.CHECK_URL)
+                            ok = r.status_code in (200, 204)
+                    except Exception:
+                        ok = False
+                    ms = int((time.monotonic() - t0) * 1000)
+                    results.append({"tag": tag, "ok": ok, "ms": ms})
+
+            await asyncio.gather(*(one(p, t) for p, t in port_map.items()))
+        finally:
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.terminate()
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            probe_cfg.unlink(missing_ok=True)
+
+        alive = sorted(
+            ({"tag": r["tag"], "ms": r["ms"]} for r in results if r["ok"]),
+            key=lambda x: x["ms"],
+        )
+        dead = [r["tag"] for r in results if not r["ok"]]
+        best = alive[0]["tag"] if alive else ""
+
+        self.probe_result = {
+            "tested": len(results),
+            "alive_count": len(alive),
+            "dead_count": len(dead),
+            "best": best,
+            "best_ms": alive[0]["ms"] if alive else 0,
+            "alive": alive[:10],       # 只留前 10（面板够用）
+            "at": time.time(),
+        }
+        log.info("节点探测完成：%d 个可用 / %d 个测试，最快 %s (%dms)",
+                 len(alive), len(results), best or "无",
+                 alive[0]["ms"] if alive else 0)
+
+        return {
+            "ok": bool(alive),
+            "best": best,
+            "tested": len(results),
+            "alive": alive,
+            "dead": dead,
+            "error": "" if alive else "所有节点都无法访问外网（可能全部失效或订阅过期）",
+        }
+
+    async def start_from_subscription_auto(self, url: str) -> dict[str, Any]:
+        """拉订阅 → 解析 → **探测节点** → 用最快的节点启动。
+
+        这是「自动更新节点」的完整流程：
+        用户只需点一次，服务自己找可用节点，不需要用户逐个试。
+        """
+        text = await self.fetch_subscription(url)
+        report = parse_subscription_text(text)
+        self._last_report = report
+
+        if not report.nodes:
+            return {
+                "ok": False,
+                "error": "订阅里没有可用节点",
+                "summary": report.summary(),
+            }
+
+        # 先用第一个节点起一个临时实例做探测
+        # （探测需要 sing-box 在跑；用第一个节点起正式配置即可，
+        #   探测会为每个节点开独立端口，不依赖默认选择）
+        first = await self._start_with_report(report, replace_running=True)
+        if not first.get("ok"):
+            return first
+
+        probe = await self.probe_nodes()
+        if not probe.get("ok"):
+            # 探测全失败：保留已启动的实例（至少端口在听），如实报告
+            return {
+                "ok": False,
+                "error": probe.get("error", "节点探测失败"),
+                "summary": report.summary(),
+                "probe": probe,
+            }
+
+        # 用探测出的最快节点重启（default_tag 换成它）
+        best = probe["best"]
+        if best and best != report.nodes[0].tag:
+            cfg = build_singbox_config(
+                report, http_port=self.http_port, socks_port=self.socks_port,
+                default_tag=best,
+            )
+            ok, err = await self._check_config(cfg)
+            if ok:
+                await self._write_and_restart(cfg, report)
+                log.info("已自动切换到最快节点：%s", best)
+
+        return {
+            "ok": True,
+            "summary": report.summary(),
+            "probe": probe,
+            "state": self.state.to_dict(),
+        }
+
+    async def _write_and_restart(self, cfg: dict[str, Any], report: ParseReport) -> None:
+        """写入配置并重启进程（探测完切节点时用）。"""
+        await self.stop()
+        tmp = self.cfg_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        tmp.replace(self.cfg_path)
+
+        logf = open(self.log_path, "ab", buffering=0)
+        try:
+            os.chmod(self.log_path, 0o600)
+        except OSError:
+            pass
+        self._proc = await asyncio.create_subprocess_exec(
+            self.singbox_bin, "run", "-c", str(self.cfg_path),
+            stdout=logf, stderr=logf, stdin=asyncio.subprocess.DEVNULL,
+        )
+        self.state.running = True
+        self.state.pid = self._proc.pid or 0
+        self.state.started_at = time.time()
+        self.state.node_count = len(report.nodes)
+        self.state.by_protocol = report.summary()["by_protocol"]
+        self.state.last_error = ""
+        await self._wait_port(self.http_port, timeout=8.0)

@@ -543,7 +543,12 @@ def build_panel_app(store: Store, manager: ProxyManager, *, require_token: bool 
         return JSONResponse({"ok": True, "config": store.read_public()})
 
     async def api_proxy_start(request):
-        """用已保存的订阅启动代理。"""
+        """用已保存的订阅启动代理，**自动探测并选择可用节点**。
+
+        产品考量：用户不该自己逐个试节点。点一次「启动」，
+        服务自动做：拉订阅 → 解析 → 探测每个节点 → 用最快的启动。
+        如果全部不通，如实报告而不是假装成功。
+        """
         if not authed(request):
             return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
         url = store.get("WS_SUBSCRIPTION_URL", "")
@@ -552,7 +557,8 @@ def build_panel_app(store: Store, manager: ProxyManager, *, require_token: bool 
                 {"ok": False, "error": "尚未配置订阅链接"}, status_code=400
             )
         try:
-            result = await manager.start_from_subscription(url)
+            # 走「自动选节点」流程（带探测）
+            result = await manager.start_from_subscription_auto(url)
         except SubscriptionError as e:
             # 消息里不含 URL（subparse 保证）
             return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
@@ -560,7 +566,15 @@ def build_panel_app(store: Store, manager: ProxyManager, *, require_token: bool 
             return JSONResponse(
                 {"ok": False, "error": f"启动失败：{type(e).__name__}"}, status_code=500
             )
-        return JSONResponse({"ok": bool(result.get("ok")), **result})
+        if not result.get("ok"):
+            # 启动失败也要给可读信息（探测报告能告诉用户「N 个节点全不通」）
+            return JSONResponse(result, status_code=200)
+        # 启动成功后立刻做一次健康检查，让用户马上看到能不能出网
+        try:
+            await manager.health_check()
+        except Exception:
+            pass
+        return JSONResponse({"ok": True, **result})
 
     async def api_proxy_stop(request):
         if not authed(request):

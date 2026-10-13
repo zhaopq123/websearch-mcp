@@ -409,6 +409,22 @@ def parse_node(uri: str, idx: int = 0) -> Node:
 
     ob = parser(uri, idx)
 
+    # ⚠️ 校验服务器地址有效性 —— 这一步不能省。
+    # 实测踩坑（2026-10-13）：机场订阅里混了占位节点，server 是
+    # 0.0.0.0。不过滤的后果：
+    #   1. 它被选进 selector 并成为 default（因为是列表第一个）
+    #   2. 所有流量发往 0.0.0.0:443 → "connect: connection refused"
+    #   3. 表面看是「节点全不通」，实际是坏节点污染了整个代理
+    # 报错要能定位但不能泄密：只说地址无效，不回显完整凭据。
+    server = str(ob.get("server", "")).strip()
+    if not server:
+        raise NodeParseError("节点缺少服务器地址")
+    if server in ("0.0.0.0", "::", "127.0.0.1", "localhost", "::1"):
+        raise NodeParseError(f"节点服务器地址无效（{server}）—— 多为订阅里的占位条目")
+    port = ob.get("server_port")
+    if not isinstance(port, int) or not (0 < port < 65536):
+        raise NodeParseError(f"节点端口无效：{port!r}")
+
     # 备注名：fragment 里的 #名字
     tag = ""
     if "#" in uri:
@@ -482,6 +498,7 @@ def build_singbox_config(
     listen: str = "127.0.0.1",
     log_level: str = "warn",
     clash_api_port: int = 0,
+    default_tag: str = "",
 ) -> dict[str, Any]:
     """生成 sing-box 配置。
 
@@ -489,7 +506,7 @@ def build_singbox_config(
       · 写入 600 权限文件
       · 不落日志、不进 git
 
-    路由：默认走第一个节点（selector 可由 Clash API 或重载切换）。
+    路由：默认走 selector，由调用方指定默认节点（见 default_tag 参数）。
     若没有任何节点，退化成 direct（这样服务不会因为没节点而崩）。
     """
     outbounds: list[dict[str, Any]] = []
@@ -499,11 +516,14 @@ def build_singbox_config(
     tags = [n.tag for n in report.nodes]
     if tags:
         # selector 让用户能切换节点（面板/Clash API）
+        # default 由调用方给（通常是探测出来的最快节点）；
+        # 没给就用第一个，但**不能是坏节点**（parse_node 已过滤掉 0.0.0.0 之类）
+        chosen = default_tag if default_tag in tags else tags[0]
         outbounds.append({
             "type": "selector",
             "tag": "proxy",
             "outbounds": tags,
-            "default": tags[0],
+            "default": chosen,
         })
         final = "proxy"
     else:
