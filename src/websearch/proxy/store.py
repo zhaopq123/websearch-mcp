@@ -34,12 +34,18 @@ WRITABLE_KEYS = {
     "WS_PANEL_TOKEN",
     "WS_PROXY_AUTO_START",
     "WS_PROXY_HEALTH_INTERVAL",
+    # 一键登录票据（服务端签发，不来自面板输入；放白名单是因为
+    # 它要经 set_many 落盘 —— 白名单拦的是「面板能写什么」，
+    # 不是「哪些键存在」）
+    "WS_LOGIN_TICKET_HASH",
+    "WS_LOGIN_TICKET_EXP",
 }
 
 # 敏感键：read_public 绝不返回其值
 SECRET_KEYS = {
     "WS_SUBSCRIPTION_URL",
     "WS_PANEL_TOKEN",
+    "WS_LOGIN_TICKET_HASH",   # 票据哈希也不该外泄（可用于碰撞尝试）
 }
 
 DEFAULTS: dict[str, str] = {
