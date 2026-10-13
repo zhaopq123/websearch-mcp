@@ -183,27 +183,30 @@ def build_panel_app(store: Store, manager: ProxyManager, *, require_token: bool 
                 )
             values["WS_SUBSCRIPTION_URL"] = sub.strip()
 
-        for key, field in (
-            ("proxy_enabled", "WS_PROXY_ENABLED"),
-            ("auto_start", "WS_PROXY_AUTO_START"),
-        ):
-            if field in body:
-                # 注意：键名用 field（配置键），不是 key（前端字段名）。
-                # 曾经误写成 values[key]，写进去一个无意义的 "proxy_enabled"，
-                # 白名单外——但因为 set_many 的校验只看 key，这个键被静默写入
-                # 且永远读不到，表现为「保存成功但设置没生效」。
-                values[field] = "1" if body[field] else "0"
-        for key, field in (
-            ("http_port", "WS_HTTP_PROXY_PORT"),
-            ("socks_port", "WS_SOCKS_PROXY_PORT"),
-            ("health_interval", "WS_PROXY_HEALTH_INTERVAL"),
-        ):
-            if field in body:
+        # 前端字段名 → 配置键的映射。
+        # 注意方向：请求体里出现的是**前端字段名**（proxy_enabled），
+        # 要写入的是**配置键**（WS_PROXY_ENABLED）。之前写成
+        # `if field in body` 判反了，导致一个字段都存不进去
+        # （表现为「没有要保存的改动」）。
+        bool_fields = {
+            "proxy_enabled": "WS_PROXY_ENABLED",
+            "auto_start": "WS_PROXY_AUTO_START",
+        }
+        int_fields = {
+            "http_port": "WS_HTTP_PROXY_PORT",
+            "socks_port": "WS_SOCKS_PROXY_PORT",
+            "health_interval": "WS_PROXY_HEALTH_INTERVAL",
+        }
+        for name, cfg_key in bool_fields.items():
+            if name in body:
+                values[cfg_key] = "1" if body[name] else "0"
+        for name, cfg_key in int_fields.items():
+            if name in body:
                 try:
-                    values[field] = str(int(body[field]))
+                    values[cfg_key] = str(int(body[name]))
                 except (TypeError, ValueError):
                     return JSONResponse(
-                        {"ok": False, "error": f"{field} 必须是整数"}, status_code=400
+                        {"ok": False, "error": f"{name} 必须是整数"}, status_code=400
                     )
 
         if not values:
