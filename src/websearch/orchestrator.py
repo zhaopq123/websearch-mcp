@@ -22,7 +22,13 @@ from .engines import Engine, RequestSpec, get_engine
 from .extract import decode_bytes, extract, wrap_untrusted
 from .fusion import fuse
 from .governor import Governor
-from .http_pool import HttpPool, TooLargeError, assert_url_async, detect_block
+from .http_pool import (
+    BlockedRedirectError,
+    HttpPool,
+    TooLargeError,
+    assert_url_async,
+    detect_block,
+)
 from .models import Budget, EngineOutcome, FetchResult, SearchResult
 from .text import relevance_ratio, sha1_key
 
@@ -215,6 +221,9 @@ class Orchestrator:
             return "network"
         if isinstance(e, TooLargeError):
             return "too_large"
+        if isinstance(e, BlockedRedirectError):
+            # 安全拦截，不是网络故障：让调用方知道是被策略挡了
+            return "blocked_url"
         if isinstance(e, httpx.HTTPError):
             return "network"
         return "unknown"

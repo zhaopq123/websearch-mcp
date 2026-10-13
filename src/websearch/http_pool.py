@@ -29,6 +29,15 @@ class TooLargeError(Exception):
     并不统一（早期版本根本没有），自定义一个最稳。
     """
 
+
+class BlockedRedirectError(Exception):
+    """重定向目标未通过 SSRF 校验。
+
+    单独一个异常类型而不是复用 TooLargeError 那种通用错误：
+    调用方要能把它归类成 blocked_url（安全拦截），
+    而不是当成网络故障去重试——重试一个被安全策略拦下的 URL 没有意义。
+    """
+
 # ── UA 池：真实浏览器版本号 ──
 # ⚠️ 实测教训（2026-10-13，vivo 国内网络）：
 # 必应对 UA 极其敏感 —— 用 Firefox/Safari/Edge 的 UA 时，它**不返回 403，
@@ -177,6 +186,12 @@ def detect_block(status: int, body: str) -> tuple[bool, str]:
 # ── SSRF 防护 ──
 
 def _is_disallowed_ip(ip: ipaddress._BaseAddress) -> bool:
+    # IPv4-mapped IPv6（::ffff:127.0.0.1、::ffff:169.254.169.254）必须先解包：
+    # 这类地址的 is_private / is_loopback 对映射部分**不生效**，
+    # 直接判会把内网地址当公网放过去 —— 经典 SSRF 绕过手法。
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
     return (
         ip.is_private
         or ip.is_loopback
@@ -270,6 +285,44 @@ async def assert_url_async(url: str, cfg: Config) -> tuple[bool, str]:
     return True, ""
 
 
+async def check_redirect_sync(url: str, cfg: Config) -> tuple[bool, str]:
+    """**重定向每一跳**都要过的 SSRF 校验。
+
+    为什么必须单独做：httpx 的 follow_redirects=True 会在库内部自动跟随
+    302/307，而 assert_url_async 只校验了**最初**那个 URL。攻击流程很直接：
+    给一个公网 URL，让它 302 跳到 http://169.254.169.254/（云元数据）或
+    内网某服务 —— 首跳校验全是公网 IP，顺利通过，然后 httpx 替我们把请求
+    打进了内网。SSRF 防线形同虚设。
+
+    这里挂 httpx 的 response 校验钩子：每收到一个响应，如果它是重定向，
+    就把 Location 目标也送进同一套 check_url 流程。拦下的重定向直接抛
+    _BlockedRedirect，最终由调用方归类成 blocked_url。
+    """
+    if cfg.allow_private_net:
+        return True, ""
+    allowed, reason = check_url(url, cfg)
+    if not allowed:
+        return False, reason
+
+    host = urlsplit(url.strip()).hostname or ""
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(
+            host, None, proto=socket.IPPROTO_TCP
+        )
+    except Exception as e:
+        log.debug("重定向目标 DNS 解析失败 %s: %s", host, e)
+        return True, ""
+
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if _is_disallowed_ip(ip):
+            return False, f"redirect_private_ip:{ip}"
+    return True, ""
+
+
 class HttpPool:
     """全局共享的 httpx 连接池。
 
@@ -320,10 +373,33 @@ class HttpPool:
         else:
             self.http2_enabled = False
         self._client = httpx.AsyncClient(**kwargs)
+        self._client.event_hooks["response"].append(self._guard_redirect)
         # 并发闸门：限制同时在飞的请求数，保护 vivo 的 3.7G 内存和有限 fd
         self._sem = asyncio.Semaphore(cfg.max_concurrency)
         self.inflight = 0
         self.total_requests = 0
+
+    async def _guard_redirect(self, response: httpx.Response) -> None:
+        """httpx 的 response event hook：自动跟随重定向前逐跳校验 SSRF。
+
+        httpx 每次准备跟随重定向时都会调这个钩子。抛出异常即中止整条
+        重定向链，请求方拿到的是 BlockedRedirectError。
+
+        只校验 3xx：非重定向响应没有下一个目标，无需检查。
+        """
+        if response.status_code < 300 or response.status_code >= 400:
+            return
+        loc = response.headers.get("location", "")
+        if not loc:
+            return
+        # 相对地址要按当前 URL 拼成绝对地址，否则 urlsplit 出来的 host 是空
+        target = str(response.url.join(loc))
+        allowed, reason = await check_redirect_sync(target, self.cfg)
+        if not allowed:
+            log.warning("拦截危险重定向 %s -> %s (%s)",
+                        response.url, target, reason)
+            raise BlockedRedirectError(
+                f"redirect_blocked:{reason}")
 
     @property
     def client(self) -> httpx.AsyncClient:
@@ -382,10 +458,18 @@ class HttpPool:
                         url, headers=req_headers, params=params, **kw
                     )
 
-                # 体积预检：Content-Length 超标直接判失败，省掉传输
+                # 体积预检：Content-Length 超标直接放弃，省掉传输。
+                # ⚠️ 必须 await resp.aclose() —— httpx.Response.close() 是**同步**
+                # 关闭，作用在 async 流上会抛
+                # "Attempted to call an sync close on an async stream."
+                # （2026-10-13 实测：tiddlywiki.com / example.com 必现，
+                #  不带 content-length 的 example.org 反而正常，所以极难复现定位）
                 cl = resp.headers.get("content-length")
                 if cl and cl.isdigit() and int(cl) > cap:
-                    resp.close()
+                    try:
+                        await resp.aclose()
+                    except Exception:
+                        pass
                     raise TooLargeError(f"content-length {cl} > cap {cap}")
                 await resp.aread()
                 if len(resp.content) > cap:

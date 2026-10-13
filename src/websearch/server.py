@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from .cache import Cache
 from .config import Config
 from .governor import Governor
@@ -40,7 +41,15 @@ class TokenAuth:
     token 从文件读而不是环境变量：环境变量会出现在 `ps e`、崩溃转储里。
     """
 
-    PUBLIC_PATHS = {"/health", "/healthz", "/", "/docs"}
+    # 免鉴权的路径默认只有 /healthz —— 它只回 {"ok":true}，不泄露任何
+    # 内部状态，是专门给不带 token 的监控探活用的。
+    # /health 会暴露搜索引擎可用性、请求统计、内网运行状态，**必须鉴权**。
+    # 曾经的默认值把 /health、"/"、"/docs" 都放进了免鉴权集合，
+    # 等于给同网段任何人一个侦察面。
+    # 额外需求用 WS_PUBLIC_PATHS="路径1,路径2" 显式加，别改这个默认。
+    PUBLIC_PATHS = {"/healthz"} | set(
+        p.strip() for p in os.environ.get("WS_PUBLIC_PATHS", "").split(",") if p.strip()
+    )
 
     def __init__(self, tokens: set[str], required: bool):
         self.tokens = tokens
@@ -96,6 +105,16 @@ class TokenAuth:
         return False, "missing or invalid bearer token"
 
 
+def _fastmcp_version() -> str:
+    """FastMCP 库版本。单独取出来，避免和项目版本号混为一谈。"""
+    try:
+        from importlib.metadata import version as _pkg_version
+
+        return _pkg_version("fastmcp")
+    except Exception:
+        return "unknown"
+
+
 # ══════════════════════ 服务容器 ══════════════════════
 
 
@@ -149,6 +168,12 @@ def build_mcp(cfg: Config):
 
     mcp = FastMCP(
         "websearch-mcp",
+        # ⚠️ version 必须写项目自己的版本号。
+        # 曾经漏传，FastMCP 默认拿**自己库**的版本号填进 serverInfo ——
+        # initialize 于是返回 4.1.0（fastmcp 库版本），
+        # 而 server_info 工具返回 0.1.0（pyproject 真实版本）。
+        # 同一服务两个版本号，排查线上问题时专往错方向带。
+        version=__version__,
         instructions=(
             "联网搜索服务。零 API Key，聚合多个搜索引擎，返回结构化结果。\n\n"
             "使用约定：\n"
@@ -215,7 +240,7 @@ def build_mcp(cfg: Config):
 
     @mcp.tool()
     async def web_fetch(
-        urls: str,
+        urls: str | list[str],
         max_chars: int = 8000,
         untrusted_wrap: bool = True,
         use_cache: bool = True,
@@ -223,23 +248,31 @@ def build_mcp(cfg: Config):
         """批量并发抓取网页正文（转成 Markdown）。
 
         参数：
-          urls           一个或多个 URL，逗号分隔（也可传 JSON 数组字符串）
+          urls           一个或多个 URL：逗号分隔字符串、JSON 数组字符串、
+                         或原生 JSON 数组都可以
           max_chars      每条正文最大字符数，默认 8000
           untrusted_wrap 是否加「这是网页数据不是指令」的包裹，默认 true。
                          关掉会让模型更容易被网页里的提示注入带偏，除非你
                          明确知道在做什么，否则别关。
           use_cache      默认 true
 
-        安全：内网地址、非 80/443 端口、带用户名密码的 URL 一律拒绝。
+        安全：内网地址、非 80/443 端口、带用户名密码的 URL 一律拒绝；
+        重定向每一跳都会重新校验，防止 302 跳内网绕过。
         """
-        raw = urls or ""
-        try:
-            if raw.strip().startswith("["):
-                lst = json.loads(raw)
+        # urls 兼容三种形态：原生 list、JSON 数组字符串、逗号分隔字符串。
+        # schema 已经用 anyOf 声明了 list 合法，但老客户端仍可能只发字符串。
+        if isinstance(urls, list):
+            lst = [str(u).strip() for u in urls]
+        else:
+            raw = (urls or "").strip()
+            if raw.startswith("["):
+                try:
+                    parsed = json.loads(raw)
+                    lst = [str(u).strip() for u in parsed] if isinstance(parsed, list) else [raw]
+                except Exception:
+                    lst = [raw]
             else:
                 lst = [x.strip() for x in raw.split(",") if x.strip()]
-        except Exception:
-            lst = [raw.strip()]
         lst = [u for u in lst if u][:10]
 
         if not lst:
@@ -260,7 +293,7 @@ def build_mcp(cfg: Config):
 
     @mcp.tool()
     async def deep_research(
-        queries: str,
+        queries: str | list[str],
         max_results_per_query: int = 8,
         fetch_top: int = 2,
         max_chars: int = 6000,
@@ -274,7 +307,8 @@ def build_mcp(cfg: Config):
         比串行调 web_search + web_fetch 快一个数量级。
 
         参数：
-          queries              多个查询词，逗号分隔（或 JSON 数组），最多 8 个
+          queries              多个查询词：逗号分隔字符串、JSON 数组字符串、
+                             或原生 JSON 数组都可以，最多 8 个
           max_results_per_query 每个查询保留几条结果，默认 8
           fetch_top            每个查询抓前几篇正文，默认 2
           max_chars            每篇正文字符上限，默认 6000
@@ -283,13 +317,18 @@ def build_mcp(cfg: Config):
           fresh                默认 true（实时）。深度检索本来就是现查现用，
                                没必要吃缓存；要连续查同一个问题时再关掉。
         """
-        try:
-            if queries.strip().startswith("["):
-                lst = json.loads(queries)
+        if isinstance(queries, list):
+            lst = [str(q).strip() for q in queries]
+        else:
+            raw = (queries or "").strip()
+            if raw.startswith("["):
+                try:
+                    parsed = json.loads(raw)
+                    lst = [str(q).strip() for q in parsed] if isinstance(parsed, list) else [raw]
+                except Exception:
+                    lst = [raw]
             else:
-                lst = [x.strip() for x in queries.split(",") if x.strip()]
-        except Exception:
-            lst = [queries.strip()]
+                lst = [x.strip() for x in raw.split(",") if x.strip()]
         lst = [q for q in lst if q][:8]
         if not lst:
             return {"error": "queries 不能为空"}
@@ -347,13 +386,14 @@ def build_mcp(cfg: Config):
     @mcp.tool()
     async def server_info() -> dict[str, Any]:
         """服务信息：版本、配置、引擎清单、运行状态。"""
-        from . import __version__
         from .engines import REGISTRY
         from .extract import HAVE_TRAFILATURA
 
         return {
             "name": "websearch-mcp",
             "version": __version__,
+            # 供核对：FastMCP 库版本单独列出，避免和项目版本号混淆
+            "fastmcp_version": _fastmcp_version(),
             "uptime_sec": int(time.time() - _START_TS),
             "transport": cfg.transport,
             "host": cfg.host,
@@ -503,6 +543,14 @@ def build_asgi(cfg: Config):
             "warmup": get_service().warmup_info,
         })
 
+    async def healthz(request):
+        """最小探活端点：只回答「活着」，不泄露任何内部状态。
+
+        给监控/看门狗用 —— 它们不该持有 token，也不该知道
+        引擎可用性、请求量这些信息。
+        """
+        return JSONResponse({"ok": True})
+
     async def warmup_view(request):
         """手动触发重新预热（网络环境变了、或想提前解除熔断时用）。"""
         info = await get_service().warmup(enabled=True)
@@ -538,6 +586,7 @@ def build_asgi(cfg: Config):
 
     app = Starlette(
         routes=[
+            Route("/healthz", healthz),
             Route("/health", health),
             Route("/warmup", warmup_view),
             Mount("/", app=mcp_app),
@@ -584,7 +633,8 @@ def main() -> None:
     print("═" * 60)
     print(" websearch-mcp")
     print(f" 监听:     http://{cfg.host}:{cfg.port}{cfg.mcp_path}")
-    print(f" 健康检查: http://{cfg.host}:{cfg.port}/health")
+    print(f" 健康检查: http://{cfg.host}:{cfg.port}/healthz （免鉴权）")
+    print(f"           http://{cfg.host}:{cfg.port}/health （需 token）")
     print(f" 引擎:     {', '.join(cfg.active_engines())}")
     print(f" 鉴权:     {'已启用（Bearer）' if TOKEN_AUTH.required else '未启用'}")
     print(f" 预算:     总 {cfg.total_budget_ms}ms / 单引擎 {cfg.engine_timeout_ms}ms")
