@@ -5,12 +5,27 @@
 #  1. token 从文件读，不写进脚本/环境变量（环境变量会出现在 ps e 和崩溃转储里）
 #  2. 绑定 0.0.0.0 必须有 token，否则服务会拒绝启动（局域网裸奔 = 送 SSRF 跳板）
 #  3. 缓存目录固定放 /opt 下，proot 重启不会丢
+#  4. **统一读 .env** —— 用户在面板里改的配置必须真正生效。
+#     之前这里只用 ${VAR:-default} 读环境变量，而面板写的是 .env 文件，
+#     导致「面板里改了代理配置，重启后搜索服务仍然直连」。
+#     现在先 source .env，再用默认值兜底，两条路都通。
 set -euo pipefail
 
 APP=/opt/websearch-mcp
 cd "$APP"
 
-# ── 配置 ──
+# ── 读 .env（面板写的配置在这里）──
+# 只导出符合 KEY=VALUE 的行，避免执行 .env 里的任意内容
+if [ -f "$APP/.env" ]; then
+  while IFS='=' read -r k v; do
+    case "$k" in
+      ''|'#'*|*[!A-Za-z0-9_]*) continue ;;   # 跳过注释与非法键名
+    esac
+    export "$k=$v"
+  done < "$APP/.env"
+fi
+
+# ── 配置（.env 优先，环境变量可覆盖）──
 export WS_HOST="${WS_HOST:-0.0.0.0}"
 export WS_PORT="${WS_PORT:-8300}"
 export WS_MCP_PATH="${WS_MCP_PATH:-/mcp}"
