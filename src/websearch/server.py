@@ -309,6 +309,8 @@ class Service:
         """
         if self.hunter is None or self.local_proxy is None:
             return False
+        if not self._on_node_pool:
+            return False        # 未挂在池上（如走用户代理），不由本方法管
         gate = self.pool.gate
         if not (gate.enabled and gate.state.bypassed):
             return False        # 代理健康，不动
