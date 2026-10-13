@@ -298,6 +298,11 @@ def _parse_trojan_like(uri: str, scheme: str, idx: int) -> dict[str, Any]:
         if fp:
             tls["utls"] = {"enabled": True, "fingerprint": fp}
         if security == "reality":
+            # ⚠️ sing-box 的 reality 客户端**强制要求 uTLS**：缺了直接 FATAL
+            # "uTLS is required by reality client" 拒绝启动。订阅里 fp= 常缺省，
+            # 缺了就整个节点连带同批探测实例一起起不来 → 探测全线 0 存活
+            # （2026-10-13 实测定位，3.2% 节点命中，足以毒死每一批）。
+            tls.setdefault("utls", {"enabled": True, "fingerprint": "chrome"})
             pbk = _qs_one(q, "pbk")
             if not pbk:
                 raise NodeParseError("reality 缺 pbk 公钥")
@@ -523,6 +528,8 @@ def _clash_tls(p: dict[str, Any], *, default_sni: str = "",
         tls["utls"] = {"enabled": True, "fingerprint": str(fp)}
     ro = p.get("reality-opts") or {}
     if ro.get("public-key"):
+        # reality 客户端必须带 uTLS，缺 client-fingerprint 时补默认（同 _parse_vless）
+        tls.setdefault("utls", {"enabled": True, "fingerprint": "chrome"})
         tls["reality"] = {
             "enabled": True,
             "public_key": str(ro["public-key"]),

@@ -25,10 +25,12 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
 import socket
+import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -46,6 +48,30 @@ CHECK_ALT = "https://www.gstatic.com/generate_204"
 PROBE_PORT_BASE = 20000
 PROBE_PORT_SPAN = 800          # 一批最多这么多节点（端口段上限）
 DEFAULT_CONCURRENCY = 12
+
+
+_REALITY_DEFAULT_UTLS = {"enabled": True, "fingerprint": "chrome"}
+
+
+def sanitize_outbound(ob: dict[str, Any]) -> dict[str, Any]:
+    """修掉会让 sing-box **拒绝启动**的已知节点配置问题（不动凭据）。
+
+    踩坑（2026-10-13，实测定位）：vless+reality 缺 `tls.utls` 时 sing-box
+    直接 FATAL（"uTLS is required by reality client"）**拒绝加载整个配置**，
+    于是一个这样的节点会把同批探测实例（上百节点共用一个实例）**全部带崩**，
+    整批判死 → 节点池永远 0 存活。订阅里 reality 常不带 fp=，故在探测侧
+    再兜一层底（解析侧 subparse 已同款修复）。
+    """
+    ob = copy.deepcopy(ob)
+    if ob.get("type") == "vless":
+        tls = ob.get("tls")
+        if isinstance(tls, dict):
+            real = tls.get("reality") or {}
+            utls = tls.get("utls") or {}
+            if real.get("enabled") and not utls.get("enabled"):
+                tls["utls"] = {**_REALITY_DEFAULT_UTLS,
+                               "fingerprint": utls.get("fingerprint") or "chrome"}
+    return ob
 
 
 @dataclass
@@ -158,30 +184,36 @@ class NodeProber:
     async def _probe_via_singbox(self, nodes: list[dict[str, Any]],
                                  timeout: float, concurrency: int,
                                  env: ProbeEnv) -> list[ProbeResult]:
-        inbounds: list[dict[str, Any]] = []
-        port_map: dict[int, str] = {}          # port -> fp
-        outbounds: list[dict[str, Any]] = []
-        rules: list[dict[str, Any]] = []
-        for i, n in enumerate(nodes):
-            p = PROBE_PORT_BASE + i
-            port_map[p] = n["fp"]
-            inbounds.append({
-                "type": "http", "tag": f"p{i}",
-                "listen": "127.0.0.1", "listen_port": p,
-            })
-            ob = dict(n["outbound"])
-            ob["tag"] = f"o{i}"
-            outbounds.append(ob)
-            rules.append({"inbound": [f"p{i}"], "outbound": f"o{i}"})
-        outbounds.append({"type": "direct", "tag": "direct"})
+        def build(ns: list[dict[str, Any]]) -> dict[str, Any]:
+            inbounds: list[dict[str, Any]] = []
+            outbounds: list[dict[str, Any]] = []
+            rules: list[dict[str, Any]] = []
+            for i, n in enumerate(ns):
+                inbounds.append({
+                    "type": "http", "tag": f"p{i}",
+                    "listen": "127.0.0.1", "listen_port": PROBE_PORT_BASE + i,
+                })
+                ob = sanitize_outbound(n["outbound"])
+                ob["tag"] = f"o{i}"
+                outbounds.append(ob)
+                rules.append({"inbound": [f"p{i}"], "outbound": f"o{i}"})
+            outbounds.append({"type": "direct", "tag": "direct"})
+            return {
+                "log": {"level": "error"},
+                "inbounds": inbounds,
+                "outbounds": outbounds,
+                "route": {"rules": rules, "final": "direct"},
+            }
 
-        cfg = {
-            "log": {"level": "error"},
-            "inbounds": inbounds,
-            "outbounds": outbounds,
-            "route": {"rules": rules, "final": "direct"},
-        }
         self.work_dir.mkdir(parents=True, exist_ok=True)
+        # 剔除会让整批实例起不来的非法节点（一个坏节点全批判死，见 sanitize 注释）
+        nodes = self._drop_poison(nodes, build)
+        if not nodes:
+            return []
+        cfg = build(nodes)
+        port_map: dict[int, str] = {
+            PROBE_PORT_BASE + i: n["fp"] for i, n in enumerate(nodes)
+        }
         cfg_path = self.work_dir / "probe_nodes.json"
         cfg_path.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
         try:
@@ -230,6 +262,45 @@ class NodeProber:
                     except Exception:
                         pass
             cfg_path.unlink(missing_ok=True)
+
+    # ── 配置级毒节点剔除 ──
+
+    def _config_ok(self, cfg: dict[str, Any]) -> bool:
+        """用 sing-box check 校验整批配置能否被接受（不启动实例）。"""
+        p = self.work_dir / "_probe_check.json"
+        try:
+            p.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+            r = subprocess.run([self.singbox_bin, "check", "-c", str(p)],
+                               capture_output=True, timeout=20)
+            return r.returncode == 0
+        except Exception:
+            return False
+        finally:
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _drop_poison(self, nodes: list[dict[str, Any]],
+                     build) -> list[dict[str, Any]]:
+        """二分剔除会让整批实例起不来的节点（未知毒配置兜底）。
+
+        背景：sing-box 是「配置不合即整体拒绝启动」，一个坏节点的 outbound
+        就能让上百节点的共用实例起不来、整批判死。sanitize_outbound 只盖已知
+        问题（reality/utls），这里用「整批 check → 二分定位」兜住未知问题。
+        代价 O(k·log n) 次 check，**仅整批校验失败时**触发（正常路径零开销）。
+        """
+        if not nodes:
+            return []
+        if self._config_ok(build(nodes)):
+            return nodes
+        if len(nodes) == 1:
+            log.warning("丢弃非法节点（sing-box 配置校验失败）：%s",
+                        str(nodes[0].get("fp", ""))[:16])
+            return []
+        mid = len(nodes) // 2
+        return (self._drop_poison(nodes[:mid], build)
+                + self._drop_poison(nodes[mid:], build))
 
     async def _check_via_proxy(self, port: int, timeout: float,
                                env: ProbeEnv) -> tuple[bool, bool, str]:
