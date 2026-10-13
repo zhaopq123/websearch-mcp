@@ -213,11 +213,18 @@ def _parse_vmess(uri: str, idx: int) -> dict[str, Any]:
         "alter_id": int(d.get("aid") or 0),
     }
     if tls in ("tls", "reality"):
+        # 同样要读 skip-cert-verify / allowInsecure（vmess JSON 里字段名是
+        # skip-cert-verify，见 v2rayN 系导出的约定）
+        insecure = bool(d.get("skip-cert-verify") or d.get("allowInsecure")
+                        or d.get("insecure"))
         ob["tls"] = {
             "enabled": True,
             "server_name": str(d.get("sni") or d.get("host") or d["add"]),
-            "insecure": False,
+            "insecure": insecure,
         }
+        fp = d.get("fp")
+        if fp:
+            ob["tls"]["utls"] = {"enabled": True, "fingerprint": str(fp)}
     # 传输层
     if net == "ws":
         ws: dict[str, Any] = {"type": "ws", "path": str(d.get("path") or "/")}
@@ -271,7 +278,18 @@ def _parse_trojan_like(uri: str, scheme: str, idx: int) -> dict[str, Any]:
 
     # TLS / Reality
     if security in ("tls", "reality", "xtls"):
-        tls: dict[str, Any] = {"enabled": True, "server_name": sni, "insecure": False}
+        # ⚠️ insecure 必须读订阅里的 allowInsecure，**不能硬编码 false**。
+        # 实测踩坑（2026-10-13）：订阅里 allowInsecure=1 的节点，
+        # 硬编码 insecure:false 会导致 TLS 校验失败 → 连接建不起来 →
+        # 表现为「所有节点都不通」，而 TCP 层明明能连上节点服务器。
+        # 这个参数在 hysteria2 分支里本来就读了，vless/trojan 却漏了 ——
+        # 同一个参数两种协议处理不一致，是典型的复制粘贴漏改。
+        insecure = (_qs_bool(q, "allowInsecure")
+                    or _qs_bool(q, "insecure")
+                    or _qs_bool(q, "skip-cert-verify"))
+        tls: dict[str, Any] = {
+            "enabled": True, "server_name": sni, "insecure": insecure,
+        }
         if fp:
             tls["utls"] = {"enabled": True, "fingerprint": fp}
         if security == "reality":
