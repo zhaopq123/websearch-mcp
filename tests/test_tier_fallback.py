@@ -184,6 +184,11 @@ class _Gate3:
     def __init__(self, bypassed: bool, enabled: bool = True):
         self.enabled = enabled
         self.state = type("S", (), {"bypassed": bypassed})()
+        self.restored = 0
+
+    def restore(self):
+        self.restored += 1
+        self.state.bypassed = False
 
 
 class _NodePool3:
@@ -200,10 +205,11 @@ class _NodePool3:
 
 
 class _Pool3:
-    def __init__(self, bypassed: bool, enabled: bool = True):
+    def __init__(self, bypassed: bool, enabled: bool = True,
+                 probe_ok: bool = False):
         self.gate = _Gate3(bypassed, enabled)
         self.attached: str | None = None
-        self.probe_ok = True
+        self.probe_ok = probe_ok
         self.probed = 0
 
     async def attach_proxy(self, url: str) -> bool:
@@ -230,25 +236,39 @@ class _Hunter3:
 
 
 def _svc3(*, bypassed: bool, on_pool: bool = True, cur: str | None = "dead1",
-           hunter: bool = True, enabled: bool = True) -> Service:
+           hunter: bool = True, enabled: bool = True,
+           probe_ok: bool = False) -> Service:
     s = Service.__new__(Service)
     s.local_proxy = _LP()
     s._user_proxy_url = ""
     s._on_node_pool = on_pool
     s._last_node_recover_mono = 0.0
-    s.pool = _Pool3(bypassed, enabled)
+    s.pool = _Pool3(bypassed, enabled, probe_ok)
     s.hunter = _Hunter3(cur) if hunter else None
     return s
 
 
 def test_recover_dead_node_switches_when_bypassed():
-    """代理进旁路（当前节点已死）→ 标死旧节点并换新节点。"""
-    s = _svc3(bypassed=True, cur="dead1")
+    """探针确认当前节点已死 → 标死旧节点并换新节点。"""
+    s = _svc3(bypassed=True, cur="dead1", probe_ok=False)
     assert asyncio.run(s.recover_dead_node()) is True
     assert s.hunter.switched is True
     # 旧节点被标死 DEAD_STREAK 次，否则 best() 仍会选它
     assert s.hunter.pool.recorded == [("dead1", False)] * 3
     assert s.pool.attached == "http://127.0.0.1:17892"
+
+
+def test_recover_dead_node_false_positive_restores():
+    """旁路是误报（探针经代理可达）→ 撤销旁路，不换节点。
+
+    实测：慢目标站的 ReadTimeout 也命中 _is_proxy_failure，代理明明通
+    却攒够 5 次进了旁路。若按旁路信号直接换节点，会把好节点误标死。
+    """
+    s = _svc3(bypassed=True, probe_ok=True)
+    assert asyncio.run(s.recover_dead_node()) is False
+    assert s.hunter.switched is False
+    assert s.hunter.pool.recorded == []
+    assert s.pool.gate.restored == 1
 
 
 def test_recover_dead_node_noop_when_healthy():
@@ -274,7 +294,7 @@ def test_recover_dead_node_noop_when_gate_disabled():
 
 def test_recover_dead_node_cooldown():
     """同一坏节点在冷却窗口内不反复换节点（防抖）。"""
-    s = _svc3(bypassed=True)
+    s = _svc3(bypassed=True, probe_ok=False)
     assert asyncio.run(s.recover_dead_node()) is True
     s.hunter.switched = False
     assert asyncio.run(s.recover_dead_node()) is False   # 冷却内

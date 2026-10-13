@@ -314,6 +314,20 @@ class Service:
         gate = self.pool.gate
         if not (gate.enabled and gate.state.bypassed):
             return False        # 代理健康，不动
+
+        # 权威判据：经代理探墙外探针。请求失败计数会误报 —— 慢目标站的
+        # ReadTimeout 也命中 _is_proxy_failure（实测：代理明明通，
+        # 却攒够 5 次失败进了旁路）。探针不通才算当前节点真死，
+        # 否则撤销这次误报的旁路。
+        try:
+            proxy_alive = await self.pool.probe_proxy()
+        except Exception:
+            proxy_alive = False
+        if proxy_alive:
+            gate.restore()
+            log.info("代理旁路系误报（探针经代理可达），已撤销")
+            return False
+
         now = time.monotonic()
         if now - self._last_node_recover_mono < 60.0:
             return False        # 冷却：与看门狗同频，防抖
