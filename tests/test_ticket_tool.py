@@ -127,3 +127,59 @@ def test_ticket_tool_does_not_leak_panel_token(cfg):
     r = run_ticket(cfg)
     assert "panel-token-for-test-only" not in r.stdout
     assert "panel-token-for-test-only" not in r.stderr
+
+
+# ══════════════════ 跨进程一致性（真 bug 回归） ══════════════════
+
+
+def test_store_sees_external_write(cfg):
+    """另一个进程写了文件，本实例必须能读到。
+
+    这是踩过的真 bug：ticket 工具（独立进程）签发票据写入 .env，
+    但面板进程的 Store 还拿着启动时的内存缓存，
+    于是「工具说链接有效、面板说票据无效」——用户点开链接进不去。
+
+    修法是按 mtime 自动重载。这条测试钉住它。
+    """
+    import time as _t
+
+    panel_store = Store(cfg)          # 模拟面板进程持有的实例
+    panel_store.set_many({"WS_PANEL_TOKEN": "panel-token-for-test-only-0123456789"})
+    # 确认此刻没有票据
+    assert panel_store._cache.get("WS_LOGIN_TICKET_HASH", "") == ""
+
+    # 另一个进程写票据（直接改文件，不经过 panel_store）
+    r = run_ticket(cfg)
+    assert r.returncode == 0, r.stderr
+
+    # 让节流窗口过期（STAT_INTERVAL = 0.5s）
+    _t.sleep(0.6)
+    # panel_store 必须能看到新票据
+    assert panel_store._cache.get("WS_LOGIN_TICKET_HASH", "") != "", \
+        "Store 没感知到外部写入 —— 跨进程缓存不一致"
+
+
+def test_consume_ticket_written_by_other_process(cfg):
+    """完整复现用户路径：工具签发 → 面板校验通过。"""
+    import re
+    import time as _t
+
+    panel_store = Store(cfg)
+    panel_store.set_many({"WS_PANEL_TOKEN": "panel-token-for-test-only-0123456789"})
+
+    r = run_ticket(cfg)
+    ticket = re.search(r"/_open\?t=([A-Za-z0-9_-]+)", r.stdout).group(1)
+
+    _t.sleep(0.6)   # 越过节流窗口
+    assert panel_store.consume_login_ticket(ticket) is True, \
+        "面板没能校验另一个进程签发的票据（用户会看到链接失效）"
+
+
+def test_reload_is_throttled(cfg):
+    """节流生效：短时间内的多次读不该反复 stat。"""
+    s = Store(cfg)
+    s._last_stat = 0.0
+    s.get("WS_PANEL_TOKEN")          # 第一次会 stat
+    first = s._last_stat
+    s.get("WS_PANEL_TOKEN")          # 立刻再读，应被节流
+    assert s._last_stat == first, "节流没生效（每次读都 stat）"

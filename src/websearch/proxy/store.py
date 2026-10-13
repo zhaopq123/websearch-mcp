@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import secrets
 import stat
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -80,15 +81,48 @@ def _mask(value: str) -> str:
 
 @dataclass
 class Store:
-    """凭据/配置存储。一个实例绑定一个 .env 文件。"""
+    """凭据/配置存储。一个实例绑定一个 .env 文件。
+
+    ⚠️ 跨进程一致性（踩过一次真 bug）：
+    面板进程持有 Store 实例，而 `ticket` 工具是**另一个进程**，
+    它签发票据时改的是磁盘文件。面板进程的内存缓存不会自动更新，
+    导致「工具说链接有效、面板说票据无效」——用户点开链接进不去。
+
+    修法：每次读之前检查文件 mtime，变了就重载（见 _maybe_reload）。
+    开销极小（一次 stat），但消除了这类跨进程不一致。
+    """
 
     path: Path
     _cache: dict[str, str] = field(default_factory=dict, repr=False)
+    _mtime: float = field(default=0.0, repr=False)
+    _last_stat: float = field(default=0.0, repr=False)
+
+    # 最多多久 stat 一次（秒）。设 0 = 每次读都 stat。
+    # 取 0.5 是因为：面板是低频交互，stat 成本可忽略；
+    # 而用户「刚跑完命令就点链接」的场景必须立刻生效。
+    STAT_INTERVAL = 0.5
 
     def __post_init__(self) -> None:
         self.path = Path(self.path)
         self._ensure_dir()
         if self.path.exists():
+            self.reload()
+
+    def _maybe_reload(self) -> None:
+        """文件被外部改动时自动重载（跨进程一致性）。
+
+        为什么要节流：一次搜索可能读十几个配置项，每次都 stat 没必要。
+        0.5 秒窗口足够覆盖「用户刚跑完命令就点链接」的场景。
+        """
+        now = time.monotonic()
+        if now - self._last_stat < self.STAT_INTERVAL:
+            return
+        self._last_stat = now
+        try:
+            mtime = self.path.stat().st_mtime
+        except OSError:
+            return
+        if mtime != self._mtime:
             self.reload()
 
     # ── 目录/权限 ──
@@ -122,8 +156,10 @@ class Store:
         """从磁盘重新加载。"""
         try:
             text = self.path.read_text(encoding="utf-8")
+            self._mtime = self.path.stat().st_mtime
         except FileNotFoundError:
             self._cache = {}
+            self._mtime = 0.0
             return
         except Exception as e:
             raise ConfigError(f"读取失败: {type(e).__name__}") from None
@@ -140,7 +176,11 @@ class Store:
         self._cache = data
 
     def get(self, key: str, default: str = "") -> str:
-        """读一个值。环境变量优先（便于运维临时覆盖）。"""
+        """读一个值。环境变量优先（便于运维临时覆盖）。
+
+        读之前先看文件有没有被外部改过（跨进程一致性）。
+        """
+        self._maybe_reload()
         env = os.environ.get(key)
         if env:
             return env
@@ -203,6 +243,13 @@ class Store:
             pass
         tmp.replace(self.path)
         self._secure_file()
+        # 记录新 mtime —— 否则自己写的改动会被 _maybe_reload 当成
+        # 「外部改动」再重载一次（无害但多余），且可能读到写一半的状态
+        try:
+            self._mtime = self.path.stat().st_mtime
+        except OSError:
+            self._mtime = 0.0
+        self._last_stat = time.monotonic()
 
     # ── 面板展示用（无凭据） ──
 
@@ -298,6 +345,9 @@ class Store:
 
         if not ticket:
             return False
+        # 关键：票据可能是**另一个进程**（ticket 工具）刚写入的，
+        # 不重载就永远校验不过 —— 这正是「链接点了进不去」的根因。
+        self._maybe_reload()
         stored = self._cache.get("WS_LOGIN_TICKET_HASH", "")
         if not stored:
             return False
