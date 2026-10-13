@@ -80,8 +80,11 @@ def test_all_tools_input_schema_has_no_anyof(tool_schemas):
 
 
 def test_tool_count_stable(tool_schemas):
-    """工具数量锁定 7 个——新增工具必须同步过上面两条约束。"""
-    assert len(tool_schemas) == 7
+    """工具数量锁定 9 个——新增工具必须同步过上面两条约束。
+
+    9 = 7 个搜索类工具 + node_hunt / node_pool（节点自养池）。
+    """
+    assert len(tool_schemas) == 9
 
 
 def test_multi_form_params_accept_any_type(tool_schemas):

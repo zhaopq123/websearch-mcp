@@ -179,6 +179,10 @@ class Service:
         self.warmup_info: dict[str, Any] | None = None
         # 节点猎手：全球免费节点自养池（详见 nodes/ 包）
         self.local_proxy = None
+        # 出网三级兜底：用户自配代理 → 自养节点池 → 直连
+        self._user_proxy_url = (cfg.proxy or "").strip()
+        self._on_node_pool = False
+        self._tier_task: asyncio.Task | None = None
         self.hunter = self._build_hunter(cfg)
 
     def _build_hunter(self, cfg: Config):
@@ -217,17 +221,66 @@ class Service:
     async def _switch_to_node(self, outbound: dict[str, Any]) -> bool:
         """智能降级的执行端：切到指定节点并让 HttpPool 走它。
 
-        ⚠️ 用户自己配了代理（cfg.proxy）时不抢：返回 True 表示「已处理」
-        （保持用户配置），节点库仅作备份，不自动接管出网。
+        **出网三级兜底**：用户自配代理 → 系统自养节点池 → 直连。
+          · 用户代理健康：不抢（尊重用户配置），返回 True 表示「已处理」。
+          · 用户代理挂了（gate 进旁路）或用户没配代理：自养节点池接管出网。
+          · 已在自养池上：继续按池内最优节点轮换。
+        为什么要有「用户代理挂了才接管」这级：否则付费代理一失效，
+        服务直接掉到直连，而池里明明有几十个实测能出网的节点干看着。
         """
-        if self.cfg.proxy:
-            return True
         if self.local_proxy is None:
             return False
+        if (self._user_proxy_url and not self._on_node_pool
+                and not self.pool.gate.state.bypassed):
+            return True
         ok = await self.local_proxy.switch_to(outbound)
         if ok:
             await self.pool.attach_proxy(self.local_proxy.proxy_url)
+            if not self._on_node_pool:
+                self._on_node_pool = True
+                log.info("自养节点池接管出网（用户代理不可用或未配置）")
         return ok
+
+    async def _maybe_restore_user_proxy(self) -> None:
+        """用户代理恢复后，把出网从自养池切回用户代理（三级兜底的回升）。
+
+        只在「当前挂在自养池上」时探活用户代理，避免无谓开销。
+        """
+        if not self._on_node_pool or not self._user_proxy_url:
+            return
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(proxy=self._user_proxy_url,
+                                         timeout=8.0) as c:
+                r = await c.get("https://www.google.com/generate_204")
+            ok = r.status_code in (200, 204)
+        except Exception:
+            ok = False
+        if ok and await self.pool.attach_proxy(self._user_proxy_url):
+            self._on_node_pool = False
+            log.info("用户代理已恢复，出网切回用户代理")
+
+    async def start_tier_recovery(self) -> None:
+        """后台回升循环：挂在自养池上时定期试用户代理，好了就切回。
+
+        与 pool.start_proxy_recovery_loop 同思路：回升不能只挂在搜索路径上，
+        否则「切到自养池后一直没人搜」就永远不回升。
+        """
+        if self._tier_task is not None or not self._user_proxy_url:
+            return
+
+        async def loop() -> None:
+            while True:
+                try:
+                    await asyncio.sleep(60)
+                    await self._maybe_restore_user_proxy()
+                except asyncio.CancelledError:
+                    return
+                except Exception:
+                    continue
+
+        self._tier_task = asyncio.create_task(loop())
 
     async def warmup(self, enabled: bool = True) -> dict[str, Any] | None:
         """启动预热。失败不影响服务启动（网络随时可能恢复）。"""
@@ -243,6 +296,8 @@ class Service:
         return self.warmup_info
 
     async def aclose(self) -> None:
+        if self._tier_task is not None:
+            self._tier_task.cancel()
         await self.pool.aclose()
         await self.cache.aclose()
         if self.hunter is not None:
@@ -504,10 +559,14 @@ def build_mcp(cfg: Config):
                 "failovers": svc.hunter.state.failovers,
             }
         alive = pool_info.get("alive", 0)
-        if st["bypassed"]:
-            hint = (f"代理不可用已降级直连（累计 {st['bypass_count']} 次）。"
-                    f"搜索仍可用但墙外源会失败。节点库现有 {alive} 个存活节点，"
-                    f"后台会持续搜并自动切换。")
+        on_pool = bool(getattr(svc, "_on_node_pool", False))
+        lp = svc.local_proxy.status() if svc.local_proxy is not None else {}
+        if on_pool and lp.get("running"):
+            hint = (f"用户代理不可用，已由**自养节点池**接管出网"
+                    f"（现有 {alive} 个存活节点，自动轮换；用户代理恢复后自动切回）。")
+        elif st["bypassed"]:
+            hint = (f"代理不可用（累计降级 {st['bypass_count']} 次）。"
+                    f"节点库有 {alive} 个存活节点，下一轮猎取会自动接管出网。")
         elif st["using_proxy"]:
             hint = "代理正常，请求走代理出网。"
         elif alive > 0:
@@ -519,7 +578,8 @@ def build_mcp(cfg: Config):
                     "node_hunt 手动触发一轮。")
         else:
             hint = "代理已配置但未启用（WS_PROXY_ENABLED=0）。"
-        return {**st, "node_pool": pool_info, "hint": hint}
+        return {**st, "on_node_pool": on_pool, "node_pool": pool_info,
+                "hint": hint}
 
     @mcp.tool(**_MCP)
     async def cache_manage(action: str = "stats", kind: str = "") -> dict[str, Any]:
@@ -769,6 +829,8 @@ async def _warmup_now() -> None:
     # 启动代理自动恢复循环：配了代理就必须有，
     # 否则「代理坏了→降级→之后没人搜→永远不恢复」
     svc.pool.start_proxy_recovery_loop()
+    # 启动「用户代理 ↔ 自养池」回升循环（三级兜底的回升）
+    await svc.start_tier_recovery()
     # 启动节点猎手持续搜索循环（用户明确要求：节点随时失效，必须一直搜）
     if svc.hunter is not None and svc.cfg.node_hunt_enabled:
         try:

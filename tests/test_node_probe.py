@@ -156,3 +156,103 @@ def test_probe_result_has_no_credentials(tmp_path):
     assert "香港01" in blob
     for secret in ("password", "uuid", "server", "0b6e8bb4"):
         assert secret not in blob.lower(), f"探测结果泄露了 {secret}"
+
+
+# ══════════════════ reality 缺 uTLS 的「毒节点」（2026-10-13 实测根因） ══════════════════
+#
+# 症状：节点池 892 个节点、每轮探测 100+、**永远 0 存活**。
+# 根因：vless+reality 的订阅常不带 fp=，解析出的 outbound 缺 tls.utls，
+#       sing-box 直接 FATAL("uTLS is required by reality client") 拒绝
+#       **加载整个配置**；而探测器把上百节点塞进同一个 sing-box 实例，
+#       于是一个毒节点 => 整批判死。实测 3.2% 节点命中，足以毒死每一批。
+
+
+def test_vless_reality_without_fp_gets_utls():
+    """reality 订阅不带 fp= 时必须补 utls，否则 sing-box 拒绝启动。"""
+    uri = ("vless://11111111-2222-3333-4444-555555555555@example.com:443"
+           "?security=reality&sni=x.com&pbk=PUBKEY&sid=abcd#REALITY")
+    n = parse_node(uri, 0)
+    tls = n.outbound["tls"]
+    assert tls["reality"]["enabled"] is True
+    assert tls["utls"]["enabled"] is True, "reality 缺 utls 会让 sing-box 拒绝启动"
+
+
+def test_vless_reality_keeps_given_fingerprint():
+    """订阅给了 fp= 时保留用户/订阅指定的指纹，不覆盖成默认。"""
+    uri = ("vless://11111111-2222-3333-4444-555555555555@example.com:443"
+           "?security=reality&sni=x.com&pbk=PUBKEY&sid=abcd&fp=firefox#R")
+    tls = parse_node(uri, 0).outbound["tls"]
+    assert tls["utls"]["fingerprint"] == "firefox"
+
+
+def test_clash_reality_without_fingerprint_gets_utls():
+    """clash 格式的 reality 节点同样要补 utls。"""
+    yml = (
+        "proxies:\n"
+        "  - name: R\n"
+        "    type: vless\n"
+        "    server: example.com\n"
+        "    port: 443\n"
+        "    uuid: 11111111-2222-3333-4444-555555555555\n"
+        "    tls: true\n"
+        "    servername: x.com\n"
+        "    reality-opts:\n"
+        "      public-key: PUBKEY\n"
+        "      short-id: abcd\n"
+    )
+    report = parse_subscription_text(yml)
+    tls = report.nodes[0].outbound["tls"]
+    assert tls["reality"]["enabled"] is True
+    assert tls["utls"]["enabled"] is True
+
+
+def test_sanitize_outbound_fixes_reality_utls():
+    """探测侧兜底：存量库里已缺 utls 的节点也要被就地修好（不改原对象）。"""
+    from websearch.nodes.probe import sanitize_outbound
+
+    ob = {"type": "vless",
+          "tls": {"enabled": True,
+                  "reality": {"enabled": True, "public_key": "K"}}}
+    out = sanitize_outbound(ob)
+    assert out["tls"]["utls"]["enabled"] is True
+    assert out["tls"]["utls"]["fingerprint"] == "chrome"
+    assert "utls" not in ob["tls"], "不得就地修改入参"
+
+
+def test_sanitize_outbound_leaves_good_node_untouched():
+    """正常节点（含 trojan、已带 utls 的 reality）原样返回。"""
+    from websearch.nodes.probe import sanitize_outbound
+
+    trojan = {"type": "trojan", "tls": {"enabled": True}}
+    assert sanitize_outbound(trojan) == trojan
+    ok_reality = {"type": "vless",
+                  "tls": {"enabled": True, "utls": {"enabled": True, "fingerprint": "firefox"},
+                          "reality": {"enabled": True, "public_key": "K"}}}
+    assert sanitize_outbound(ok_reality) == ok_reality
+
+
+def test_drop_poison_removes_only_offending_node(tmp_path):
+    """二分剔除：只丢让整批配置校验失败的节点，其余保留、顺序不变。"""
+    from websearch.nodes.probe import NodeProber
+
+    p = NodeProber(singbox_bin="/nonexistent/sing-box", work_dir=tmp_path)
+    # 用假的校验器：只要配置里含 "bad" 就判失败（模拟 sing-box 拒绝加载）
+    p._config_ok = lambda cfg: "bad" not in cfg["nodes"]  # type: ignore[assignment]
+
+    def build(ns):
+        return {"nodes": [n["fp"] for n in ns]}
+
+    nodes = [{"fp": "ok1"}, {"fp": "bad"}, {"fp": "ok2"}, {"fp": "ok3"}]
+    kept = [n["fp"] for n in p._drop_poison(nodes, build)]
+    assert kept == ["ok1", "ok2", "ok3"]
+
+
+def test_drop_poison_all_good_is_noop(tmp_path):
+    """整批配置合法时零改动、零额外开销。"""
+    from websearch.nodes.probe import NodeProber
+
+    p = NodeProber(singbox_bin="/nonexistent/sing-box", work_dir=tmp_path)
+    p._config_ok = lambda cfg: True  # type: ignore[assignment]
+    nodes = [{"fp": "a"}, {"fp": "b"}]
+    assert p._drop_poison(nodes, lambda ns: {}) is nodes
+
