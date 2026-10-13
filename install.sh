@@ -2,26 +2,26 @@
 # websearch-mcp 一键安装 —— 装完直接给你一个可点开的链接，零手工配置
 #
 # 用法（在服务器上执行）：
-#   bash install.sh              # 默认：面板绑局域网，装完打印直达链接
-#   bash install.sh --local-only # 面板只绑本机（更保守）
+#   bash install.sh                 # 默认：面板局域网可达，装完给直达链接
+#   bash install.sh --local-only    # 面板只绑本机（更保守，需 SSH 隧道访问）
 #
 # 它做这些事（全部幂等，可重复执行）：
-#   1. 检查 python / venv
-#   2. 装 sing-box（代理客户端，可选但推荐）
-#   3. 装 Python 依赖
+#   1. 检查/创建 Python 虚拟环境
+#   2. 安装 Python 依赖
+#   3. 检查 sing-box（代理客户端，可选但推荐）
 #   4. 生成配置与面板口令（600 权限）
 #   5. 启动面板并打印「点开即登录」的链接
 #
-# ⚠️ 不碰任何凭据：订阅链接由用户在面板里填，脚本不接收、不打印。
+# ⚠️ 本脚本不接收也不打印任何凭据：订阅链接由用户在面板里填。
 set -euo pipefail
 
 APP="${WS_APP_DIR:-/opt/websearch-mcp}"
-PANEL_PORT="${WS_PANEL_PORT:-8500}"
+PANEL_PORT_DEFAULT="${WS_PANEL_PORT:-8500}"
 LOCAL_ONLY=0
 for a in "$@"; do
   case "$a" in
     --local-only) LOCAL_ONLY=1 ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
   esac
 done
 
@@ -32,54 +32,73 @@ die()  { printf '  \033[0;31m✘\033[0m %s\n' "$*" >&2; exit 1; }
 
 say "═══ websearch-mcp 安装 ═══"
 
-# ── 1. 目录与 Python ──
+# ── 0. 前置检查 ──
 [ -d "$APP" ] || die "找不到 $APP（先把项目放上去，或用 WS_APP_DIR 指定）"
 cd "$APP"
 
+if ! command -v python3 >/dev/null 2>&1; then
+  die "缺少 python3。Ubuntu/Debian 装法：sudo apt install -y python3 python3-venv"
+fi
+ok "python3 已就绪（$(python3 -V 2>&1)）"
+
+# ── 1. 虚拟环境 ──
+say "1/5 准备 Python 环境"
 if [ ! -x "$APP/venv/bin/python" ]; then
-  say "1/5 创建 Python 虚拟环境"
-  python3 -m venv "$APP/venv" || die "创建 venv 失败（需要 python3-venv）"
-  ok "venv 已创建"
+  python3 -m venv "$APP/venv" 2>/dev/null \
+    || die "创建虚拟环境失败。多半缺 python3-venv：sudo apt install -y python3-venv"
+  ok "虚拟环境已创建"
 else
-  ok "1/5 venv 已存在"
+  ok "虚拟环境已存在"
 fi
 PY="$APP/venv/bin/python"
 
-say "2/5 安装 Python 依赖"
+# ── 2. 依赖 ──
+say "2/5 安装依赖（可能需要 1-2 分钟）"
 "$PY" -m pip install -q --upgrade pip 2>/dev/null || true
-"$PY" -m pip install -q -e ".[extract]" 2>/dev/null \
-  || "$PY" -m pip install -q fastmcp uvicorn starlette httpx trafilatura \
-  || die "依赖安装失败"
-ok "依赖已安装"
-
-# ── 2. sing-box（可选）──
-say "3/5 检查 sing-box（代理客户端，没它就只能用国内源）"
-SB="${WS_SINGBOX_BIN:-/opt/sing-box/sing-box}"
-if [ -x "$SB" ]; then
-  ok "已安装：$("$SB" version 2>/dev/null | head -1)"
+if "$PY" -m pip install -q -e ".[extract]" 2>/dev/null; then
+  ok "依赖已安装（含正文提取增强）"
+elif "$PY" -m pip install -q fastmcp uvicorn starlette httpx 2>/dev/null; then
+  warn "基础依赖已安装（trafilatura 装失败，正文提取退化为内置算法）"
 else
-  warn "未安装。要出网（用 Google/DDG 等墙外源）需要它。"
-  echo "     装法（ARM64 服务器，如树莓派/手机容器）："
-  echo "       VER=\$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep -o '\"tag_name\": *\"[^\"]*\"' | head -1 | cut -d'\"' -f4)"
-  echo "       curl -sL -o /tmp/sb.tgz \"https://github.com/SagerNet/sing-box/releases/download/\$VER/sing-box-\${VER#v}-linux-arm64.tar.gz\""
-  echo "       mkdir -p /opt/sing-box && tar -xzf /tmp/sb.tgz -C /tmp --strip-components=1 && cp /tmp/sing-box /opt/sing-box/ && chmod +x /opt/sing-box/sing-box"
-  echo "     x86_64 把 linux-arm64 换成 linux-amd64"
+  die "依赖安装失败。检查网络，或手动跑：$PY -m pip install fastmcp uvicorn starlette httpx"
 fi
 
-# ── 3. 配置 ──
+# ── 3. sing-box（可选）──
+say "3/5 检查 sing-box（用来访问墙外搜索源）"
+SB="${WS_SINGBOX_BIN:-/opt/sing-box/sing-box}"
+if [ -x "$SB" ]; then
+  ok "已安装（$("$SB" version 2>/dev/null | head -1)）"
+else
+  warn "未安装 —— 只能搜国内源（百度/必应/360/微信）。要搜 Google/DDG 需要它。"
+  ARCH=$(uname -m)
+  case "$ARCH" in
+    aarch64|arm64) SBFILE="linux-arm64" ;;
+    x86_64|amd64)  SBFILE="linux-amd64" ;;
+    *) SBFILE="" ;;
+  esac
+  if [ -n "$SBFILE" ]; then
+    echo "     你的架构 $ARCH，装法："
+    echo "       VER=\$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep -o '\"tag_name\": *\"[^\"]*\"' | head -1 | cut -d'\"' -f4)"
+    echo "       curl -sL -o /tmp/sb.tgz \"https://github.com/SagerNet/sing-box/releases/download/\$VER/sing-box-\${VER#v}-$SBFILE.tar.gz\""
+    echo "       mkdir -p /opt/sing-box && tar -xzf /tmp/sb.tgz -C /tmp --strip-components=1"
+    echo "       cp /tmp/sing-box /opt/sing-box/ && chmod +x /opt/sing-box/sing-box"
+    echo "     （装完重新跑一次本脚本即可）"
+  else
+    echo "     你的架构 $ARCH 没有官方预编译包，需自行编译。"
+  fi
+fi
+
+# ── 4. 配置 ──
 say "4/5 初始化配置"
 ENVFILE="$APP/.env"
 if [ ! -f "$ENVFILE" ]; then
-  # 面板监听：默认局域网可达（安装体验优先），口令是唯一防线
-  if [ "$LOCAL_ONLY" = "1" ]; then
-    HOSTVAL="127.0.0.1"
-  else
-    HOSTVAL="0.0.0.0"
-  fi
+  if [ "$LOCAL_ONLY" = "1" ]; then HOSTVAL="127.0.0.1"; else HOSTVAL="0.0.0.0"; fi
   cat > "$ENVFILE" <<EOF
 # websearch-mcp 配置（含凭据，权限 600，已在 .gitignore）
+# 这个文件由管理面板读写；手工改完重启面板生效。
 WS_PANEL_HOST=$HOSTVAL
-WS_PANEL_PORT=$PANEL_PORT
+WS_PANEL_PORT=$PANEL_PORT_DEFAULT
+WS_PORT=8300
 WS_HTTP_PROXY_PORT=17890
 WS_SOCKS_PROXY_PORT=17891
 WS_PROXY_ENABLED=0
@@ -90,19 +109,21 @@ WS_PROXY_WORKDIR=$APP/proxy-run
 WS_CONFIG_FILE=$ENVFILE
 EOF
   chmod 600 "$ENVFILE"
-  ok "配置已生成（$ENVFILE，600 权限）"
+  ok "配置已生成（600 权限）"
 else
   chmod 600 "$ENVFILE"
   ok "配置已存在（权限已收紧为 600）"
 fi
 
 # gitignore 自检 —— 防凭据被提交
-if [ -f "$APP/.gitignore" ] && ! grep -q '^\.env$' "$APP/.gitignore"; then
-  warn ".gitignore 里没有 .env —— 凭据有被提交的风险，已自动补上"
-  printf '\n.env\n.env.*\n!.env.example\nsingbox.json\nsingbox.log\nproxy-run/\n' >> "$APP/.gitignore"
+if [ -f "$APP/.gitignore" ]; then
+  if ! grep -q '^\.env$' "$APP/.gitignore"; then
+    warn ".gitignore 缺 .env —— 凭据有被提交风险，已自动补上"
+    printf '\n.env\n.env.*\n!.env.example\nsingbox.json\nsingbox.log\nproxy-run/\n' >> "$APP/.gitignore"
+  fi
 fi
 
-# ── 4. 启动 ──
+# ── 5. 启动 ──
 say "5/5 启动面板"
 pkill -f "websearch.proxy.panel_server" 2>/dev/null || true
 sleep 1
@@ -111,27 +132,30 @@ mkdir -p "$APP/proxy-run"; chmod 700 "$APP/proxy-run"
 export PYTHONPATH="$APP/src"
 export WS_CONFIG_FILE="$ENVFILE"
 nohup "$PY" -m websearch.proxy.panel_server > "$APP/panel.log" 2>&1 &
-sleep 4
+sleep 5
+
+PANEL_PORT=$(grep '^WS_PANEL_PORT=' "$ENVFILE" 2>/dev/null | cut -d= -f2 | tr -d ' \r')
+PANEL_PORT="${PANEL_PORT:-$PANEL_PORT_DEFAULT}"
 
 if curl -s -m 5 -o /dev/null "http://127.0.0.1:$PANEL_PORT/healthz"; then
-  ok "面板已启动（:$PANEL_PORT）"
+  ok "面板已启动（端口 $PANEL_PORT）"
 else
-  die "面板启动失败，看日志：tail -30 $APP/panel.log"
+  die "面板启动失败。看日志：tail -30 $APP/panel.log"
 fi
 
 echo
 say "═══ 安装完成 ═══"
 echo
-echo "面板的访问链接与说明已打印在上面的启动日志里："
+echo "访问方式与直达链接（打印在启动日志里）："
 echo
-sed -n '/点这个链接直接进面板/,/^═/p' "$APP/panel.log" 2>/dev/null | head -20 \
-  || tail -25 "$APP/panel.log"
+sed -n '/websearch-mcp 管理面板/,/^═/p' "$APP/panel.log" | tail -25
 echo
-echo "以后常用命令："
+echo "常用命令："
 echo "  看状态:   bash $APP/scripts/panel-ctl.sh status"
-echo "  重启:     bash $APP/scripts/panel-ctl.sh restart"
+echo "  重启面板: bash $APP/scripts/panel-ctl.sh restart"
 echo "  看日志:   bash $APP/scripts/panel-ctl.sh logs"
-echo "  配代理:   在面板里填订阅链接 → 启动代理 → 健康检查"
 echo
-echo "搜索服务要用代理时，设这个环境变量后重启搜索服务："
-echo "  export WS_PROXY=http://127.0.0.1:17890"
+echo "下一步："
+echo "  1. 打开上面那个「点这个链接直接进面板」的地址"
+echo "  2. 在「机场订阅」填你的订阅链接 → 保存 → 启动代理"
+echo "  3. 在「把它接到你的 AI 客户端」里复制配置，粘到你的 AI 客户端"
