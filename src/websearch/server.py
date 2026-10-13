@@ -582,7 +582,7 @@ def build_mcp(cfg: Config):
 
     @mcp.tool(**_MCP)
     async def node_pool(action: str = "status", limit: int = 30,
-                        pool: str = "") -> dict[str, Any]:
+                        pool: str = "", target_alive: int = -1) -> dict[str, Any]:
         """查看「节点库」——**两个独立池**：客户导入 + 系统自搜。
 
         · cust  客户导入的节点（机场/自建）。选路**优先**用它，
@@ -592,10 +592,17 @@ def build_mcp(cfg: Config):
         免费节点挤掉客户节点的探测预算、选路时把付费节点和免费垃圾
         平等排序。
 
+        **保活模式**（target_alive>0 时启用）：后台不是「定时收集」而是
+        **维持 N 个活节点**的闭环 —— 活节点会持续死亡，每轮重新规划
+        探测量（按存活率放大）和下次间隔（缺口大就 2 分钟，达标就
+        15 分钟），并对死节点做激进淘汰。
+
         参数：
           action  status（库统计，默认）| list（节点列表）| sources（源健康度）
           limit   list/sources 的返回条数上限
           pool    cust（只看客户池）| free（只看免费池）| 留空=全部
+          target_alive  保活目标活节点数；传0=关闭保活（回到定时收集），
+                        传 -1（默认）=不改，只查询
 
         返回**不含任何节点凭据**（uuid/密码永不外泄），
         只给协议、地区、延迟、健康分。
@@ -606,6 +613,9 @@ def build_mcp(cfg: Config):
         p = svc.hunter.pool
         limit = max(1, min(int(limit or 30), 200))
         pool = pool if pool in ("cust", "free") else ""
+        if target_alive >= 0:
+            svc.hunter.state.target_alive = int(target_alive)
+            log.info("保活目标已调整为 %d（0=关闭）", target_alive)
         if action == "list":
             return {
                 "pool": pool or "all",
@@ -620,13 +630,14 @@ def build_mcp(cfg: Config):
         return {
             "stats": p.stats().to_dict(),
             "hunter": svc.hunter.status(),
+            "plan": svc.hunter.plan_next_round(),
             "local_proxy": (svc.local_proxy.status()
                             if svc.local_proxy is not None else None),
             "hint": ("两个池：cust=客户导入（选路优先，不按时效淘汰）、"
                      "free=系统自搜的全球免费节点（兜底）。"
                      "stats.by_pool 分别给出两池的 total/alive/untested。"
-                     "搜到全球节点后会按延迟与成功率自动选最优，"
-                     "但客户池有可用节点时永远优先用它。"),
+                     "plan 是下一轮的规划（探多少/隔多久）——"
+                     "保活模式下按缺口自适应，不会固定十分钟一轮。"),
         }
 
     @mcp.tool(**_MCP)

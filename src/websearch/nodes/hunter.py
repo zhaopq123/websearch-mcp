@@ -51,6 +51,30 @@ DEFAULT_FETCH_CONCURRENCY = 6   # 源抓取并发
 DEFAULT_LOOP_INTERVAL = 600     # 持续搜索间隔（秒）——10 分钟一轮
 LOOP_FAIL_BACKOFF_MAX = 3600    # 连续失败时最长退避到 1 小时
 
+# ── 保活闭环（维持 N 个活节点）──
+#
+# 为什么需要单独一套参数：默认配置是「随便搜搜」，一轮 120 个探测、
+# 十分钟一轮、7 天才淘汰。而要「一直保持 100 个活节点」是**保活**
+# 不是「收集」——活节点会以小时为单位死亡，必须持续补充，且死得
+# 比补得快。三个调节旋钮：
+TARGET_ALIVE = 100# 目标活节点数（env WS_NODE_TARGET_ALIVE）
+# 实测免费节点存活率极低（2026-10-13：探测 60 存活 0）。
+# 要养住 100 个活的，输入侧的候选必须远超 100 —— 否则再怎么探也是杯水车薪。
+PROBE_OVERSHOOT = 4             # 每轮探测量 = target × 本值（至少 PROBE_MIN）
+PROBE_MIN = 240#单轮探测下限（补库存时的最小批量）
+# 活节点不够时缩短间隔，够时拉长。固定间隔是「够用就行」的做法，
+# 保活必须按缺口调节，否则刚补满 100 个，下一轮又掉到 50 个。
+INTERVAL_MIN = 120              # 缺货时最快 2 分钟一轮
+INTERVAL_MAX = 900              # 满仓时最慢 15 分钟一轮
+INTERVAL_FLOOR_RATIO = 0.5       # 缺口达此比例 → 用 INTERVAL_MIN
+# 保活模式下的淘汰阈值。默认 7 天对免费节点太长：死节点堆着不删，
+# 候选查询越来越慢，而免费节点本来就按小时计寿命。2 小时够筛掉
+# 「源里还挂着但实际早已不可用」的那批，且不会误伤刚入库的。
+FRESH_PRUNE_SEC = 2 * 3600
+# 单轮探测硬上限。probe.py 的 PROBE_PORT_SPAN=800 是端口段上限，
+# 这里留一半余量：手机 CPU 上一次别开太多代理端口（实测并发 12 已接近饱和）。
+PROBE_HARD_CAP = 400
+
 
 def _env_int(name: str, default: int) -> int:
     try:
@@ -75,6 +99,12 @@ class HunterState:
     current_node_fp: str = ""      # 当前代理正在用的节点指纹
     failovers: int = 0             # 累计换节点次数
     last_error: str = ""
+    # ── 保活闭环状态 ──
+    target_alive: int = 0# 目标活节点数（0 = 不启用保活模式）
+    alive_now: int = 0             # 上轮结束时实测存活总数
+    alive_cust: int = 0            # 其中客户池
+    alive_free: int = 0            # 其中免费池
+    deficit: int = 0               # 缺口 = target − alive（<=0 表示达标）
 
     def to_dict(self) -> dict[str, Any]:
         now = time.time()
@@ -92,6 +122,12 @@ class HunterState:
             "current_node_fp": self.current_node_fp,
             "failovers": self.failovers,
             "last_error": self.last_error,
+            # 保活闭环
+            "target_alive": self.target_alive,
+            "alive_now": self.alive_now,
+            "alive_cust": self.alive_cust,
+            "alive_free": self.alive_free,
+            "deficit": self.deficit,
         }
 
 
@@ -124,10 +160,90 @@ class NodeHunter:
         self.switch_cb = switch_cb
         self.state = HunterState(
             interval_sec=_env_int("WS_NODE_HUNT_INTERVAL", DEFAULT_LOOP_INTERVAL),
+            target_alive=_env_int("WS_NODE_TARGET_ALIVE", TARGET_ALIVE),
         )
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._lock = asyncio.Lock()      # 保证同一时刻只有一轮 hunt
+        # 存活率 EMA：决定探测量要放大多少倍才能养住目标活节点数。
+        # 首次探测前没有样本，先用一个保守的悲观值（免费节点存活率极低）。
+        self._alive_rate_ema: float = 0.0
+
+    # ══════════════════ 保活规划器 ══════════════════
+
+    def plan_next_round(self) -> dict[str, Any]:
+        """按当前缺口规划下一轮：探多少、隔多久再跑。
+
+        为什么要有这个：默认参数是「随便搜搜」（一轮 120 个探测、
+        10 分钟一轮），而保活的目标是**动态维持** N 个活节点。
+        活节点会持续死亡（实测免费池 807 个存活 0），补的速度必须
+        始终快过死的速度，缺口越大就得越激进。
+
+        返回（无凭据）：{"probe_limit", "delay_sec", "deficit",
+                        "alive", "alive_rate", "untested"}
+        """
+        st = self.state
+        target = st.target_alive
+        stats = self.pool.stats()
+        alive = stats.alive
+        st.alive_now = alive
+        st.alive_cust = (stats.by_pool.get("cust") or {}).get("alive", 0)
+        st.alive_free = (stats.by_pool.get("free") or {}).get("alive", 0)
+        untested = stats.untested
+
+        if target <= 0:
+            # 未启用保活：沿用固定规模
+            return {
+                "probe_limit": _env_int("WS_NODE_HUNT_PROBE_LIMIT",
+                                        DEFAULT_PROBE_LIMIT),
+                "delay_sec": st.interval_sec,
+                "deficit": 0, "alive": alive, "alive_rate": None,
+                "untested": untested, "mode": "collect",
+            }
+
+        deficit = max(0, target - alive)
+        st.deficit = deficit
+
+        # 探测量：按存活率放大。存活率 10% 时要探 10 倍才够，
+        # 所以下限取 PROBE_MIN（批量探测有固定开销，太少不划算）。
+        rate = self._alive_rate_ema
+        if rate <= 0.01:
+            need = PROBE_MIN
+        else:
+            need = int(target / rate * PROBE_OVERSHOOT)
+        probe_limit = max(PROBE_MIN, need)
+        # ⚠️ 不能用 `min(probe_limit, untested)` 限制探测量 ——
+        # 库存挖空（untested=0）时那会把 probe_limit 压到 0，
+        # 循环变成「每轮探 0 个」→ 永远补不上活节点。
+        # 正确做法是探测量由**存活率**决定（要多少探多少），
+        # 探不到候选时让 probe_batch 自己少探几个即可。
+        probe_limit = min(probe_limit, PROBE_HARD_CAP)
+
+        # 间隔：缺口越大越快。
+        if deficit <= 0:
+            delay = INTERVAL_MAX
+        elif deficit >= target * INTERVAL_FLOOR_RATIO:
+            delay = INTERVAL_MIN
+        else:
+            ratio = deficit / max(1, target)
+            delay = int(INTERVAL_MIN + (INTERVAL_MAX - INTERVAL_MIN) * ratio)
+        # 已启用保活时不再用固定 interval_sec
+        return {
+            "probe_limit": probe_limit,
+            "delay_sec": max(INTERVAL_MIN, min(INTERVAL_MAX, delay)),
+            "deficit": deficit, "alive": alive, "alive_rate": rate,
+            "untested": untested, "mode": "keepalive",
+        }
+
+    def _update_alive_rate(self, probed: int, alive: int) -> None:
+        """更新存活率 EMA（只在有样本时更新）。"""
+        if probed <= 0:
+            return
+        r = alive / probed
+        if self._alive_rate_ema <= 0:
+            self._alive_rate_ema = r
+        else:
+            self._alive_rate_ema = 0.7 * self._alive_rate_ema + 0.3 * r
 
     # ══════════════════ 主流程 ══════════════════
 
@@ -141,6 +257,12 @@ class NodeHunter:
             self.state.running = True
             max_sources = max_sources or _env_int(
                 "WS_NODE_HUNT_MAX_SOURCES", DEFAULT_MAX_SOURCES)
+            # 保活模式下 probe_limit 由规划器按缺口决定，忽略默认固定值
+            plan: dict[str, Any] = {}
+            if probe_limit is None:
+                plan = self.plan_next_round()
+                if plan.get("mode") == "keepalive":
+                    probe_limit = plan["probe_limit"]
             probe_limit = probe_limit or _env_int(
                 "WS_NODE_HUNT_PROBE_LIMIT", DEFAULT_PROBE_LIMIT)
 
@@ -150,6 +272,8 @@ class NodeHunter:
                 "new_nodes": 0, "probed": 0, "alive": 0,
                 "discovered": 0, "note": "",
             }
+            if plan:
+                report["plan"] = plan
             try:
                 # 1) 组源
                 source_list = await self._build_sources(discover=discover,
@@ -159,12 +283,15 @@ class NodeHunter:
                 # 2) 抓取 + 解析 + 入库
                 parsed_nodes = await self._fetch_and_ingest(source_list, report)
 
-                # 3) 探测候选（优先未测的）
+                # 3) 探测候选（cust 配额 + free 补量）
                 probe_report = await self._probe_candidates(probe_limit)
                 report.update(probe_report)
+                self._update_alive_rate(report["probed"], report["alive"])
 
-                # 4) 清理
-                pruned = self.pool.prune()
+                # 4) 清理。保活模式要**激进淘汰**：死节点堆积会拖慢
+                #    候选查询，且免费节点本就该按小时计寿命。
+                pruned = (self.pool.prune(max_age_sec=FRESH_PRUNE_SEC)
+                          if self.state.target_alive > 0 else self.pool.prune())
                 if pruned:
                     report["pruned"] = pruned
 
@@ -174,6 +301,18 @@ class NodeHunter:
                     report["note"] = "所有源都抓取失败（网络或源已失效）"
                 elif report["alive"] == 0:
                     report["note"] = "收到节点但本轮探测无存活（免费节点常态）"
+
+                # 保活模式下把实时库存写回状态（下一轮规划要用）
+                if self.state.target_alive > 0:
+                    st2 = self.pool.stats()
+                    self.state.alive_now = st2.alive
+                    self.state.alive_cust = (
+                        st2.by_pool.get("cust") or {}).get("alive", 0)
+                    self.state.alive_free = (
+                        st2.by_pool.get("free") or {}).get("alive", 0)
+                    self.state.deficit = max(0, self.state.target_alive - st2.alive)
+                    report["alive_total"] = st2.alive
+                    report["deficit"] = self.state.deficit
 
                 self.state.rounds += 1
                 self.state.last_round_at = time.time()
@@ -383,24 +522,45 @@ class NodeHunter:
         log.info("节点猎手循环已停止")
 
     async def _loop(self) -> None:
-        """常驻循环：立即跑一轮，之后按间隔跑；失败退避。"""
+        """常驻循环：**自适应间隔**的保活闭环。
+
+        间隔不写死：每轮结束后重新规划 —— 缺口大就 2 分钟后再跑，
+        达标了可以拉到 15 分钟。这是「一直保持 N 个活节点」和
+        「定时收集」的根本区别。
+        """
         while not self._stop.is_set():
+            delay = self.state.interval_sec
             try:
                 # 启动即搜一轮（不等第一个间隔）
                 await self.hunt(trigger="auto", discover=self.discover)
                 # 每轮结束顺手自愈一次（换掉失效的当前节点 / 首次接入出网）
                 await self.smart_failover(switch_cb=self.switch_cb)
-                delay = self.state.interval_sec
+                # 规划下一轮间隔
+                if self.state.target_alive > 0:
+                    plan = self.plan_next_round()
+                    delay = int(plan["delay_sec"])
+                    if self.state.rounds % 5 == 1 or plan["deficit"] <= 0:
+                        log.info(
+                            "保活状态：活 %d/%d（客户 %d / 免费 %d），"
+                            "缺口 %d，未测 %d，本轮探 %d，存活率 %.1f%%，"
+                            "下次 %.0fs 后",
+                            plan["alive"], self.state.target_alive,
+                            self.state.alive_cust, self.state.alive_free,
+                            plan["deficit"], plan["untested"],
+                            plan["probe_limit"],
+                            (plan["alive_rate"] or 0) * 100,
+                            delay,
+                        )
                 if self.state.consecutive_fail >= 2:
                     # 连续失败退避：×2，最长 1 小时（别把源打崩）
                     delay = min(LOOP_FAIL_BACKOFF_MAX,
-                                self.state.interval_sec * (2 ** min(
-                                    self.state.consecutive_fail, 4)))
+                                max(delay, self.state.interval_sec * (2 ** min(
+                                    self.state.consecutive_fail, 4))))
             except asyncio.CancelledError:
                 return
             except Exception as e:
                 log.warning("hunt 循环异常（继续）: %s", type(e).__name__)
-                delay = min(LOOP_FAIL_BACKOFF_MAX, self.state.interval_sec * 2)
+                delay = min(LOOP_FAIL_BACKOFF_MAX, max(delay, 300))
             self.state.next_round_at = time.time() + delay
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=delay)

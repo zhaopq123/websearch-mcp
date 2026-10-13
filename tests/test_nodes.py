@@ -546,3 +546,115 @@ async def test_hunter_import_customer_goes_to_cust(tmp_path):
     free = pool.list_public(only_alive=False, pool="free")
     assert [r["server"] for r in cust] == ["cust.example.com"]
     assert [r["server"] for r in free] == ["free.example.com"]
+
+
+# ══════════════════════ 保活闭环（维持 N 个活节点）══════════════════════
+#
+# 需求：搜→跑→测→删一直跑，保持 100 个活节点。
+# 关键约束：活节点持续死亡，补充速度必须快过死亡速度，且探测预算
+# 不能浪费在重测已知死节点上（实测免费池 807 个存活 0）。
+
+def _hunter(tmp_path):
+    from websearch.nodes.hunter import NodeHunter
+    from websearch.nodes.probe import NodeProber
+    from websearch.nodes.sources import SourceFetcher
+    pool = NodePool(tmp_path / "p.sqlite3")
+    return NodeHunter(pool=pool, fetcher=SourceFetcher(timeout=1),
+                      prober=NodeProber(singbox_bin="", work_dir=tmp_path)), pool
+
+
+def test_keepalive_probe_scales_with_deficit(tmp_path):
+    """缺口大 → 探测量放大（存活率决定要探多少才够）。"""
+    h, pool = _hunter(tmp_path)
+    h.state.target_alive = 100
+    # 模拟存活率 5%（免费节点实测极低）
+    h._alive_rate_ema = 0.05
+    plan = h.plan_next_round()
+    assert plan["mode"] == "keepalive"
+    assert plan["deficit"] == 100
+    # 要养 100 个活的、存活率 5%，至少得探 100/0.05 = 2000，
+    # 乘overshoot 后远超库存 → 撞硬上限 400
+    assert plan["probe_limit"] == 400
+
+
+def test_keepalive_interval_fast_when_short_fast_when_full(tmp_path):
+    """缺口大 → 间隔短；达标 → 间隔长。"""
+    from websearch.nodes import hunter as H
+
+    h, pool = _hunter(tmp_path)
+    h.state.target_alive = 100
+
+    # 一个活节点都没有 → 最快间隔
+    plan = h.plan_next_round()
+    assert plan["deficit"] == 100
+    assert plan["delay_sec"] == H.INTERVAL_MIN
+
+    # 全部达标 → 最慢间隔
+    pool.upsert_nodes([(f"a{i}.example.com", "ss",
+                        {"server": f"a{i}.example.com", "server_port": 443,
+                         "method": "aes-256-gcm", "password": "p"})
+                       for i in range(100)], "s", pool="free")
+    for c in pool.candidates_for_probe(limit=200):
+        pool.record_probe(c["fp"], True, 300)
+    plan = h.plan_next_round()
+    assert plan["deficit"] == 0
+    assert plan["delay_sec"] == H.INTERVAL_MAX
+
+
+def test_keepalive_not_stalled_when_inventory_empty(tmp_path):
+    """⚠️ 库存挖空时探测量不能被压成0（否则永远补不上）。"""
+    from websearch.nodes import hunter as H
+
+    h, pool = _hunter(tmp_path)
+    h.state.target_alive = 100
+    h._alive_rate_ema = 0.3
+    # 库里一个节点都没有 → untested=0
+    assert pool.stats().untested == 0
+    plan = h.plan_next_round()
+    # 关键：不能是 0/1，probe_batch 探不到候选会自己少探，但计划值必须有量
+    assert plan["probe_limit"] >= H.PROBE_MIN
+    assert plan["probe_limit"] > 1
+
+
+def test_probe_prefers_untested_over_known_dead(tmp_path):
+    """⚠️ 探测预算不能浪费在重测已知死节点上。
+
+    库里 5 个刚测过的死节点 + 3 个从未测过的新节点 → 取 3 个候选
+    必须全是新节点。早期实现按 last_probe_at ASC 排会把死节点排在
+    最前，保活就永远测不到新货。
+    """
+    pool = NodePool(tmp_path / "p.sqlite3")
+    pool.upsert_nodes([_node("dead.example.com")], "s", pool="free")
+    dead_fp = pool.candidates_for_probe(pool="free")[0]["fp"]
+    pool.record_probe(dead_fp, False)          # 刚测过，死
+    pool.upsert_nodes([_node(f"new{i}.example.com") for i in range(3)],
+                      "s", pool="free")
+    cands = pool.candidates_for_probe(limit=3, pool="free")
+    assert all("new" in c["server"] for c in cands), \
+        f"候选里混进了已知死节点: {[c['server'] for c in cands]}"
+
+
+def test_keepalive_prune_is_aggressive_but_not_cust(tmp_path):
+    """保活模式：死节点快速淘汰，但客户池仍不动。"""
+    pool = NodePool(tmp_path / "p.sqlite3")
+    pool.upsert_nodes([_node("cust.example.com")], "s1", pool="cust")
+    pool.upsert_nodes([_node("free.example.com")], "s2", pool="free")
+    # 两个都标记为「很久没出现且从没活过」
+    n = pool.prune(max_age_sec=0)
+    assert n == 1
+    assert [r["server"] for r in pool.list_public(only_alive=False)] \
+        == ["cust.example.com"]
+
+
+def test_alive_rate_ema_needs_samples(tmp_path):
+    """没有样本时不能瞎猜存活率（否则探测量会被算成极小值）。"""
+    h, pool = _hunter(tmp_path)
+    h.state.target_alive = 100
+    h._alive_rate_ema = 0.0
+    plan = h.plan_next_round()
+    assert plan["alive_rate"] == 0.0
+    # 无样本 → 用 PROBE_MIN 兜底，不是 0
+    assert plan["probe_limit"] >= 240
+    # 有样本后才更新
+    h._update_alive_rate(100, 5)
+    assert 0.04 < h._alive_rate_ema < 0.06

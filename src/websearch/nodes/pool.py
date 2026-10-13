@@ -194,6 +194,9 @@ class NodePool:
     PRUNE_AFTER_SEC = 7 * 24 * 3600
     # 连续失败多少次判定「节点死了」（智能降级的触发线）
     DEAD_STREAK = 3
+    # 探测结果的有效期：超过这个时间没重新测过，节点状态算「陈旧」，
+    # 需要重新测（免费节点状态漂移快，2 小时足够暴露大部分失效）。
+    PROBE_REFRESH_SEC = 2 * 3600
 
     def __init__(self, db_path: Path | str):
         self.path = Path(db_path)
@@ -408,14 +411,15 @@ class NodePool:
                              pool: str = "") -> list[dict[str, Any]]:
         """挑一批候选节点去探测。
 
-        优先级：从未测过的 > 很久没测的 > 曾经活的。
-        为什么优先未测的：免费源一次能收到几百个节点，全测一轮太久；
-        先把「未知」变「已知」比重复测已知的更划算。
+        优先级（**分层，不是简单按 last_probe_at 排序**）：
+          1. alive 的（保持健康分新鲜，早停降级准）
+          2. 从未测过的 last_probe_at=0（把「未知」变「已知」）
+          3. 很久没测的（超过 PROBE_REFRESH_SEC，节点状态会漂移）
 
-        `pool` 传 'cust'/'free' 只探测某个池；留空 = 全部。
-        调用方（hunter）应当**分池各取一批**：客户节点只有几十个，
-        却会被免费源的数百个候选挤出探测预算 —— 那等于让付费节点
-        永远处于「未知」状态，选路时也就无从比较。
+        为什么不能只按 last_probe_at ASC 排：那样每次都把
+        「最近测过且死了」的节点排在最前 —— 库里死节点上千时
+        （实测免费池 807 个存活 0），探测预算全花在重测已知死节点上，
+        新入库的节点永远测不到。保活必须是「先测新的，再刷老的」。
         """
         conn = self._ensure()
         where = ""
@@ -423,11 +427,20 @@ class NodePool:
         if pool in ("cust", "free"):
             where = "WHERE pool=?"
             params.append(pool)
-        order = ("last_probe_at ASC, " if prefer_untested else "")
+        # 活着 > 未测 > 很久没测（>2h 视为需要刷新）> 其他
+        stale_cut = time.time() - self.PROBE_REFRESH_SEC
+        order = (
+            "CASE WHEN alive=1 THEN 0"
+            "     WHEN last_probe_at=0 THEN 1"
+            f"     WHEN last_probe_at < {stale_cut} THEN 2"
+            "     ELSE 3 END ASC,"
+        )
+        if not prefer_untested:
+            order = ""
         rows = conn.execute(
             f"SELECT fp, protocol, server, port, country, tag, outbound,"
             f" alive, avg_ms, last_probe_at, pool FROM nodes"
-            f" {where} ORDER BY {order}alive DESC, last_probe_at ASC LIMIT ?",
+            f" {where} ORDER BY {order}avg_ms ASC LIMIT ?",
             (*params, limit),
         ).fetchall()
         return [
