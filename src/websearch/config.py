@@ -196,6 +196,11 @@ class Config:
     singbox_bin: str = "/opt/sing-box/sing-box"  # 出网验证用（没有则退化 TCP）
     node_probe_concurrency: int = 24
     node_probe_timeout_ms: int = 8000
+    # 单源单轮入库上限：普通代理列表源（HProxy/Proxifly/…）动辄几千
+    # 上万条，不设上限会把库和探测预算一起撑爆（实测 GFP 系列表单文件
+    # 万行级）。超出的部分当轮丢弃（源本身还会下轮再来，不失新鲜度）。
+    # ⚠️ cust 客户导入**不受此限**（用户自己的订阅，条条都是刚需）。
+    node_ingest_cap: int = 6000
 
     # ── 客户订阅（cust 池唯一入口）──
     # ⚠️ 含 token = 凭据：只走环境变量（WS_CUSTOMER_SUBS，逗号分隔）或
@@ -309,6 +314,8 @@ class Config:
                                             c.node_probe_concurrency)
         c.node_probe_timeout_ms = _env_int("WS_NODE_PROBE_TIMEOUT_MS",
                                            c.node_probe_timeout_ms)
+        c.node_ingest_cap = _env_int("WS_NODE_INGEST_CAP",
+                                     c.node_ingest_cap)
 
         # 客户订阅：env 列表 + 可选文件（合并去重，文件读取失败只记类型名）
         subs = _env_list("WS_CUSTOMER_SUBS", [])

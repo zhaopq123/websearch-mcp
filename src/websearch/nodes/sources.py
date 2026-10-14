@@ -75,6 +75,60 @@ SEED_SOURCES: list[dict[str, str]] = [
     # 日更 clash 订阅，仓库自称发布前做过可用性检测（质量信号）
     {"url": "https://raw.githubusercontent.com/share-daily/node/main/clash.yaml",
      "kind": "sub", "note": "share-daily 日更 clash（发布前检测）"},
+    # ── 2026-10-14 优化文档复盘后新增（vivo 实测产出，勿凭印象删）──
+    # morpheusadam/v2ray-config：每日重建、发布前自测。取协议分文件
+    # （单个小、失败影响面小）而非 all.txt（20.6s 且与协议文件重复）。
+    # 实测新增：vless 15997 / trojan 8373 / vmess 7300 / ss 6742 /
+    # hysteria2 1549（修 IPv6 畸形行后）/ tuic 225 / lite 281 / best 1746。
+    # ⚠️ hysteria2.txt 曾因 `[IPv6]:34602/` 畸形行整份解析失败——
+    # _split_hostport 已修（2026-10-14），别回退。
+    {"url": "https://raw.githubusercontent.com/morpheusadam/v2ray-config/main/subs/bundles/best.txt",
+     "kind": "sub", "note": "morpheusadam 精选 bundle"},
+    {"url": "https://raw.githubusercontent.com/morpheusadam/v2ray-config/main/subs/bundles/lite.txt",
+     "kind": "sub", "note": "morpheusadam 小型列表（慢线路）"},
+    {"url": "https://raw.githubusercontent.com/morpheusadam/v2ray-config/main/subs/bundles/vless.txt",
+     "kind": "sub", "note": "morpheusadam VLESS 专集"},
+    {"url": "https://raw.githubusercontent.com/morpheusadam/v2ray-config/main/subs/bundles/trojan.txt",
+     "kind": "sub", "note": "morpheusadam Trojan 专集"},
+    {"url": "https://raw.githubusercontent.com/morpheusadam/v2ray-config/main/subs/bundles/vmess.txt",
+     "kind": "sub", "note": "morpheusadam VMess 专集"},
+    {"url": "https://raw.githubusercontent.com/morpheusadam/v2ray-config/main/subs/bundles/shadowsocks.txt",
+     "kind": "sub", "note": "morpheusadam Shadowsocks 专集"},
+    {"url": "https://raw.githubusercontent.com/morpheusadam/v2ray-config/main/subs/bundles/hysteria2.txt",
+     "kind": "sub", "note": "morpheusadam Hysteria2 专集"},
+    {"url": "https://raw.githubusercontent.com/morpheusadam/v2ray-config/main/subs/bundles/tuic.txt",
+     "kind": "sub", "note": "morpheusadam TUIC 专集"},
+    # FastNodes：多源聚合+去重+多层检查。top/verified_tls 实测新增
+    # 763/10263；协议分文件各 818-933。everything/stable 与协议文件
+    # 重复且 20s+，不抓。countries 补齐地区出口（JP/US/SG/KR/HK/DE）。
+    {"url": "https://raw.githubusercontent.com/rtwo2/FastNodes/main/sub/top.txt",
+     "kind": "sub", "note": "FastNodes Top（欧洲向为主）"},
+    {"url": "https://raw.githubusercontent.com/rtwo2/FastNodes/main/sub/verified.txt",
+     "kind": "sub", "note": "FastNodes Xray 验证列表"},
+    {"url": "https://raw.githubusercontent.com/rtwo2/FastNodes/main/sub/verified_tls.txt",
+     "kind": "sub", "note": "FastNodes TLS 验证列表"},
+    {"url": "https://raw.githubusercontent.com/rtwo2/FastNodes/main/sub/protocols/vless.txt",
+     "kind": "sub", "note": "FastNodes VLESS 专集"},
+    {"url": "https://raw.githubusercontent.com/rtwo2/FastNodes/main/sub/protocols/vmess.txt",
+     "kind": "sub", "note": "FastNodes VMess 专集"},
+    {"url": "https://raw.githubusercontent.com/rtwo2/FastNodes/main/sub/protocols/trojan.txt",
+     "kind": "sub", "note": "FastNodes Trojan 专集"},
+    {"url": "https://raw.githubusercontent.com/rtwo2/FastNodes/main/sub/protocols/ss.txt",
+     "kind": "sub", "note": "FastNodes Shadowsocks 专集"},
+    {"url": "https://raw.githubusercontent.com/rtwo2/FastNodes/main/sub/protocols/hysteria2.txt",
+     "kind": "sub", "note": "FastNodes Hysteria2 专集"},
+    {"url": "https://raw.githubusercontent.com/rtwo2/FastNodes/main/sub/countries/JP.txt",
+     "kind": "sub", "note": "FastNodes 日本"},
+    {"url": "https://raw.githubusercontent.com/rtwo2/FastNodes/main/sub/countries/US.txt",
+     "kind": "sub", "note": "FastNodes 美国"},
+    {"url": "https://raw.githubusercontent.com/rtwo2/FastNodes/main/sub/countries/SG.txt",
+     "kind": "sub", "note": "FastNodes 新加坡"},
+    {"url": "https://raw.githubusercontent.com/rtwo2/FastNodes/main/sub/countries/KR.txt",
+     "kind": "sub", "note": "FastNodes 韩国"},
+    {"url": "https://raw.githubusercontent.com/rtwo2/FastNodes/main/sub/countries/HK.txt",
+     "kind": "sub", "note": "FastNodes 中国香港"},
+    {"url": "https://raw.githubusercontent.com/rtwo2/FastNodes/main/sub/countries/DE.txt",
+     "kind": "sub", "note": "FastNodes 德国"},
 ]
 
 # 自举搜索词：发现新聚合站。多词覆盖不同表述（免费节点/白嫖/每日更新）

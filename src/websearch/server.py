@@ -237,6 +237,7 @@ class Service:
                 discover=cfg.node_hunt_discover,
                 switch_cb=self._switch_to_node,
                 customer_subs=cfg.customer_subs,
+                ingest_cap=cfg.node_ingest_cap,
             )
         except Exception as e:
             log.warning("节点猎手初始化失败（不影响搜索）: %s", e)

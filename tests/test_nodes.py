@@ -1275,3 +1275,59 @@ def test_read_pool_overview_never_writes(tmp_path):
     # 也没有额外落一个 WAL（只读连接不会触发 WAL 恢复/写入）
     assert not (tmp_path / "nodes.sqlite3-wal").exists() or \
         (tmp_path / "nodes.sqlite3-wal").stat().st_size == 0
+
+
+# ══════════════ 2026-10-14 普通代理入池 ══════════════
+
+
+def test_ingest_cap_truncates_proxy_list_flood(tmp_path):
+    """单源入库上限：代理列表洪水（万行）只进 cap 条，库不爆。
+
+    公开代理列表（HProxy/Proxifly/…）动辄几千上万行，不设上限会把
+    库和探测预算一起撑爆。截断是「当轮丢弃」语义——源下轮还会来。
+    """
+    from websearch.nodes.hunter import NodeHunter
+    from websearch.nodes.probe import NodeProber
+
+    text = "\n".join(
+        f"10.{(i >> 16) & 255}.{(i >> 8) & 255}.{i & 255}:1080"
+        for i in range(2000))
+    pool = NodePool(tmp_path / "p.sqlite3")
+    h = NodeHunter(pool=pool, fetcher=None,
+                   prober=NodeProber(singbox_bin="", work_dir=tmp_path),
+                   ingest_cap=500)
+    n, _added = h._ingest_text(text, "s1", url="https://x.example/socks5.txt")
+    assert n == 2000                       # 解析数照实报（不隐瞒规模）
+    assert pool.stats().total == 500       # 入库被 cap 截断
+
+
+def test_ingest_cap_zero_means_unlimited(tmp_path):
+    """cap=0 = 不限制（VPN 订阅源不受代理列表上限影响）。"""
+    from websearch.nodes.hunter import NodeHunter
+    from websearch.nodes.probe import NodeProber
+
+    text = "\n".join(f"trojan://pw@n{i}.example.com:443#n{i}"
+                     for i in range(50))
+    pool = NodePool(tmp_path / "p.sqlite3")
+    h = NodeHunter(pool=pool, fetcher=None,
+                   prober=NodeProber(singbox_bin="", work_dir=tmp_path),
+                   ingest_cap=0)
+    _n, added = h._ingest_text(text, "s1", url="https://x.example/list.txt")
+    assert added == 50
+    assert pool.stats().total == 50
+
+
+def test_proxy_list_nodes_enter_free_pool_as_socks(tmp_path):
+    """普通代理列表 → free 池，protocol=socks（与 VPN 节点同一管线）。"""
+    from websearch.nodes.hunter import NodeHunter
+    from websearch.nodes.probe import NodeProber
+
+    text = "\n".join(f"198.51.100.{i}:1080" for i in range(1, 8))
+    pool = NodePool(tmp_path / "p.sqlite3")
+    h = NodeHunter(pool=pool, fetcher=None,
+                   prober=NodeProber(singbox_bin="", work_dir=tmp_path))
+    n, added = h._ingest_text(text, "s1", url="https://x.example/socks5.txt")
+    assert n == 7 and added == 7
+    rows = pool.list_public(only_alive=False)
+    assert all(r["protocol"] == "socks" for r in rows)
+    assert all(r["pool"] == "free" for r in rows)

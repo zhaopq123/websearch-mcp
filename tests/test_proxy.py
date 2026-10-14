@@ -23,8 +23,11 @@ import pytest
 from websearch.proxy.subparse import (
     NodeParseError,
     SubscriptionError,
+    _sniff_proxy_proto,
     build_singbox_config,
+    looks_like_proxy_list,
     parse_node,
+    parse_proxy_list,
     parse_subscription_text,
 )
 
@@ -302,3 +305,130 @@ def test_manager_config_file_mode_is_600():
         assert mode == 0o600, f"配置文件权限 {oct(mode)}，应为 600"
     finally:
         asyncio.run(pm.stop())
+
+
+# ══════════════ 2026-10-14 优化文档复盘新增 ══════════════
+
+
+def test_hysteria2_ipv6_trailing_slash_not_fatal():
+    """[IPv6]:port/ 畸形行只跳自己，不炸整份订阅。
+
+    实测 morpheusadam/hysteria2.txt（1690 节点）里混了
+    hysteria2://pw@[2001:xx::1]:34602/?sni=... 行，旧 _split_hostport
+    对 "34602/" 抛裸 ValueError 炸穿 parse_subscription_text ——
+    整份订阅解析失败，1690 个节点全丢。
+    """
+    text = (
+        "hysteria2://testpass@example.com:443?sni=example.com#good1\n"
+        "hysteria2://testpass@[2001:db8::1]:34602/?sni=example.com#ipv6\n"
+        "hysteria2://testpass@example.net:443?sni=example.net#good2\n"
+    )
+    # 修复后 IPv6 行也能正确解析（rstrip("/") + IPv6 分支 try）——
+    # 三个节点都进来，一个不丢
+    rep = parse_subscription_text(text)
+    assert len(rep.nodes) == 3
+    assert not rep.skipped
+    v6 = [n for n in rep.nodes if n.outbound["server"] == "2001:db8::1"]
+    assert v6 and v6[0].outbound["server_port"] == 34602
+
+
+def test_unexpected_parse_error_skips_one_line_only():
+    """未预期异常只跳过单行 —— 兜底防「一个坏行丢整份订阅」。"""
+    from unittest import mock
+
+    text = ("trojan://p@example.com:443?sni=example.com#a\n"
+            "trojan://p@example.net:443?sni=example.net#b\n")
+    with mock.patch(
+        "websearch.proxy.subparse.parse_node",
+        side_effect=[ValueError("boom"),  # 第一个炸
+                     __import__("websearch.proxy.subparse", fromlist=["Node"]).Node(
+                         tag="b", protocol="trojan", outbound={})],
+    ):
+        rep = parse_subscription_text(text)
+    assert len(rep.nodes) == 1
+    assert rep.skipped[0]["reason"].startswith("未预期错误")
+
+
+# ── 普通代理列表（IP:PORT 行）──
+
+
+def test_parse_proxy_list_plain():
+    text = ("# 注释\n"
+            "198.199.86.11:1080\n"
+            "209.97.150.167:1080\n"
+            "192.252.209.155:14455\n")
+    rep = parse_proxy_list(text, "socks5")
+    assert len(rep.nodes) == 3
+    n = rep.nodes[0]
+    assert n.protocol == "socks"
+    assert n.outbound["version"] == "5"
+    assert n.outbound["server"] == "198.199.86.11"
+    assert n.outbound["server_port"] == 1080
+
+
+def test_parse_proxy_list_country_suffix_and_scheme_prefix():
+    """@CC / |CC / socks5:// 前缀都只抠 IP:PORT。"""
+    text = ("1.2.3.4:1080@US\n"
+            "US|5.6.7.8:1080\n"
+            "socks5://9.10.11.12:1080\n")
+    rep = parse_proxy_list(text)
+    assert [n.outbound["server"] for n in rep.nodes] == [
+        "1.2.3.4", "5.6.7.8", "9.10.11.12"]
+
+
+def test_parse_proxy_list_rejects_invalid():
+    text = ("999.999.999.999:1080\n"     # 段超 255
+            "1.2.3.4:99999\n"            # 端口超范围
+            "1.2.3.4:abc\n"              # 端口非数字
+            "1.2.3.4:1080\n")            # 唯一合法的
+    rep = parse_proxy_list(text)
+    assert len(rep.nodes) == 1
+    assert len(rep.skipped) == 3
+
+
+def test_parse_proxy_list_socks4_and_http():
+    r4 = parse_proxy_list("1.2.3.4:1080\n", "socks4")
+    assert r4.nodes[0].outbound["version"] == "4"
+    rh = parse_proxy_list("1.2.3.4:8080\n", "http")
+    assert rh.nodes[0].protocol == "http"
+    assert "version" not in rh.nodes[0].outbound
+
+
+def test_socks5_and_http_uri_forms():
+    n = parse_node("socks5://user:pass@198.51.100.7:1080#p5", 0)
+    assert n.protocol == "socks"
+    assert n.outbound["version"] == "5"
+    assert n.outbound["username"] == "user"
+    assert n.outbound["password"] == "pass"
+    n2 = parse_node("http://198.51.100.8:8080#phttp", 0)
+    assert n2.protocol == "http"
+    assert n2.outbound["server_port"] == 8080
+
+
+def test_looks_like_proxy_list():
+    assert looks_like_proxy_list("1.2.3.4:1080\n5.6.7.8:1080\n9.10.11.12:1080\n"
+                                 "13.14.15.16:1080\n17.18.19.20:1080\n")
+    assert not looks_like_proxy_list("vmess://abc\nvmess://def\nvmess://ghi\n"
+                                     "vmess://jkl\nvmess://mno\n")
+
+
+def test_sniff_proxy_proto():
+    assert _sniff_proxy_proto("https://x/main/socks5.txt") == "socks5"
+    assert _sniff_proxy_proto("https://x/main/socks4.txt") == "socks4"
+    assert _sniff_proxy_proto("https://x/main/http.txt") == "http"
+    assert _sniff_proxy_proto("https://x/main/all.txt") == "socks5"  # 默认
+
+
+def test_subscription_text_falls_back_to_proxy_list():
+    """URI 体系零节点 + 像代理列表 + default_proto → 走代理解析。"""
+    text = ("198.199.86.11:1080\n209.97.150.167:1080\n192.252.209.155:14455\n"
+            "67.207.92.87:1088\n138.68.60.8:1080\n142.54.236.97:4145\n")
+    rep = parse_subscription_text(text, default_proto="socks5")
+    assert len(rep.nodes) == 6
+    assert all(n.protocol == "socks" for n in rep.nodes)
+
+
+def test_subscription_text_without_proto_still_raises():
+    """没给 default_proto 时不猜 —— 保持「不像订阅就报错」的旧口径。"""
+    with pytest.raises(SubscriptionError):
+        parse_subscription_text("198.199.86.11:1080\n209.97.150.167:1080\n")

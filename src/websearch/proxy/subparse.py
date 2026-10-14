@@ -15,9 +15,13 @@
   vless://      vless（含 reality）
   hysteria2://  hysteria2（含 hy2:// 简写）
   tuic://       tuic v5
+  socks5:// / socks4:// / http://   普通代理（IP:PORT 或裸列表行）
 
-不支持的协议会**明确列出并跳过**，不静默丢弃 —— 用户要能看到
-「你 20 个节点里有 3 个是 ssr，没接进来」，而不是莫名其妙少几个。
+普通代理与 VPN 隧道节点是两种东西（无 UUID/密码，形态就是 IP:PORT），
+但 sing-box 原生支持 socks/http outbound，所以它们与 VPN 节点走同一条
+探测/选路/local_proxy 管线，只是 outbound type 不同。公开代理列表源
+（HProxy/Proxifly/monosans/…）是低延迟候选的重要补充 —— 公网代理多在
+欧美 VPS 上，实测 RTT 150-300ms，比免费 VPN 节点的 4.7s 快一个数量级。
 """
 
 from __future__ import annotations
@@ -99,14 +103,27 @@ def _b64decode_text(s: str) -> str:
 
 
 def _split_hostport(s: str, default_port: int = 443) -> tuple[str, int]:
-    """解析 host:port，兼容 IPv6 的 [::1]:443 形式。"""
-    s = s.strip()
+    """解析 host:port，兼容 IPv6 的 [::1]:443 形式。
+
+    2026-10-14 修（实测 morpheusadam/hysteria2.txt 触发）：真实订阅里
+    有 `hysteria2://pw@[2001:xx::1]:34602/?sni=...` 这种带尾斜杠的
+    IPv6 行，旧代码 `int(rest.lstrip(":"))` 对 "34602/" 抛裸
+    ValueError —— 它不在 NodeParseError 体系里，会炸穿
+    parse_subscription_text 主循环，**一整份 1690 节点的订阅因为
+    一个畸形行全丢**。现在：入口先剥尾斜杠，IPv6 分支 int() 包 try。
+    """
+    s = s.strip().rstrip("/")
     if not s:
         raise NodeParseError("缺少服务器地址")
     if s.startswith("["):
         host, _, rest = s[1:].partition("]")
-        port = int(rest.lstrip(":") or default_port)
-        return host, port
+        port_s = rest.lstrip(":")
+        if not port_s:
+            return host, default_port
+        try:
+            return host, int(port_s)
+        except ValueError as e:
+            raise NodeParseError("端口不是数字") from e
     if ":" in s:
         host, _, port_s = s.rpartition(":")
         try:
@@ -395,6 +412,54 @@ def _parse_tuic(uri: str, idx: int) -> dict[str, Any]:
     return ob
 
 
+def _parse_socks(uri: str, idx: int) -> dict[str, Any]:
+    """socks5://host:port / socks4://host:port（可能带 user:pass@）。"""
+    scheme, _, rest = uri.partition("://")
+    rest = rest.split("#", 1)[0]
+    version = "4" if scheme.lower() == "socks4" else "5"
+    user = pw = ""
+    if "@" in rest:
+        userinfo, _, rest = rest.rpartition("@")
+        if ":" in userinfo:
+            user, _, pw = userinfo.partition(":")
+        else:
+            user = unquote(userinfo)
+    host, port = _split_hostport(rest)
+    ob: dict[str, Any] = {
+        "type": "socks",
+        "server": host,
+        "server_port": port,
+        "version": version,
+    }
+    if version == "5" and user:
+        ob["username"] = unquote(user)
+        ob["password"] = unquote(pw)
+    return ob
+
+
+def _parse_http_proxy(uri: str, idx: int) -> dict[str, Any]:
+    """http://host:port / https://host:port（可能带 user:pass@）。"""
+    scheme, _, rest = uri.partition("://")
+    rest = rest.split("#", 1)[0]
+    user = pw = ""
+    if "@" in rest:
+        userinfo, _, rest = rest.rpartition("@")
+        if ":" in userinfo:
+            user, _, pw = userinfo.partition(":")
+        else:
+            user = unquote(userinfo)
+    host, port = _split_hostport(rest, default_port=8080)
+    ob: dict[str, Any] = {
+        "type": "http",
+        "server": host,
+        "server_port": port,
+    }
+    if user:
+        ob["username"] = unquote(user)
+        ob["password"] = unquote(pw)
+    return ob
+
+
 _PARSERS = {
     "ss": _parse_ss,
     "vmess": _parse_vmess,
@@ -403,6 +468,11 @@ _PARSERS = {
     "hysteria2": _parse_hysteria2,
     "hy2": _parse_hysteria2,
     "tuic": _parse_tuic,
+    "socks5": lambda u, i: _parse_socks(u, i),
+    "socks4": lambda u, i: _parse_socks(u, i),
+    "socks": lambda u, i: _parse_socks(u, i),
+    "http": _parse_http_proxy,
+    "https": _parse_http_proxy,
 }
 
 # 明确识别但不支持 —— 报给用户，不静默丢
@@ -410,8 +480,6 @@ _UNSUPPORTED = {
     "ssr": "shadowsocksr（sing-box 已不再支持，建议换 ss/ss2022 节点）",
     "hysteria": "hysteria v1（建议用 hysteria2）",
     "snell": "snell（sing-box 不支持）",
-    "http": "http 代理节点",
-    "socks": "socks 代理节点",
 }
 
 _SCHEME_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.-]*)://")
@@ -674,13 +742,150 @@ def looks_like_clash_yaml(text: str) -> bool:
 # ══════════════════════ 订阅正文解析 ══════════════════════
 
 
-def parse_subscription_text(text: str) -> ParseReport:
+# ══════════════════════ 普通代理列表解析 ══════════════════════
+#
+# HProxy/Proxifly/monosans/litport/Thordata/proxio/databay 等公开代理
+# 列表的形态：一行一个 IP:PORT（无任何 scheme）。各站噪声格式不一：
+#   1.2.3.4:1080            纯（多数站）
+#   1.2.3.4:1080@US         带国家码（hproxy all.json 导出）
+#   US|1.2.3.4:1080         国家码前缀
+#   socks5://1.2.3.4:1080   个别站带 scheme
+# 统一只抠 IP:PORT，行内其他内容忽略；协议由调用方按源声明/URL 嗅探。
+
+_IPPORT_LINE_RE = re.compile(
+    r"^(?:[a-z0-9]+://)?"            # 可选 scheme 前缀（socks5://）
+    r"(?:[a-z]{2}[|@])?"             # 可选国家码前缀（US| / US@）
+    r"(?P<ip>\d{1,3}(?:\.\d{1,3}){3})"  # IPv4
+    r":(?P<port>\d{1,5})"            # 端口
+    r"(?:[@|,].*)?$",                # 可带 @CC / |CC 后缀
+    re.I,
+)
+_IPV4_OCTET_RE = re.compile(r"^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$")
+
+_PROXY_DEFAULT_PORTS = {"socks5": 1080, "socks4": 1080, "http": 8080}
+
+
+def _valid_ipv4(ip: str) -> bool:
+    """四段都在 0-255（防止把 999.999.999.999 当节点，白耗探测预算）。"""
+    m = _IPV4_OCTET_RE.match(ip)
+    if not m:
+        return False
+    return all(0 <= int(g) <= 255 for g in m.groups())
+
+
+def parse_proxy_list(text: str,
+                     default_proto: str = "socks5") -> ParseReport:
+    """解析普通代理列表（一行一个 IP:PORT）。
+
+    default_proto：列表的协议（socks5 / socks4 / http）—— 调用方按
+    源 URL 或页面声明给出（socks5.txt → socks5）。缺省 socks5 是这类
+    列表的最大公约数。
+
+    产出 Node.protocol = sing-box outbound type（socks/http），
+    与 VPN 节点同一套探测/选路管线。
+    """
+    proto = (default_proto or "socks5").lower()
+    if proto in ("socks4", "socks"):
+        stype, version = "socks", "4"
+    elif proto == "socks5":
+        stype, version = "socks", "5"
+    elif proto in ("http", "https"):
+        stype, version = "http", ""
+    else:
+        raise SubscriptionError(f"不支持的代理列表协议 {default_proto}")
+
+    report = ParseReport()
+    idx = 0
+    for ln in (text or "").splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        m = _IPPORT_LINE_RE.match(ln)
+        if not m:
+            # 不像 IP:PORT 的行：能解析出 scheme:// 的交给 URI 体系，
+            # 否则记 skip（保持「不静默丢」的约定）
+            if "://" in ln:
+                try:
+                    report.nodes.append(parse_node(ln, idx))
+                    idx += 1
+                    continue
+                except NodeParseError:
+                    pass
+            report.skipped.append({"index": idx, "scheme": "?",
+                                   "reason": "不是 IP:PORT 行"})
+            idx += 1
+            continue
+        ip, port_s = m.group("ip"), m.group("port")
+        if not _valid_ipv4(ip):
+            report.skipped.append({"index": idx, "scheme": proto,
+                                   "reason": "IPv4 地址无效"})
+            idx += 1
+            continue
+        try:
+            port = int(port_s)
+        except ValueError:
+            report.skipped.append({"index": idx, "scheme": proto,
+                                   "reason": "端口不是数字"})
+            idx += 1
+            continue
+        if not (0 < port < 65536):
+            report.skipped.append({"index": idx, "scheme": proto,
+                                   "reason": "端口超出范围"})
+            idx += 1
+            continue
+        ob: dict[str, Any] = {"type": stype, "server": ip,
+                              "server_port": port}
+        if stype == "socks":
+            ob["version"] = version
+        report.nodes.append(Node(tag=f"{proto}-{idx}", protocol=stype,
+                                 outbound=ob))
+        idx += 1
+    if not report.nodes and not report.skipped:
+        raise SubscriptionError("代理列表为空")
+    return report
+
+
+def looks_like_proxy_list(text: str) -> bool:
+    """粗判文本是否为普通代理列表（IP:PORT 行占非空行一半以上）。"""
+    lines = [l.strip() for l in (text or "").splitlines()
+             if l.strip() and not l.strip().startswith("#")]
+    if len(lines) < 5:
+        return False
+    hit = sum(1 for l in lines if _IPPORT_LINE_RE.match(l))
+    return hit * 2 >= len(lines)
+
+
+def _sniff_proxy_proto(url: str) -> str:
+    """按 URL 路径/查询嗅探列表协议。认不出来的默认 socks5。
+
+    ⚠️ 只看 path/query，**不看 URL 自身的 scheme** ——
+    https://…/all.txt 是 https 页面，列表内容多半是 socks。2026-10-14
+    第一版把 scheme 也算进去，结果所有 https 源都被判成 http 代理。
+    """
+    try:
+        parts = urlsplit(url or "")
+        hay = (parts.path + " " + parts.query).lower()
+    except ValueError:
+        hay = (url or "").lower()
+    if "socks4" in hay:
+        return "socks4"
+    if "socks5" in hay or "socks" in hay:
+        return "socks5"
+    if "http" in hay:
+        return "http"
+    return "socks5"
+
+
+def parse_subscription_text(text: str,
+                            default_proto: str = "") -> ParseReport:
     """解析订阅正文。
 
-    三种常见形态：
+    四种常见形态：
       · base64 编码的整块（机场标准）—— 里面每行一个节点
       · 明文每行一个节点（部分自建/分享用）
       · Clash/Mihomo yaml（免费聚合源常见，取 proxies 段）
+      · 普通代理列表（一行一个 IP:PORT，无 scheme）—— default_proto
+        非空且 URI 解析零节点时走 parse_proxy_list
 
     自动判别：整块能 base64 解出含 "://" 的文本就当编码块；
     含 proxies: 的 yaml 走 clash 解析。
@@ -717,13 +922,33 @@ def parse_subscription_text(text: str) -> ParseReport:
                            if _SCHEME_RE.match(ln) else "?"),
                 "reason": str(e),   # 已确保不含敏感值
             })
-    if not report.nodes and not report.skipped:
+        except Exception as e:  # noqa: BLE001
+            # 兜底：未预期异常（解析器 bug、畸形行）只跳过这一行，
+            # 绝不炸掉整份订阅。2026-10-14 实测：一个带尾斜杠的 IPv6
+            # 行曾让 1690 节点的 hysteria2.txt 整份解析失败。
+            # reason 只记异常类型名（可能含地址等敏感值，不记消息）。
+            report.skipped.append({
+                "index": i,
+                "scheme": (_SCHEME_RE.match(ln).group(1).lower()
+                           if _SCHEME_RE.match(ln) else "?"),
+                "reason": f"未预期错误 {type(e).__name__}",
+            })
+    if report.nodes:
+        return report
+    # URI 体系零节点：文本像普通代理列表（IP:PORT 行过半）且调用方
+    # 声明了协议 → 走代理解析（HProxy/Proxifly 这类源的全部价值）。
+    if default_proto and looks_like_proxy_list(raw):
+        try:
+            return parse_proxy_list(raw, default_proto)
+        except SubscriptionError:
+            pass  # 解析不出就按下面的口径报错，不掩盖
+    if not report.skipped:
         raise SubscriptionError("订阅里没有识别到任何节点")
     # 区分两种「零节点」：
     #   · 一行都不像节点链接（HTML 错误页、纯说明文字）→ 这压根不是订阅，报错
     #   · 有像节点链接的行但都解析失败/不支持（如整份都是 ssr）→ 返回报告，
     #     让用户看到具体原因，而不是一句含糊的「没有节点」
-    if not report.nodes and not any(s["scheme"] != "?" for s in report.skipped):
+    if not any(s["scheme"] != "?" for s in report.skipped):
         raise SubscriptionError(
             "订阅内容不像节点列表（可能链接失效、返回了网页或错误信息）"
         )

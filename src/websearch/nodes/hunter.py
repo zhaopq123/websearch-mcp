@@ -160,7 +160,8 @@ class NodeHunter:
     def __init__(self, *, pool: NodePool, fetcher: SourceFetcher,
                  prober: NodeProber, orch: Any = None,
                  discover: bool = True, switch_cb: Any = None,
-                 customer_subs: list[str] | None = None):
+                 customer_subs: list[str] | None = None,
+                 ingest_cap: int = 0):
         self.pool = pool
         self.fetcher = fetcher
         self.prober = prober
@@ -173,6 +174,8 @@ class NodeHunter:
         # 空 = 没配，import_customer_subs 直接跳过，零开销。
         self.customer_subs = [s.strip() for s in (customer_subs or [])
                               if s and s.strip()]
+        # 单源单轮入库上限（防代理列表洪水爆库）。0/负 = 不限制。
+        self.ingest_cap = ingest_cap
         # 最近一次客户订阅导入结果（只计数，无凭据）
         self.last_customer_import: dict[str, Any] = {}
         self.state = HunterState(
@@ -488,7 +491,7 @@ class NodeHunter:
                 # 订阅内容：解析
                 from ..proxy.subparse import SubscriptionError
                 try:
-                    n, added = self._ingest_text(r.text, sid)
+                    n, added = self._ingest_text(r.text, sid, url=url)
                 except SubscriptionError:
                     # 解析器对「空内容 / 一行节点都没有 / 订阅已失效」
                     # 一律抛 SubscriptionError（属于源没货，不是代码 bug）。
@@ -525,20 +528,35 @@ class NodeHunter:
 
         return report["parsed"]
 
-    def _ingest_text(self, text: str, sid: str) -> tuple[int, int]:
+    def _ingest_text(self, text: str, sid: str,
+                     url: str = "") -> tuple[int, int]:
         """解析订阅文本并入库。
 
         返回 (解析到的节点数, 新增入库数)。
 
         这里抓的是**系统自搜**的公开源，一律归 free 池。
         客户导入走 NodeHunter.import_customer()，那里传 pool='cust'。
+
+        url 用于嗅探普通代理列表的协议（socks5.txt → socks5）；
+        空 = 纯 VPN 订阅，不给 default_proto。
         """
         from ..proxy.subparse import parse_subscription_text
 
-        rep = parse_subscription_text(text)
+        proto = ""
+        if url:
+            from ..proxy.subparse import _sniff_proxy_proto
+            proto = _sniff_proxy_proto(url)
+        rep = parse_subscription_text(text, default_proto=proto)
         if not rep.nodes:
             return 0, 0
         items = [(n.tag, n.protocol, n.outbound) for n in rep.nodes]
+        # 单源入库上限（WS_NODE_INGEST_CAP）：代理列表源动辄万行，
+        # 不设限会把库撑爆、探测预算摊薄。截断是「当轮丢弃」语义——
+        # 源下轮还会来，新鲜节点不受影响（优先截最新解析的尾部，
+        # 因为头部通常是该源排序最前的，保留）。
+        cap = getattr(self, "ingest_cap", 0) or 0
+        if cap and len(items) > cap:
+            items = items[:cap]
         added = self.pool.upsert_nodes(items, source_sid=sid, pool="free")
         return len(rep.nodes), added
 
