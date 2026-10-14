@@ -253,6 +253,17 @@ class Maintenance:
         self.last_report = rep
         return rep
 
+    def _tick(self) -> dict[str, Any]:
+        """跑一轮并记一行日志。
+
+        为什么单独抽出来：`run_once` 只对**有动作**的项记日志，正常无事可做时
+        整轮静默 —— 生产上就没法确认这个 janitor 还活着。每轮固定记一行
+        （30 分钟一条，可忽略），运维才好判活；同时便于测试直接调用。
+        """
+        rep = self.run_once()
+        log.info("维护完成：%s", {k: v for k, v in rep.items() if k != "at"})
+        return rep
+
     def start(self) -> None:
         """启动低频维护循环（幂等）。启动后先跑一轮，别等整个周期。"""
         if self._task is not None and not self._task.done():
@@ -266,7 +277,7 @@ class Maintenance:
                 try:
                     await asyncio.sleep(30.0 if first else self.interval_sec)
                     first = False
-                    await loop_.run_in_executor(None, self.run_once)
+                    await loop_.run_in_executor(None, self._tick)
                 except asyncio.CancelledError:
                     return
                 except Exception:                  # 维护失败绝不影响服务

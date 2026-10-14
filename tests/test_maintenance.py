@@ -202,6 +202,32 @@ def test_run_once_shrinks_bloated_db_file(tmp_path):
     c.close()
 
 
+def test_tick_returns_report_and_logs(tmp_path, caplog):
+    """无事可做时也要留一行日志，否则生产上判不出 janitor 死活。"""
+    app = tmp_path / "app"
+    data = app / "cache"
+    data.mkdir(parents=True)
+    mnt = m.Maintenance(data_dir=data, app_dir=app, interval_sec=60)
+    with caplog.at_level("INFO", logger="websearch.maintenance"):
+        rep = mnt._tick()
+    assert "at" in rep
+    assert any("维护完成" in r.getMessage() for r in caplog.records)
+
+
+async def test_start_is_idempotent(tmp_path):
+    import asyncio
+    mnt = m.Maintenance(data_dir=tmp_path, app_dir=tmp_path, interval_sec=60)
+    mnt.start()
+    t = mnt._task
+    mnt.start()                       # 第二次不该再造一个任务
+    assert mnt._task is t
+    t.cancel()
+    try:
+        await t
+    except asyncio.CancelledError:
+        pass
+
+
 def test_maintenance_from_env_defaults(tmp_path):
     mnt = m.Maintenance.from_env(data_dir=tmp_path, app_dir=tmp_path)
     assert mnt.interval_sec >= 60.0
