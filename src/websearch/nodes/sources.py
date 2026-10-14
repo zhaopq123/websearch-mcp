@@ -66,6 +66,15 @@ SEED_SOURCES: list[dict[str, str]] = [
      "kind": "sub", "note": "Pawdroid Free-servers"},
     {"url": "https://raw.githubusercontent.com/yaney01/Yaney01/main/yaney_01",
      "kind": "sub", "note": "yaney01（ssr 为主）"},
+    # ── 2026-10-14 复盘后新增（对着实测数据加）──
+    # 日更页：页内直接嵌 ~455 个裸节点 URI（实测今日页 571KB/455 URI），
+    # 是新鲜度最高的源。URL 带 %Y%m%d，_build_sources 按当天格式化；
+    # 日期页不进历史轮换（见 _DATED_URL_RE），不会旧页重抓。
+    {"url": "https://clashgithub.com/clashnode-%Y%m%d.html",
+     "kind": "page", "dated": "1", "note": "clashgithub 日更页（页内裸 URI）"},
+    # 日更 clash 订阅，仓库自称发布前做过可用性检测（质量信号）
+    {"url": "https://raw.githubusercontent.com/share-daily/node/main/clash.yaml",
+     "kind": "sub", "note": "share-daily 日更 clash（发布前检测）"},
 ]
 
 # 自举搜索词：发现新聚合站。多词覆盖不同表述（免费节点/白嫖/每日更新）
@@ -214,6 +223,39 @@ def extract_subscription_urls(text: str, base_url: str = "") -> list[str]:
         seen.add(url)
         out.append(url)
     return out
+
+
+# 页面里直接嵌着的节点 URI（vmess/vless/...）。
+# ⚠️ 2026-10-14 新增：实测 clashgithub.com/clashnode-YYYYMMDD.html 日更页
+# 直接嵌 455 个裸 URI，而旧管线只认「订阅链接」—— 这种火源页面会被判
+# no_sub_links 拉黑，456 个新鲜节点/天全部漏掉。TG 公频直连被网络层封
+# （Errno 101），经本地代理可达，但实测三个频道只发聚合站链接不发裸 URI，
+# 暂不作为火源。
+# 字符类不含反斜杠：URI 在 HTML 属性里以引号/尖括号/空白结尾。
+_NODE_URI_RE = re.compile(
+    r"(?:vmess|vless|trojan|ss|ssr|hysteria2|hysteria|tuic)://"
+    r"[^ \t\r\n" + chr(34) + chr(39) + "<>" + "]+",
+    re.IGNORECASE,
+)
+
+
+def extract_node_uris(text: str) -> list[str]:
+    """从网页文本里直接抠出节点 URI（去重、保序）。
+
+    喂给解析器前调用：parse_subscription_text 是行首匹配且见 HTML 直接
+    拒解（subparse 第 669 行），属性里的 href="vmess://..." 必须这里先
+    抠成一行一个。HTML 实体（&amp; 等）先反转义，否则 query 参数被截断。
+    """
+    import html as _html
+
+    uniq = list(dict.fromkeys(_NODE_URI_RE.findall(_html.unescape(text or ""))))
+    return uniq
+
+
+# 日期型 URL（clashnode-20261014.html 这类追新页）：含 8 位连续数字即视为
+# 日期页。用途：历史源轮换时跳过——日期页每天一个，放进历史会被当普通源
+# 永久每轮重抓，白白耗抓取预算（它们的贡献按天计，旧页没有重抓价值）。
+_DATED_URL_RE = re.compile(r"(?:19|20)\d{6}")
 
 
 # 直连失败后值得「换本地代理再试」的网络错误（httpx 异常类型名）。

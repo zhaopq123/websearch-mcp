@@ -37,7 +37,9 @@ from .probe import NodeProber
 from .sources import (
     SEED_SOURCES,
     SourceFetcher,
+    _DATED_URL_RE,
     discover_via_search,
+    extract_node_uris,
     extract_subscription_urls,
     source_id,
 )
@@ -393,10 +395,23 @@ class NodeHunter:
             out.append({"url": url, "kind": kind, "note": note})
 
         for s in SEED_SOURCES:
-            add(s["url"], s.get("kind", "sub"), s.get("note", ""))
+            url = s["url"]
+            # 日期型种子（clashnode-%Y%m%d.html）：按当天格式化成当日页，
+            # 每天自动追新。格式化失败（URL 里没有 % 指令）就用原值。
+            if s.get("dated"):
+                try:
+                    url = time.strftime(url)
+                except Exception:
+                    pass
+            add(url, s.get("kind", "sub"), s.get("note", ""))
 
-        # 历史源：健康度高的在前（失败多的自然沉底）
+        # 历史源：健康度高的在前（失败多的自然沉底）。
+        # ⚠️ 日期页跳过：它们每天产生一个新 URL，放进历史就会被当普通源
+        # 永久每轮重抓（旧页的节点早过期，重抓纯耗预算），只有「当天」的
+        # 日期页有抓取价值，而它已经由上面的种子机制每天生成。
         for s in health[:60]:
+            if _DATED_URL_RE.search(s["url"] or ""):
+                continue
             kind = s.get("kind") or "sub"
             add(s["url"], kind, "history")
         report["sources_dead_skipped"] = dead_skipped
@@ -436,17 +451,31 @@ class NodeHunter:
             # 按实际内容形态决定处理方式（源声明可能不准）
             ck = r.content_kind
             if ck == "page" or kind == "page":
-                # 页面：提取订阅链接，回填成下一层源。
-                # 页面源的「贡献」= 挖出的订阅链接数。原来这里一律记
-                # `ok=True, nodes_found=0`，把「返回 200 但一个链接都没有」
-                # 也算成功 —— 于是游戏站/词典站永远排在健康榜前列被反复抓。
-                # 现在挖不出链接就记失败，交给无贡献源黑名单自然淘汰。
+                # 火源页面：先直接抠页面里嵌的裸节点 URI（vmess/vless/…）。
+                # 2026-10-14 实测：clashgithub 日更页直接嵌 455 个 URI，
+                # 而旧逻辑只认「订阅链接」——这类页面会被判 no_sub_links
+                # 拉黑，每天几百个新鲜节点全部漏掉。抠完再走订阅链接
+                # 提取（zhuhai 这类两者都有的页面，两层都不落）。
+                direct_n = direct_added = 0
+                try:
+                    uris = extract_node_uris(r.text)
+                    if uris:
+                        direct_n, direct_added = self._ingest_text(
+                            "\n".join(uris), sid)
+                except SubscriptionError:
+                    pass  # 页面里没有可解析节点行，走订阅链接提取
+                except Exception as e:
+                    log.warning("页面 %s 节点直解异常：%s",
+                                url[:60], type(e).__name__)
                 subs = [su for su in extract_subscription_urls(r.text, url)
                         if su != url]
-                if subs:
+                if direct_n > 0 or subs:
                     report["sources_ok"] += 1
-                    self.pool.record_source_fetch(sid, True,
-                                                  nodes_found=len(subs))
+                    if direct_n > 0:
+                        report["parsed"] += direct_n
+                        report["new_nodes"] += direct_added
+                    self.pool.record_source_fetch(
+                        sid, True, nodes_found=direct_n or len(subs))
                 else:
                     report["sources_fail"] += 1
                     self.pool.record_source_fetch(sid, False,

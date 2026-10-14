@@ -776,6 +776,136 @@ def test_healthy_sources_counts_output_not_http_200(tmp_path):
     assert st.healthy_sources == 1
 
 
+# ══════════════════ 页面火源：页内裸 URI 直解析（2026-10-14）══════════════════
+
+
+def test_extract_node_uris_from_html():
+    """页内 href 里的裸节点 URI 要抠得出来（HTML 实体先反转义）。"""
+    import base64
+    import json as _json
+
+    from websearch.nodes.sources import extract_node_uris
+
+    cfg = _json.dumps({"v": "2", "ps": "t", "add": "fire.example.com",
+                       "port": "443",
+                       "id": "15234567-89ab-cdef-1234-567890abcdef",
+                       "net": "tcp"})
+    vmess = "vmess://" + base64.b64encode(cfg.encode()).decode()
+    html = ('<div class="msg"><a href="' + vmess + '">n1</a></div>'
+            '<code>vless://15234567-89ab-cdef-1234-567890abcdef@'
+            'fire.example.com:443?type=ws#n2</code>'
+            '<a href="' + vmess + '">dup</a>')
+    uris = extract_node_uris(html)
+    assert len(uris) == 2  # 同一个 vmess 出现两次，去重后剩 1
+    assert uris[0].startswith("vmess://")
+    assert uris[1].startswith("vless://")
+    # query 里的 &amp; 要被反转义回 &，否则参数被截断
+    esc = extract_node_uris(
+        '<a href="vless://uuid@h.example.com:443?type=ws&amp;security=tls#x">')
+    assert "&security=tls" in esc[0]
+    # 空/无 URI 不炸
+    assert extract_node_uris("") == []
+    assert extract_node_uris("<html>小游戏大全</html>") == []
+
+
+@pytest.mark.asyncio
+async def test_page_with_embedded_node_uris_ingested(tmp_path):
+    """火源页（clashgithub 日更页形态）：页内裸 URI 直接入库并记成功。
+
+    旧逻辑只认订阅链接，这种页面会被判 no_sub_links 拉黑 —— 实测日更页
+    嵌 455 个 URI，全漏。
+    """
+    import base64
+    import json as _json
+
+    from websearch.nodes.hunter import NodeHunter
+    from websearch.nodes.probe import NodeProber
+
+    cfg = _json.dumps({"v": "2", "ps": "t", "add": "fire.example.com",
+                       "port": "443",
+                       "id": "15234567-89ab-cdef-1234-567890abcdef",
+                       "net": "tcp"})
+    vmess = "vmess://" + base64.b64encode(cfg.encode()).decode()
+    body = f'<div class="tgme_widget_message_text">{vmess}</div>'
+
+    class _Stub:
+        async def fetch(self, url: str):
+            return type("R", (), {"ok": True, "text": body,
+                                  "content_kind": "page", "error": ""})()
+
+    pool = NodePool(tmp_path / "p.sqlite3")
+    page = "https://clashgithub.com/clashnode-20261014.html"
+    pool.upsert_source(source_id(page), page, "page")
+    h = NodeHunter(pool=pool, fetcher=_Stub(),
+                   prober=NodeProber(singbox_bin="", work_dir=tmp_path),
+                   orch=None)
+    rep = {"sources_ok": 0, "sources_fail": 0, "parsed": 0, "new_nodes": 0}
+    await h._fetch_and_ingest([{"url": page, "kind": "page"}], rep)
+    assert rep["sources_ok"] == 1 and rep["sources_fail"] == 0
+    assert rep["parsed"] == 1 and rep["new_nodes"] == 1
+    row = [s for s in pool.source_health(limit=10) if s["url"] == page][0]
+    assert row["ok"] == 1 and row["nodes_found"] == 1
+    nodes = pool.list_public(only_alive=False)
+    assert [r["server"] for r in nodes] == ["fire.example.com"]
+
+
+@pytest.mark.asyncio
+async def test_dated_seed_formats_today_and_history_skips_dated(tmp_path):
+    """日期种子按当天格式化；日期页不进历史轮换（旧页重抓纯耗预算）。"""
+    import time as _time
+
+    from websearch.nodes.hunter import NodeHunter
+    from websearch.nodes.probe import NodeProber
+
+    pool = NodePool(tmp_path / "p.sqlite3")
+    h = NodeHunter(pool=pool,
+                   fetcher=type("F", (), {"fetch": None})(),
+                   prober=NodeProber(singbox_bin="", work_dir=tmp_path),
+                   orch=None)
+    rep = {"sources_dead_skipped": 0}
+    out = await h._build_sources(discover=False, report=rep)
+    urls = [s["url"] for s in out]
+    today = _time.strftime("%Y%m%d")
+    # 种子里的 %Y%m%d 被格式化成今天
+    assert f"https://clashgithub.com/clashnode-{today}.html" in urls
+    assert not any("%Y" in u for u in urls)
+    # 健康度很好的历史日期页也不进轮换
+    old = f"https://clashgithub.com/clashnode-20260101.html"
+    pool.upsert_source(source_id(old), old, "page")
+    for _ in range(50):
+        pool.record_source_fetch(source_id(old), True, nodes_found=455)
+    out2 = await h._build_sources(discover=False, report={"sources_dead_skipped": 0})
+    assert old not in [s["url"] for s in out2]
+
+
+def test_candidates_prefer_newest_untested(tmp_path):
+    """未测节点必须最新优先生效——免费节点按小时死，陈库存 0% 存活。"""
+    import sqlite3
+
+    pool = NodePool(tmp_path / "p.sqlite3")
+    sid = "s"
+    items = [
+        ("old", "trojan", {"type": "trojan", "server": "old.example.com",
+                           "port": 443, "password": "p"}),
+        ("mid", "trojan", {"type": "trojan", "server": "mid.example.com",
+                           "port": 443, "password": "p"}),
+        ("new", "trojan", {"type": "trojan", "server": "new.example.com",
+                           "port": 443, "password": "p"}),
+    ]
+    pool.upsert_nodes(items, source_sid=sid, pool="free")
+    conn = pool._ensure()
+    # 手工摆 first_seen：old 最老、new 最新（都未测）
+    conn.execute("UPDATE nodes SET first_seen=? WHERE server='old.example.com'",
+                 (1000.0,))
+    conn.execute("UPDATE nodes SET first_seen=? WHERE server='mid.example.com'",
+                 (2000.0,))
+    conn.execute("UPDATE nodes SET first_seen=? WHERE server='new.example.com'",
+                 (3000.0,))
+    conn.commit()
+    got = [c["server"] for c in pool.candidates_for_probe(limit=10)]
+    assert got[:3] == ["new.example.com", "mid.example.com", "old.example.com"]
+
+
 @pytest.mark.asyncio
 async def test_smart_failover_no_alive_returns_none(tmp_path):
     """池里无存活节点 → 报告「应降级直连」，不假装切换。"""

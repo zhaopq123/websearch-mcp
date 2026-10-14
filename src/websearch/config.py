@@ -194,7 +194,7 @@ class Config:
     node_hunt_probe_limit: int = 120  # 单轮最多探测多少节点
     node_hunt_discover: bool = True  # 用搜索引擎自举发现新源
     singbox_bin: str = "/opt/sing-box/sing-box"  # 出网验证用（没有则退化 TCP）
-    node_probe_concurrency: int = 12
+    node_probe_concurrency: int = 24
     node_probe_timeout_ms: int = 8000
 
     # ── 客户订阅（cust 池唯一入口）──

@@ -427,13 +427,19 @@ class NodePool:
         if pool in ("cust", "free"):
             where = "WHERE pool=?"
             params.append(pool)
-        # 活着 > 未测 > 很久没测（>2h 视为需要刷新）> 其他
+        # 活着 > 未测 > 很久没测（>2h 视为需要刷新）> 其他。
+        # ⚠️ 2026-10-14 修新鲜度：未测层里必须**最新的优先**。免费节点
+        # 按小时死（实测库存抽样 60 个全 ConnectError，0% 存活），旧排序
+        # 是 avg_ms ASC——新节点和几千个陈库存同优先级，等轮到它早死透。
+        # 改 first_seen DESC：当天解析出的节点当轮就测，才抓得住活的。
         stale_cut = time.time() - self.PROBE_REFRESH_SEC
         order = (
             "CASE WHEN alive=1 THEN 0"
             "     WHEN last_probe_at=0 THEN 1"
             f"     WHEN last_probe_at < {stale_cut} THEN 2"
             "     ELSE 3 END ASC,"
+            "CASE WHEN last_probe_at=0 THEN first_seen ELSE 0 END DESC,"
+            "avg_ms ASC,"
         )
         if not prefer_untested:
             order = ""
