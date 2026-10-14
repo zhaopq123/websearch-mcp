@@ -235,9 +235,13 @@ class Maintenance:
         for db in (nodes_db, cache_db):
             if not db.exists():
                 continue
-            checkpoint(db)
+            checkpoint(db)          # 先把 WAL 灌回主库，page_count 才是准的
             if vacuum_if_bloated(db):
                 rep["vacuumed"].append(db.name)
+                # VACUUM 的产物先落进 WAL，**必须再 checkpoint 一次**才能把主库
+                # 文件真正缩下来。实测（2026-10-14）：只 VACUUM 不补 checkpoint，
+                # 主库仍停在旧尺寸（504KB/126 页），逻辑上已缩到 16 页却看不出来。
+                checkpoint(db)
 
         rep["logs_rotated"] = [p.name for p in self._log_targets()
                                if rotate_log_copytruncate(p)]

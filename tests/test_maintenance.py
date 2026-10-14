@@ -176,6 +176,32 @@ def test_maintenance_run_once_smoke(tmp_path):
     assert isinstance(rep["backups_trimmed"], list)
 
 
+def test_run_once_shrinks_bloated_db_file(tmp_path):
+    """VACUUM 之后必须再 checkpoint，否则缩的是 WAL、主库文件不缩。
+
+    实测坑（2026-10-14）：cache.sqlite3 VACUUM 后逻辑上只剩 16 页，
+    但主库文件仍是 504KB/126 页 —— VACUUM 的重写产物先落在 WAL 里，
+    不补一次 checkpoint 就看不到文件变小。
+    """
+    app = tmp_path / "app"
+    data = app / "cache"
+    data.mkdir(parents=True)
+    (app / "backups").mkdir()
+    db = data / "cache.sqlite3"
+    c = sqlite3.connect(str(db), isolation_level=None)   # 保持连接（模拟常驻服务）
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("CREATE TABLE t (a TEXT)")
+    c.executemany("INSERT INTO t VALUES (?)", [("z" * 2000,)] * 800)
+    c.execute("DELETE FROM t")                           # 制造大量空闲页
+    big = db.stat().st_size
+    assert big > 200_000
+
+    rep = m.Maintenance(data_dir=data, app_dir=app, interval_sec=60).run_once()
+    assert "cache.sqlite3" in rep["vacuumed"]
+    assert db.stat().st_size < big / 2                   # 主库文件真的缩了
+    c.close()
+
+
 def test_maintenance_from_env_defaults(tmp_path):
     mnt = m.Maintenance.from_env(data_dir=tmp_path, app_dir=tmp_path)
     assert mnt.interval_sec >= 60.0
