@@ -157,7 +157,8 @@ class NodeHunter:
 
     def __init__(self, *, pool: NodePool, fetcher: SourceFetcher,
                  prober: NodeProber, orch: Any = None,
-                 discover: bool = True, switch_cb: Any = None):
+                 discover: bool = True, switch_cb: Any = None,
+                 customer_subs: list[str] | None = None):
         self.pool = pool
         self.fetcher = fetcher
         self.prober = prober
@@ -166,6 +167,12 @@ class NodeHunter:
         # 切换回调：async (outbound) -> bool，由 Service 提供（负责起
         # 本地 sing-box 并把 HttpPool 切过去）。不传则只更新内部状态。
         self.switch_cb = switch_cb
+        # 客户订阅（cust 池唯一入口，WS_CUSTOMER_SUBS / WS_CUSTOMER_SUB_FILE）。
+        # 空 = 没配，import_customer_subs 直接跳过，零开销。
+        self.customer_subs = [s.strip() for s in (customer_subs or [])
+                              if s and s.strip()]
+        # 最近一次客户订阅导入结果（只计数，无凭据）
+        self.last_customer_import: dict[str, Any] = {}
         self.state = HunterState(
             interval_sec=_env_int("WS_NODE_HUNT_INTERVAL", DEFAULT_LOOP_INTERVAL),
             target_alive=_env_int("WS_NODE_TARGET_ALIVE", TARGET_ALIVE),
@@ -283,6 +290,11 @@ class NodeHunter:
             if plan:
                 report["plan"] = plan
             try:
+                # 0) 客户订阅导入（cust 池唯一入口）。放在最前：客户节点
+                #    要赶在本轮探测前入库，才吃得到 CUST_PROBE_QUOTA。
+                if self.customer_subs:
+                    report["customer"] = await self.import_customer_subs()
+
                 # 1) 组源
                 source_list = await self._build_sources(discover=discover,
                                                         report=report)
@@ -517,6 +529,46 @@ class NodeHunter:
         added = self.pool.upsert_nodes(items, source_sid=sid, pool="cust")
         log.info("客户节点导入：解析 %d 个，新增 %d 个", len(rep.nodes), added)
         return len(rep.nodes), added
+
+    async def import_customer_subs(self) -> dict[str, Any]:
+        """抓取配置里的客户订阅 URL，导入 cust 池（每轮 hunt 开头跑）。
+
+        与免费源抓取的区别：
+          · 复用 fetcher（直连失败自动走本地代理）—— 机场订阅多在墙外；
+          · **不记 source 健康度**：URL 含 token，sources 表会经
+            node_pool action=sources 外泄；
+          · 失败只记次数与异常类型名，不记 URL。
+        返回 {"configured", "ok", "fail", "parsed", "added"}（无凭据）。
+        """
+        if not self.customer_subs:
+            return {"configured": 0}
+        rep: dict[str, Any] = {"configured": len(self.customer_subs),
+                               "ok": 0, "fail": 0, "parsed": 0, "added": 0}
+        for url in self.customer_subs:
+            try:
+                r = await self.fetcher.fetch(url)
+                if not r.ok:
+                    rep["fail"] += 1
+                    log.warning("客户订阅抓取失败：%s", r.error or "fetch fail")
+                    continue
+                n, added = self.import_customer(r.text)
+            except Exception as e:
+                rep["fail"] += 1
+                log.warning("客户订阅导入异常：%s", type(e).__name__)
+                continue
+            if n <= 0:
+                # 订阅失效/解析不出节点：算失败，提示更换
+                rep["fail"] += 1
+                log.warning("客户订阅解析出 0 个节点（订阅可能已失效）")
+                continue
+            rep["ok"] += 1
+            rep["parsed"] += n
+            rep["added"] += added
+        self.last_customer_import = dict(rep)
+        if rep["ok"] or rep["fail"]:
+            log.info("客户订阅导入：%d 成功 / %d 失败，解析 %d，新增 %d",
+                     rep["ok"], rep["fail"], rep["parsed"], rep["added"])
+        return rep
 
     async def _probe_candidates(self, limit: int) -> dict[str, Any]:
         """挑候选节点探测，更新健康分。**分池配额**。

@@ -9,9 +9,12 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+
+log = logging.getLogger("websearch.config")
 
 
 def _env_str(name: str, default: str) -> str:
@@ -194,6 +197,14 @@ class Config:
     node_probe_concurrency: int = 12
     node_probe_timeout_ms: int = 8000
 
+    # ── 客户订阅（cust 池唯一入口）──
+    # ⚠️ 含 token = 凭据：只走环境变量（WS_CUSTOMER_SUBS，逗号分隔）或
+    # WS_CUSTOMER_SUB_FILE 指向的 600 权限文件（一行一个 URL，# 注释）。
+    # 绝不进日志、绝不进 sources 健康表 —— 那张表会经 node_pool
+    # action=sources 原样外泄 URL。
+    customer_subs: list[str] = field(default_factory=list)
+    customer_sub_file: str = ""     # WS_CUSTOMER_SUB_FILE
+
     # ── 安全 ──
     allow_private_net: bool = False  # 默认禁内网（SSRF 防护）
     allow_nonstd_port: bool = False  # 默认只放行 80/443
@@ -298,6 +309,22 @@ class Config:
                                             c.node_probe_concurrency)
         c.node_probe_timeout_ms = _env_int("WS_NODE_PROBE_TIMEOUT_MS",
                                            c.node_probe_timeout_ms)
+
+        # 客户订阅：env 列表 + 可选文件（合并去重，文件读取失败只记类型名）
+        subs = _env_list("WS_CUSTOMER_SUBS", [])
+        c.customer_sub_file = _env_str("WS_CUSTOMER_SUB_FILE", "")
+        if c.customer_sub_file:
+            try:
+                for line in Path(c.customer_sub_file).read_text(
+                        encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#") and line not in subs:
+                        subs.append(line)
+            except OSError as e:
+                # 只报路径与异常类型；文件内容含 token，绝不进日志
+                log.warning("客户订阅文件读取失败（%s）：%s",
+                            c.customer_sub_file, type(e).__name__)
+        c.customer_subs = subs
 
         c.allow_private_net = _env_bool("WS_ALLOW_PRIVATE_NET", c.allow_private_net)
         c.allow_nonstd_port = _env_bool("WS_ALLOW_NONSTD_PORT", c.allow_nonstd_port)

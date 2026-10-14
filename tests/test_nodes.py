@@ -268,10 +268,27 @@ def test_parse_subscription_text_routes_clash_yaml():
     ("https://a.com/logo.png", False),
     ("https://api.example.com/api/v1/client/subscribe?token=x", True),
     ("https://node.foo.cn/", True),
+    # ── 2026-10-14 收严：poki.com 游戏页实测假源 ──
+    ("https://api.poki.com", False),                    # 实测假订阅链接（裸 api 域名）
+    ("https://poki.com/en/free-games", False),          # 弱词 free 不再单独放行
+    ("https://poki.com/en/g/subway-surfers", False),    # 无任何订阅特征
+    ("https://free.example.com/", False),               # 裸 free 域名不再放行
+    ("https://example.com/jump?url=https://evil", False),  # ?url= 是跳转不是订阅
+    ("https://4399.com/", False),
+    ("https://sub.example.net/free/latest/", True),     # 强主机词仍放行
 ])
 def test_subscription_url_word_boundary(url, expected):
-    """关键词必须词边界匹配 —— 裸子串会把 css2/freedomport 误判。"""
+    """关键词必须词边界匹配 —— 裸子串会把 css2/freedomport 误判；
+    弱词（free/share/nodes）与裸 api/free 域名不单独放行（poki 假源）。"""
     assert _looks_like_subscription_url(url) is expected
+
+
+def test_extract_from_poki_page_yields_nothing():
+    """poki 游戏页整页提取：一个订阅链接都不该有（2026-10-14 实测假源）。"""
+    html = ('<a href="https://api.poki.com">api</a>'
+            '<a href="https://poki.com/en/free-games">games</a>'
+            '<a href="https://poki.com/en/g/subway-surfers">s</a>')
+    assert extract_subscription_urls(html) == []
 
 
 def test_extract_from_page_text():
@@ -334,6 +351,210 @@ def test_source_fetcher_classify():
 def test_source_id_stable():
     assert source_id("https://a.com/x") == source_id("https://a.com/x")
     assert source_id("https://a.com/x") != source_id("https://a.com/y")
+
+
+# ══════════════════ 抓源出网路径：直连 ↔ 本地代理 ══════════════════
+
+
+def _patch_client(monkeypatch, *, direct_exc=None, proxy_exc=None):
+    """把 httpx.AsyncClient 换成按 proxy 参数决定行为的假 client。
+
+    返回 calls 列表：每次实例化记录传入的 proxy（"" = 直连），
+    用来断言「走了哪条路、走了一条还是两条」。
+    """
+    calls: list[str] = []
+
+    class _Resp:
+        status_code = 200
+        text = "ss://abc\nvmess://def"
+
+    class _Client:
+        def __init__(self, **kwargs):
+            self._proxy = kwargs.get("proxy") or ""
+            calls.append(self._proxy)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url):
+            if self._proxy:
+                if proxy_exc is not None:
+                    raise proxy_exc
+            elif direct_exc is not None:
+                raise direct_exc
+            return _Resp()
+
+    monkeypatch.setattr(node_sources.httpx, "AsyncClient", _Client)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_fetcher_falls_back_to_local_proxy(monkeypatch):
+    """直连网络错误 → 自动改走本地代理；两条路都试过才认输。"""
+    calls = _patch_client(monkeypatch,
+                          direct_exc=httpx.ConnectTimeout("direct dead"))
+    f = SourceFetcher(timeout=1,
+                      proxy_provider=lambda: "http://127.0.0.1:17892")
+    r = await f.fetch("https://manifest.dpdns.org/free/latest/v2ray.txt")
+    assert r.ok is True
+    assert calls == ["", "http://127.0.0.1:17892"]   # 先直连后代理
+    # 成功路径被记住：下次同一宿主不再先赌直连超时
+    assert f._remembered_path("manifest.dpdns.org") == "proxy"
+
+
+@pytest.mark.asyncio
+async def test_fetcher_proxy_first_for_github_raw(monkeypatch):
+    """GitHub raw 宿主默认代理优先 —— 不为已知不通的直连浪费一轮超时。"""
+    calls = _patch_client(monkeypatch)
+    f = SourceFetcher(timeout=1,
+                      proxy_provider=lambda: "http://127.0.0.1:17892")
+    r = await f.fetch(
+        "https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.txt")
+    assert r.ok is True
+    assert calls == ["http://127.0.0.1:17892"]        # 只走代理，没赌直连
+    assert f._remembered_path("raw.githubusercontent.com") == "proxy"
+
+
+@pytest.mark.asyncio
+async def test_fetcher_path_memory_skips_dead_direct(monkeypatch):
+    """记住「代理通」后，同宿主第二把直接走代理（不重复试直连）。"""
+    calls = _patch_client(monkeypatch,
+                          direct_exc=httpx.ConnectTimeout("direct dead"))
+    f = SourceFetcher(timeout=1,
+                      proxy_provider=lambda: "http://127.0.0.1:17892")
+    url = "https://manifest.dpdns.org/free/latest/v2ray.txt"
+    assert (await f.fetch(url)).ok is True
+    calls.clear()
+    assert (await f.fetch(url)).ok is True
+    assert calls == ["http://127.0.0.1:17892"]
+
+
+@pytest.mark.asyncio
+async def test_fetcher_no_retry_on_http_error(monkeypatch):
+    """HTTP 4xx/5xx 不是网络错误：不换路径，如实返回（源健康度要记真实状态）。"""
+    class _Resp:
+        status_code = 403
+        text = "forbidden"
+
+    class _Client:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url):
+            return _Resp()
+
+    monkeypatch.setattr(node_sources.httpx, "AsyncClient", _Client)
+    f = SourceFetcher(timeout=1,
+                      proxy_provider=lambda: "http://127.0.0.1:17892")
+    r = await f.fetch("https://example.com/sub.txt")
+    assert r.ok is False and r.error == "HTTP 403"
+
+
+@pytest.mark.asyncio
+async def test_fetcher_proxy_unavailable_degrades_to_direct(monkeypatch):
+    """sing-box 没起来（provider 返回 ""）→ 纯直连，不报错。"""
+    calls = _patch_client(monkeypatch)
+    f = SourceFetcher(timeout=1, proxy_provider=lambda: "")
+    r = await f.fetch("https://example.com/sub.txt")
+    assert r.ok is True
+    assert calls == [""]
+
+
+@pytest.mark.asyncio
+async def test_fetcher_user_proxy_single_path(monkeypatch):
+    """用户显式配了代理：只用它，不做直连兜底。"""
+    calls = _patch_client(monkeypatch)
+    f = SourceFetcher(timeout=1, proxy="http://user:pass@host:7897",
+                      proxy_provider=lambda: "http://127.0.0.1:17892")
+    r = await f.fetch("https://example.com/sub.txt")
+    assert r.ok is True
+    assert calls == ["http://user:pass@host:7897"]
+
+
+# ══════════════════ 客户订阅导入（cust 池）══════════════════
+
+
+@pytest.mark.asyncio
+async def test_import_customer_subs_goes_to_cust_pool(tmp_path):
+    """配置了客户订阅：抓取→解析→cust 池；不记 source 健康表（URL 含 token）。"""
+    from websearch.nodes.hunter import NodeHunter
+    from websearch.nodes.probe import NodeProber
+
+    class _Stub:
+        async def fetch(self, url):
+            from websearch.nodes.sources import Fetched
+            return Fetched(url=url, ok=True, text="trojan://pw@cust.example.com:443#n",
+                           content_kind="sub")
+
+    pool = NodePool(tmp_path / "p.sqlite3")
+    hunter = NodeHunter(pool=pool, fetcher=_Stub(),
+                        prober=NodeProber(singbox_bin="", work_dir=tmp_path),
+                        customer_subs=["https://airport.example/sub?token=SECRET"])
+    rep = await hunter.import_customer_subs()
+    assert rep == {"configured": 1, "ok": 1, "fail": 0, "parsed": 1, "added": 1}
+    cust = pool.list_public(only_alive=False, pool="cust")
+    assert [r["server"] for r in cust] == ["cust.example.com"]
+    # 订阅 URL（含 token）绝不能进 sources 表
+    assert pool.source_health(limit=50) == []
+
+
+@pytest.mark.asyncio
+async def test_import_customer_subs_failure_counted(tmp_path):
+    """订阅抓取失败/解析 0 节点：记 fail，不炸、不记 URL。"""
+    from websearch.nodes.hunter import NodeHunter
+    from websearch.nodes.probe import NodeProber
+    from websearch.nodes.sources import Fetched
+
+    class _Dead:
+        async def fetch(self, url):
+            return Fetched(url=url, ok=False, error="ConnectTimeout")
+
+    class _Empty:
+        async def fetch(self, url):
+            return Fetched(url=url, ok=True, text="<html>登录页</html>",
+                           content_kind="page")
+
+    pool = NodePool(tmp_path / "p.sqlite3")
+    prober = NodeProber(singbox_bin="", work_dir=tmp_path)
+    h1 = NodeHunter(pool=pool, fetcher=_Dead(), prober=prober,
+                    customer_subs=["https://a.example/s?token=x"])
+    rep = await h1.import_customer_subs()
+    assert rep["ok"] == 0 and rep["fail"] == 1
+
+    h2 = NodeHunter(pool=pool, fetcher=_Empty(), prober=prober,
+                    customer_subs=["https://b.example/s?token=x"])
+    rep2 = await h2.import_customer_subs()
+    assert rep2["ok"] == 0 and rep2["fail"] == 1
+
+
+def test_config_customer_subs_from_env_and_file(tmp_path, monkeypatch):
+    """WS_CUSTOMER_SUBS + WS_CUSTOMER_SUB_FILE 合并去重；文件含 token 不外泄。"""
+    from websearch.config import Config
+
+    sub_file = tmp_path / "subs.txt"
+    sub_file.write_text("# 注释\nhttps://a.example/s?token=T1\n\n"
+                        "https://b.example/s?token=T2\n", encoding="utf-8")
+    monkeypatch.setenv("WS_CUSTOMER_SUBS", "https://c.example/s?token=T3, https://a.example/s?token=T1")
+    monkeypatch.setenv("WS_CUSTOMER_SUB_FILE", str(sub_file))
+    c = Config.from_env()
+    assert c.customer_subs == [
+        "https://c.example/s?token=T3",
+        "https://a.example/s?token=T1",
+        "https://b.example/s?token=T2",
+    ]
+    # 文件不存在：不炸，只留 env 的
+    monkeypatch.setenv("WS_CUSTOMER_SUB_FILE", str(tmp_path / "nope.txt"))
+    c2 = Config.from_env()
+    assert len(c2.customer_subs) == 2
 
 
 # ══════════════════════ 猎手：组源与降级决策 ══════════════════════

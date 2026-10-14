@@ -217,8 +217,17 @@ class Service:
                 timeout=cfg.node_probe_timeout_ms / 1000.0,
                 concurrency=cfg.node_probe_concurrency,
             )
-            # 抓源直连（聚合站墙内可达）；传代理反而不稳（代理挂了就全抓不到）
-            fetcher = SourceFetcher(timeout=15.0, cfg=cfg)
+            # 抓源：直连优先，网络错误自动改走本地节点代理再试一次
+            # （2026-10-14 实测 GitHub raw 直连超时率 ~30%，拖垮每轮
+            # 解析量）。provider 返回 "" = sing-box 没起来，退化为直连。
+            def _local_proxy_url() -> str:
+                lp = self.local_proxy
+                if lp is None or not lp.state.running:
+                    return ""
+                return lp.proxy_url
+
+            fetcher = SourceFetcher(timeout=15.0, cfg=cfg,
+                                    proxy_provider=_local_proxy_url)
             # 本地节点代理：用户没配代理时，服务用节点库最优节点自养出网
             self.local_proxy = LocalNodeProxy(
                 singbox_bin=cfg.singbox_bin, work_dir=data_dir,
@@ -227,6 +236,7 @@ class Service:
                 pool=pool, fetcher=fetcher, prober=prober, orch=self.orch,
                 discover=cfg.node_hunt_discover,
                 switch_cb=self._switch_to_node,
+                customer_subs=cfg.customer_subs,
             )
         except Exception as e:
             log.warning("节点猎手初始化失败（不影响搜索）: %s", e)
@@ -754,7 +764,8 @@ def build_mcp(cfg: Config):
 
     @mcp.tool(**_MCP)
     async def node_pool(action: str = "status", limit: int = 30,
-                        pool: str = "", target_alive: int = -1) -> dict[str, Any]:
+                        pool: str = "", target_alive: int = -1,
+                        text: str = "", sub_url: str = "") -> dict[str, Any]:
         """查看「节点库」——**两个独立池**：客户导入 + 系统自搜。
 
         · cust  客户导入的节点（机场/自建）。选路**优先**用它，
@@ -771,10 +782,19 @@ def build_mcp(cfg: Config):
 
         参数：
           action  status（库统计，默认）| list（节点列表）| sources（源健康度）
+                  | import_customer（导入客户订阅，见下）
           limit   list/sources 的返回条数上限
           pool    cust（只看客户池）| free（只看免费池）| 留空=全部
           target_alive  保活目标活节点数；传0=关闭保活（回到定时收集），
                         传 -1（默认）=不改，只查询
+          text     import_customer 用：直接粘贴订阅内容（base64/URI 列表/
+                   clash yaml 均可）。⚠️ 含凭据，只进 600 权限节点库，
+                   不进日志、不出现在任何返回里
+          sub_url  import_customer 用：订阅地址（服务端抓取后导入）。
+                   不带 text 时生效；同样只进库不外泄
+
+        import_customer 不传 text/sub_url 时，返回配置情况与最近一次
+        自动导入结果（只计数，不吐 URL）。
 
         返回**不含任何节点凭据**（uuid/密码永不外泄），
         只给协议、地区、延迟、健康分。
@@ -798,6 +818,31 @@ def build_mcp(cfg: Config):
             return {
                 "sources": p.source_health(limit=limit),
                 "stats": p.stats().to_dict(),
+            }
+        if action == "import_customer":
+            # 手动导入客户订阅：粘贴订阅内容（text）或给订阅 URL（sub_url）。
+            # ⚠️ 两者都含 token：只进 600 权限节点库，绝不进日志/返回。
+            if text.strip():
+                n, added = svc.hunter.import_customer(text)
+                return {"action": "import_customer", "source": "text",
+                        "parsed": n, "added": added}
+            if sub_url.strip():
+                r = await svc.hunter.fetcher.fetch(sub_url.strip())
+                if not r.ok:
+                    return {"action": "import_customer", "source": "url",
+                            "error": r.error or "fetch fail"}
+                n, added = svc.hunter.import_customer(r.text)
+                return {"action": "import_customer", "source": "url",
+                        "parsed": n, "added": added}
+            # 无参数：回报配置与最近一次自动导入结果（只计数，不吐 URL）
+            return {
+                "action": "import_customer",
+                "configured": len(svc.hunter.customer_subs),
+                "last": svc.hunter.last_customer_import,
+                "hint": ("传 text=订阅内容 或 sub_url=订阅地址 立即导入；"
+                         "URL 含 token，不会出现在任何返回里。"
+                         "批量自动导入用 WS_CUSTOMER_SUBS /"
+                         " WS_CUSTOMER_SUB_FILE 配置。"),
             }
         return {
             "stats": p.stats().to_dict(),
