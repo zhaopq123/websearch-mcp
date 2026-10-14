@@ -1331,3 +1331,85 @@ def test_proxy_list_nodes_enter_free_pool_as_socks(tmp_path):
     rows = pool.list_public(only_alive=False)
     assert all(r["protocol"] == "socks" for r in rows)
     assert all(r["pool"] == "free" for r in rows)
+
+
+def test_prune_deletes_dead_proxies_despite_fresh_last_seen(tmp_path):
+    """死透硬删：alive=0 + 测过 + 48h 没活过 → 删，不问 last_seen。
+
+    代理列表源每轮都列出死代理（列表自身不清理），last_seen 被无限
+    刷新 —— 只依赖 last_seen 的主规则永远删不掉它们，库无限膨胀。
+    """
+    import time as _t
+
+    pool = NodePool(tmp_path / "p.sqlite3")
+    now = _t.time()
+    # 死节点：49h 前最后一次探测成功，但 last_seen 是「现在」
+    # （代理列表每轮都列出它）
+    pool.upsert_nodes([("dead1", "socks",
+                        {"type": "socks", "server": "10.0.0.1",
+                         "server_port": 1080, "version": "5"})])
+    conn = pool._ensure()
+    conn.execute("UPDATE nodes SET alive=0, last_probe_at=?,"
+                 " last_ok_at=?, last_seen=? WHERE tag='dead1'",
+                 (now - 3600, now - 49 * 3600, now))
+    # 活节点：last_ok_at 旧但活着 → 不能删
+    pool.upsert_nodes([("alive1", "socks",
+                        {"type": "socks", "server": "10.0.0.2",
+                         "server_port": 1080, "version": "5"})])
+    conn.execute("UPDATE nodes SET alive=1, last_probe_at=?,"
+                 " last_ok_at=?, last_seen=? WHERE tag='alive1'",
+                 (now, now - 49 * 3600, now))
+    # 刚死的节点：5h 前最后一次成功 → 不删（48h 内）
+    pool.upsert_nodes([("fresh-dead", "socks",
+                        {"type": "socks", "server": "10.0.0.3",
+                         "server_port": 1080, "version": "5"})])
+    conn.execute("UPDATE nodes SET alive=0, last_probe_at=?,"
+                 " last_ok_at=?, last_seen=? WHERE tag='fresh-dead'",
+                 (now - 3600, now - 5 * 3600, now))
+    conn.commit()
+
+    pruned = pool.prune()
+    assert pruned == 1
+    left = {r["tag"] for r in pool.list_public(only_alive=False)}
+    assert left == {"alive1", "fresh-dead"}
+
+
+def test_prune_deletes_stale_untested_stock(tmp_path):
+    """陈库存硬删：入库 3 天从未排到探测 → 删（探测预算排不到，纯负担）。"""
+    import time as _t
+
+    pool = NodePool(tmp_path / "p.sqlite3")
+    now = _t.time()
+    conn = pool._ensure()
+    for i, age_d in ((0, 4), (1, 4), (2, 0)):   # 两个陈旧 + 一个新鲜
+        pool.upsert_nodes([(f"n{i}", "socks",
+                            {"type": "socks", "server": f"10.1.0.{i}",
+                             "server_port": 1080, "version": "5"})])
+        conn.execute("UPDATE nodes SET first_seen=?, last_seen=?"
+                     " WHERE tag=?", (now - age_d * 86400, now, f"n{i}"))
+    conn.commit()
+
+    pruned = pool.prune()
+    assert pruned == 2
+    left = {r["tag"] for r in pool.list_public(only_alive=False)}
+    assert left == {"n2"}
+
+
+def test_prune_never_touches_cust_pool(tmp_path):
+    """硬淘汰只清 free 池；cust 客户节点一条不碰（用户自己的订阅）。"""
+    import time as _t
+
+    pool = NodePool(tmp_path / "p.sqlite3")
+    now = _t.time()
+    pool.upsert_nodes([("cust-dead", "socks",
+                        {"type": "socks", "server": "10.2.0.1",
+                         "server_port": 1080, "version": "5"})],
+                      source_sid="customer", pool="cust")
+    conn = pool._ensure()
+    conn.execute("UPDATE nodes SET alive=0, last_probe_at=?,"
+                 " last_ok_at=?, last_seen=?, first_seen=?"
+                 " WHERE tag='cust-dead'",
+                 (now - 3600, now - 99 * 3600, now, now - 99 * 86400))
+    conn.commit()
+    assert pool.prune() == 0
+    assert pool.list_public(only_alive=False, pool="cust")

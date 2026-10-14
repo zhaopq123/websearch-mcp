@@ -197,6 +197,16 @@ class NodePool:
     # 探测结果的有效期：超过这个时间没重新测过，节点状态算「陈旧」，
     # 需要重新测（免费节点状态漂移快，2 小时足够暴露大部分失效）。
     PROBE_REFRESH_SEC = 2 * 3600
+    # ── 2026-10-14 接入公开代理列表源后新增的两条硬淘汰 ──
+    # 背景：主淘汰规则要求 last_seen 也过期，但代理列表源（HProxy/
+    # Proxifly/…）**每轮都列出死代理**（列表自己不删死条目）——
+    # last_seen 被无限刷新，死代理永远删不掉，库无限膨胀。
+    # 死透硬删：明确判死（alive=0）、测过（last_probe_at>0，没测过的
+    # 不误杀）、48h 没活过 → 删，不问 last_seen。
+    PRUNE_DEAD_AFTER_SEC = 48 * 3600
+    # 陈库存硬删：入库 3 天还从未排到探测（预算有限，新鲜节点一直在
+    # 前面）→ 删。留着既是纯负担，又会拖慢候选查询。
+    PRUNE_UNTESTED_AFTER_SEC = 3 * 24 * 3600
 
     def __init__(self, db_path: Path | str):
         self.path = Path(db_path)
@@ -550,10 +560,34 @@ class NodePool:
             (pool, cutoff, cutoff),
         )
         n = cur.rowcount or 0
-        if n:
-            log.info("节点库清理：淘汰 %d 个过期 %s 池节点", n, pool)
+        # ── 两条不依赖 last_seen 的硬淘汰（2026-10-14，代理列表源专用）──
+        # 1) 死透：alive=0 + 测过 + 48h 没活过。代理列表每轮都列出死
+        #    条目（列表自身不清理），last_seen 无限刷新，主规则永远
+        #    删不到它们 —— 库会膨胀到 sqlite 查询都慢。
+        dead_cut = time.time() - self.PRUNE_DEAD_AFTER_SEC
+        cur2 = conn.execute(
+            "DELETE FROM nodes WHERE pool=? AND alive=0 AND last_probe_at>0"
+            " AND last_ok_at <= ?",
+            (pool, dead_cut),
+        )
+        n2 = cur2.rowcount or 0
+        # 2) 陈库存：入库 3 天从未排到探测。探测预算有限，未被测过的
+        #    陈旧库存是纯负担（还会拖慢 candidates_for_probe 查询）。
+        untested_cut = time.time() - self.PRUNE_UNTESTED_AFTER_SEC
+        cur3 = conn.execute(
+            "DELETE FROM nodes WHERE pool=? AND last_probe_at=0"
+            " AND first_seen <= ?",
+            (pool, untested_cut),
+        )
+        n3 = cur3.rowcount or 0
+        total = n + n2 + n3
+        if total:
+            log.info(
+                "节点库清理：淘汰 %d 个过期 %s 池节点"
+                "（过期 %d / 死透 %d / 未测陈库存 %d）",
+                total, pool, n, n2, n3)
         self._secure()
-        return n
+        return total
 
     # ── 对外视图（无凭据）──
 
