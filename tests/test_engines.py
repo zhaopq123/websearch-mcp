@@ -154,3 +154,64 @@ def test_registry_complete():
     for expect in ("bing", "so360", "baidu_m", "sogou_m", "so360_m", "weixin",
                    "toutiao", "duckduckgo", "mojeek", "brave"):
         assert expect in REGISTRY, f"缺少引擎 {expect}"
+
+
+# ══════════════ 2026-10-14 结果后过滤（全量测试复盘）══════════════
+
+
+def test_is_noise_result_categories():
+    """self 噪声 / 验证挑战页 / 已知仿冒站都要拦；正常结果不误伤。"""
+    from websearch.engines import _is_noise_result
+
+    # 拦：引擎自身站点非跳转壳（登录页/热搜榜）
+    assert _is_noise_result("https://passport.baidu.com/v2/?login")
+    assert _is_noise_result("https://top.baidu.com/board?tab=realtime")
+    assert _is_noise_result("https://www.sogou.com/web?query=x")
+    # 拦：cloudflare 挑战页与 cdn-cgi 路径
+    assert _is_noise_result("https://challenges.cloudflare.com/turnstile")
+    assert _is_noise_result("https://openai.com/_cdn-cgi/challenge-platform/x")
+    # 拦：实测抓到过的仿冒站
+    assert _is_noise_result("https://chatgpt-ai.com/")
+    # 不拦：真实结果 + 引擎跳转壳（/link?url= 是真结果）
+    assert not _is_noise_result("https://openai.com/chatgpt")
+    assert not _is_noise_result("https://www.baidu.com/link?url=abc123")
+    assert not _is_noise_result("https://example.com/login-help")  # 第三方登录帮助页是内容
+
+
+def test_baidu_parse_output_is_filtered_by_orchestrator_layer():
+    """parse 层保持纯净，噪声过滤在 orchestrator 层统一做（一处覆盖全引擎）。
+
+    设计取舍：过滤下沉到 17 个 parse 方法里必然漏；放在 orchestrator
+    解析后一步，所有引擎（含未来新增）自动获得过滤。
+    """
+    from websearch.engines import BaiduEngine, _is_noise_result
+
+    e = BaiduEngine()
+
+    def block(url: str, title: str) -> str:
+        return (f'<div class="result c-container"><h3 class="t">'
+                f'<a href="{url}">{title}</a></h3></div>')
+
+    html = ("<html><body>"
+            + block("https://passport.baidu.com/v2/?login", "登录百度")
+            + block("https://top.baidu.com/board?tab=realtime", "百度热搜")
+            + block("https://openai.com/chatgpt", "ChatGPT 官网")
+            + "</body></html>")
+    raw = e.parse(html, limit=10)
+    # parse 层原样返回（不内置过滤）
+    assert len(raw) == 3
+    # orchestrator 层的过滤把噪声清掉，只留真实结果
+    kept = [r for r in raw if not _is_noise_result(r.url)]
+    assert [r.url for r in kept] == ["https://openai.com/chatgpt"]
+
+
+def test_orchestrator_noise_filter_wiring():
+    """orchestrator 模块确实 import 并使用了噪声过滤（防回归掉线）。"""
+    import websearch.orchestrator as orch_mod
+    from websearch.engines import _is_noise_result
+
+    # 接线存在：模块级名字可用
+    assert orch_mod._is_noise_result is _is_noise_result
+    # 源码里确实出现在解析之后（而不是只 import 不用的死 import）
+    src = Path(orch_mod.__file__).read_text(encoding="utf-8")
+    assert "_is_noise_result(r.url)" in src

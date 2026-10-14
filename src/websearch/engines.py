@@ -52,6 +52,20 @@ _SELF_HOSTS = {
 }
 _LINK_PATH = re.compile(r"^/(?:link|jump|url)\b", re.I)
 
+# ── 结果后过滤（2026-10-14 全量测试复盘，实测噪声形态）──
+# 1) 登录/验证/挑战页：baidu 搜 ChatGPT 时前 2 条曾是 passport.baidu.com
+#    与 top.baidu.com；so360 返回过 cloudflare 验证页；这些「通了但
+#    不是内容」的条目比没有结果更坏 —— 用户以为搜到了。
+# 2) 已知仿冒站（域名黑名单）：实测搜 ChatGPT 返回 chatgpt-ai.com
+#    仿冒官网。只列**实测抓到过**的，不做通用品牌仿冒猜测（误伤真站）。
+_CHALLENGE_HOSTS = {
+    "challenges.cloudflare.com",
+}
+_CHALLENGE_PATH = re.compile(r"/_cdn-cgi/|/cdn-cgi/", re.I)
+_IMPERSONATION_HOSTS = {
+    "chatgpt-ai.com",
+}
+
 
 def _is_self_noise(url: str) -> bool:
     """是不是引擎自身站点上的非结果链接。"""
@@ -63,6 +77,20 @@ def _is_self_noise(url: str) -> bool:
         return False
     path = urlsplit(url).path or "/"
     return not _LINK_PATH.match(path)
+
+
+def _is_noise_result(url: str) -> bool:
+    """统一结果噪声判定：self 噪声 / 验证挑战页 / 已知仿冒站。"""
+    if _is_self_noise(url):
+        return True
+    try:
+        host = (urlsplit(url).hostname or "").lower().lstrip("www.")
+        path = urlsplit(url).path or ""
+    except ValueError:
+        return False
+    if host in _CHALLENGE_HOSTS or _CHALLENGE_PATH.search(path):
+        return True
+    return host in _IMPERSONATION_HOSTS
 
 
 def generic_parse(html: str, engine: str, limit: int) -> list[SearchResult]:

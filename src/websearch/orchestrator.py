@@ -18,7 +18,7 @@ import httpx
 from . import engines as eng_mod
 from .cache import Cache
 from .config import PARSER_VERSION, Config
-from .engines import Engine, RequestSpec, get_engine
+from .engines import Engine, RequestSpec, _is_noise_result, get_engine
 from .extract import decode_bytes, extract, wrap_untrusted
 from .fusion import fuse
 from .governor import Governor
@@ -158,6 +158,14 @@ class Orchestrator:
                 engine=name, ok=False, error=f"parse error: {e}"[:200],
                 error_kind="parse", elapsed_ms=elapsed,
             )
+
+        # 5b) 结果后过滤：登录页/热搜榜/验证挑战页/已知仿冒站
+        #     （2026-10-14 全量测试复盘：baidu 前 2 条高频是
+        #     passport.baidu.com + top.baidu.com，搜 ChatGPT 返回过
+        #     cloudflare 验证页和 chatgpt-ai.com 仿冒站）。
+        #     放在 parse 之后、zero 判定之前：过滤后归零 = 这次没拿到
+        #     可用结果，按 soft failure 走，别把噪声当成功。
+        results = [r for r in results if not _is_noise_result(r.url)]
 
         if not results:
             # 解析出 0 条：软失败。可能是查询无匹配（正常），也可能是
