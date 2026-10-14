@@ -78,6 +78,43 @@ def test_circuit_closes_on_success(cfg):
     assert g.health("x").consecutive_fail == 0
 
 
+def test_ready_count_counts_expired_cooldown(cfg):
+    """冷却已过的 open 引擎必须算就绪——否则准入门和半开探测互相等死。
+
+    2026-10-14 实测死锁：冷启动预热全失败 → 14 引擎全 open，300s 冷却
+    过后 remaining=0 但状态还是 open，ready_count 全跳过 → 容量门永远
+    不放行 → allow_now 永不被调用 → half_open 永不发生 → 搜索永久
+    server_busy，只有重启能解。open→half_open 的转换只发生在
+    allow_now，放行入口必须先把这些引擎算进来。
+    """
+    g = Governor(cfg)
+    for name in ("a", "b"):
+        for _ in range(cfg.cb_failure_threshold):
+            g.record(name, False, 10, "boom")
+    # 冷却中：不算就绪
+    g.health("a").open_until = time.monotonic() + 100
+    g.health("b").open_until = time.monotonic() + 100
+    assert g.ready_count() == 0
+    # 冷却结束：算就绪（放它去吃半开探测那一枪）
+    g.health("a").open_until = time.monotonic() - 0.01
+    assert g.ready_count() == 1
+    g.health("b").open_until = time.monotonic() - 0.01
+    assert g.ready_count() == 2
+    # 且 allow_now 此时确实放行并翻 half_open
+    ok, reason = g.allow_now("a")
+    assert ok is True and reason == "half_open"
+
+
+def test_ready_count_skips_active_cooldown_even_with_tokens(cfg):
+    """真在冷却中的引擎，就算桶里有令牌也不算就绪。"""
+    g = Governor(cfg)
+    for _ in range(cfg.cb_failure_threshold):
+        g.record("x", False, 10, "boom")
+    g.health("x").open_until = time.monotonic() + 100
+    assert g.health("x").limiter.peek() >= 1.0  # 桶是满的
+    assert g.ready_count() == 0
+
+
 def test_cooldown_grows_exponentially(cfg):
     """重复触发熔断时冷却应该翻倍，避免刚恢复又被打。"""
     g = Governor(cfg)

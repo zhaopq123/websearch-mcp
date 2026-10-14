@@ -153,13 +153,22 @@ class Governor:
         用于准入层的容量感知：全枯竭时扇出必然空手而归。
         _h 为空（刚启动、预热还没建健康档案）时按"全部就绪"处理，
         避免启动期卡死。
+
+        ⚠️ 2026-10-14 修死锁：冷却已结束（open_until 已过）但状态还是
+        "open"的引擎**必须算就绪**。open→half_open 的转换只发生在
+        allow_now() 里，而 allow_now 只在真正扇出时被调用——容量门若把
+        这些引擎全跳过，就成了「门等引擎就绪、引擎等门放行」的互相等，
+        搜索永久 server_busy（冷启动预热失败时实测复现：14 引擎全
+        open，remaining=0 却谁都过不来，直到重启）。冷却结束即放行，
+        让 acquire→allow_now 自己去翻 half_open，成败由探测说话。
         """
         if not self._h:
             return 99
         n = 0
+        now = time.monotonic()
         for h in self._h.values():
-            if h.state == "open":
-                continue
+            if h.state == "open" and now < h.open_until:
+                continue  # 真在冷却中，不算
             if h.limiter.peek() >= 1.0:
                 n += 1
         return n
