@@ -424,3 +424,30 @@ def test_page_renders_pool_card_and_sub_toggle(client):
     assert "删除订阅" in body
     # 池子卡片必须明说「只读 / 程序维护」
     assert "只读" in body
+
+
+def test_health_reports_pool_when_no_subscription(tmp_path):
+    """只用自养池时，别再说「没配代理、只搜国内网站」。
+
+    这是线上实测到的真缺陷：池子里有可用的节点、墙外搜索是通的，
+    健康卡片却报「只搜国内网站」并让用户去填订阅链接 —— 结论错、
+    指引也错，还跟新加的池子卡片自相矛盾。
+    """
+    client = TestClient(_pool_app(tmp_path, n_alive=3, n_dead=1))
+    client.post("/api/login", json={"token": FAKE_PANEL_TOKEN})
+    d = client.get("/api/health-summary").json()
+    proxy = [i for i in d["items"] if "代理" in i["title"]]
+    assert proxy, "没有代理状态条目"
+    top = proxy[0]
+    assert top["level"] == "ok", f"池子可用却报了 {top['level']}：{top['title']}"
+    assert "节点池" in top["title"]
+    assert "只搜国内" not in top["title"]
+    assert "只搜国内" not in top["detail"]
+
+
+def test_health_still_warns_when_pool_empty(client):
+    """池子空 + 没订阅 → 仍然如实报 warn，且必须说「还能用」。"""
+    client.post("/api/login", json={"token": FAKE_PANEL_TOKEN})
+    d = client.get("/api/health-summary").json()
+    proxy = [i for i in d["items"] if "代理" in i["title"]]
+    assert proxy[0]["level"] == "warn"

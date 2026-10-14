@@ -305,28 +305,49 @@ def build_panel_app(store: Store, manager: ProxyManager, *,
                 "action": {"label": "启动搜索服务", "id": "start_search"},
             })
 
-        # 2) 代理/出网状态
+        # 2) 出网状态：**先看你自己的订阅代理，再看程序自养的节点池兜底**。
+        #    只看 manager.state 是不够的：用户「只用节点池」时 manager 没在
+        #    跑，但墙外搜索其实是通的 —— 那时报「只搜国内网站」是给错结论，
+        #    还会把用户误导去填订阅链接（线上实测踩到，与池子卡片自相矛盾）。
+        pool_alive = 0
+        if pool_db is not None:
+            try:
+                _p = read_pool_overview(pool_db, limit=1)
+                pool_alive = int((_p.get("stats") or {}).get("alive") or 0)
+            except Exception:
+                pool_alive = 0
+
         st = manager.state
-        if not st.running:
-            items.append({
-                "level": "warn", "title": "没有配置代理（只搜国内网站）",
-                "detail": ("现在能搜到百度、必应、360、微信等国内源。"
-                           "想搜 Google、DuckDuckGo 这些墙外源，需要填一个订阅链接。"),
-                "action": {"label": "去配置", "id": "focus_sub"},
-            })
-        elif st.last_check_ok:
+        if st.running and st.last_check_ok:
             items.append({
                 "level": "ok", "title": "代理工作正常，能访问墙外网站",
                 "detail": (f"出口 IP {st.exit_ip} {st.exit_country}"
                            if st.exit_ip else "已通过健康检查。"),
             })
-        else:
+        elif st.running:
             items.append({
                 "level": "error", "title": "代理配置了但连不上",
                 "detail": (f"原因：{st.last_error or '未知'}。"
                            "可能是节点失效或订阅过期 —— 换个节点或更新订阅。"
                            "搜索会自动降级为直连，不会完全用不了。"),
                 "action": {"label": "重新检测", "id": "recheck_proxy"},
+            })
+        elif pool_alive > 0:
+            items.append({
+                "level": "ok",
+                "title": (f"没配你自己的代理，但自养节点池在兜底"
+                          f"（{pool_alive} 个实测可用）"),
+                "detail": ("墙外搜索由服务自己搜集的免费节点池提供，现在是通的。"
+                           "这些节点寿命短、稳定性不如你自己订阅的机场；"
+                           "哪个通、哪个不通看下面「节点池」卡片。"),
+            })
+        else:
+            items.append({
+                "level": "warn", "title": "没有配置代理（只搜国内网站）",
+                "detail": ("现在能搜到百度、必应、360、微信等国内源。"
+                           "想搜 Google、DuckDuckGo 这些墙外源，可以填一个"
+                           "订阅链接；不填也行 —— 服务会自己搜集节点兜底。"),
+                "action": {"label": "去配置", "id": "focus_sub"},
             })
 
         # 3) 配置安全
