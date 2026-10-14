@@ -13,6 +13,19 @@ export PYTHONPATH="$APP/src"
 export WS_CONFIG_FILE="$APP/.env"
 export LOG_LEVEL="${LOG_LEVEL:-info}"
 
+# ── 日志轮转兜底（copytruncate）──
+# 面板崩了看门狗每 10s 重拉，日志由 >> 无限追加；起前兜底转存超限日志。
+# 必须 copytruncate（先 cp 后 > 截断），不能 mv：日志以 O_APPEND 打开，
+# 重命名会让后续进程继续写旧 inode，新文件永远为空。
+_rotate_log() {
+  local f="$1" max=$((1024 * 1024)) sz
+  [ -f "$f" ] || return 0
+  sz=$(stat -c %s "$f" 2>/dev/null || echo 0)
+  [ "$sz" -gt "$max" ] 2>/dev/null || return 0
+  cp -f "$f" "$f.1" 2>/dev/null || return 0
+  : > "$f"
+}
+
 # ── 自愈：清掉残留的孤儿面板 ──
 # proot 会话被冻/杀时，python 会变成 ppid=1 的孤儿继续占住 8500，
 # 本看门狗就会每 10s 起一次、绑不上端口、空转刷日志（实测踩到）。
@@ -24,4 +37,5 @@ for _ in $(seq 1 16); do
 done
 
 mkdir -p "$(dirname "$APP/panel.log")"
+_rotate_log "$APP/panel.log"
 exec "$APP/venv/bin/python" -m websearch.proxy.panel_server >> "$APP/panel.log" 2>&1

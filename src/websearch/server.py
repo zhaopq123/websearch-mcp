@@ -21,11 +21,17 @@ from .cache import Cache
 from .config import Config
 from .governor import Governor
 from .http_pool import HttpPool
+from .maintenance import Maintenance
 from .orchestrator import Orchestrator
 
 log = logging.getLogger("websearch")
 
 _START_TS = time.time()
+
+
+def _app_dir() -> Path:
+    """仓库根目录（本文件上溯三级：<app>/src/websearch/server.py）。"""
+    return Path(__file__).resolve().parents[2]
 
 
 # ══════════════════════ 鉴权 ══════════════════════
@@ -186,6 +192,13 @@ class Service:
         # 死节点自愈：上一次换节点的时刻（单调钟），用于冷却防抖
         self._last_node_recover_mono = 0.0
         self.hunter = self._build_hunter(cfg)
+        # 垃圾数据自动清理（低频 janitor，见 maintenance.py）
+        try:
+            self.maintenance = Maintenance.from_env(
+                data_dir=cfg.cache_path(), app_dir=_app_dir())
+        except Exception as e:
+            log.warning("维护器初始化失败（不影响搜索）: %s", e)
+            self.maintenance = None
 
     def _build_hunter(self, cfg: Config):
         """构造节点猎手 + 本地节点代理。任何失败都不该拖垮搜索服务。"""
@@ -947,6 +960,14 @@ async def _warmup_now() -> None:
             log.warning("节点猎手循环启动失败（不影响搜索）: %s", e)
     else:
         log.info("节点猎手持续搜索未启用（WS_NODE_HUNT=0）")
+    # 启动垃圾数据自动清理：runs 表 / WAL / 日志 / 超限备份，低频循环
+    if svc.maintenance is not None:
+        try:
+            svc.maintenance.start()
+            log.info("垃圾数据自动清理已启动：每 %ds 一轮（runs/WAL/日志/备份）",
+                     int(svc.maintenance.interval_sec))
+        except Exception as e:
+            log.warning("维护循环启动失败（不影响搜索）: %s", e)
 
 
 def build_asgi(cfg: Config):
