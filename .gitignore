@@ -5,6 +5,9 @@ __pycache__/
 cache/
 service.log
 *.log
+# 轮转产物（maintenance 保留 .1/.2）。`*.log` 匹配不到 `panel.log.1`
+# （模式要整段匹配 basename），不补这行每次轮转都会把 git status 弄脏
+*.log.*
 .tokens
 *.bak-*
 *-out.txt
