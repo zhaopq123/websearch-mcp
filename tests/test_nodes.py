@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from websearch.http_pool import BlockedRedirectError
 from websearch.nodes import sources as node_sources
-from websearch.nodes.pool import NodePool, fingerprint
+from websearch.nodes.pool import NodePool, fingerprint, read_pool_overview
 from websearch.nodes.sources import (
     SourceFetcher,
     _looks_like_subscription_url,
@@ -722,3 +722,72 @@ def test_alive_rate_ema_needs_samples(tmp_path):
     # 有样本后才更新
     h._update_alive_rate(100, 5)
     assert 0.04 < h._alive_rate_ema < 0.06
+
+
+# ══════════════════════ 节点池只读读取器（面板画灯用）══════════════════════
+
+
+def _fp_of(host: str) -> str:
+    """从 _node() 的同一份构造推导指纹 —— 别手写一份，改了 _node 这里会漂。"""
+    _, proto, fields = _node(host)
+    return fingerprint(proto, fields)
+
+
+def test_read_pool_overview_missing_db_is_safe(tmp_path):
+    """库还没生成 → 明确说「还没有」，绝不顺手建一个。"""
+    db = tmp_path / "nodes.sqlite3"
+    r = read_pool_overview(db)
+    assert r["available"] is False
+    assert r["nodes"] == [] and r["stats"] == {}
+    assert "note" in r
+    assert not db.exists(), "只读读取器不该创建节点库"
+
+
+def test_read_pool_overview_reports_lights(tmp_path):
+    """面板要的就是「哪个通、哪个不通」—— alive 必须如实带出来。"""
+    pool = NodePool(tmp_path / "nodes.sqlite3")
+    pool.upsert_nodes([_node("up.example.com")], "s1", pool="free")
+    pool.upsert_nodes([_node("down.example.com")], "s2", pool="free")
+    pool.record_probe(_fp_of("up.example.com"), True, 120)   # 标记存活
+    pool.close()
+
+    r = read_pool_overview(tmp_path / "nodes.sqlite3")
+    assert r["available"] is True
+    assert r["stats"]["total"] == 2
+    assert r["stats"]["alive"] == 1
+    assert r["stats"]["by_pool"]["free"]["total"] == 2
+    lights = {n["server"]: n["alive"] for n in r["nodes"]}
+    assert lights == {"up.example.com": True, "down.example.com": False}
+    # 活的排前面 —— 用户扫一眼就看见能用的
+    assert r["nodes"][0]["server"] == "up.example.com"
+    # 绝不带凭据
+    assert "password" not in r["nodes"][0]
+
+
+def test_read_pool_overview_only_alive_filter(tmp_path):
+    pool = NodePool(tmp_path / "nodes.sqlite3")
+    pool.upsert_nodes([_node("up.example.com")], "s1", pool="free")
+    pool.upsert_nodes([_node("down.example.com")], "s2", pool="free")
+    pool.record_probe(_fp_of("up.example.com"), True, 50)
+    pool.close()
+
+    r = read_pool_overview(tmp_path / "nodes.sqlite3", only_alive=True)
+    assert [n["server"] for n in r["nodes"]] == ["up.example.com"]
+
+
+def test_read_pool_overview_never_writes(tmp_path):
+    """只读是硬约束：面板是独立进程，读一眼不该动服务端正在用的库。"""
+    db = tmp_path / "nodes.sqlite3"
+    pool = NodePool(db)
+    pool.upsert_nodes([_node("a.example.com")], "s1", pool="free")
+    pool.close()
+    before_size = db.stat().st_size
+    before_mtime = db.stat().st_mtime_ns
+
+    read_pool_overview(db, limit=10)
+
+    assert db.stat().st_size == before_size
+    assert db.stat().st_mtime_ns == before_mtime
+    # 也没有额外落一个 WAL（只读连接不会触发 WAL 恢复/写入）
+    assert not (tmp_path / "nodes.sqlite3-wal").exists() or \
+        (tmp_path / "nodes.sqlite3-wal").stat().st_size == 0

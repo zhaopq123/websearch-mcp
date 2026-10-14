@@ -652,3 +652,89 @@ class NodePool:
             best=self.best(), source_count=src_total, healthy_sources=src_ok,
             last_run=last_run, db_bytes=db_bytes,
         )
+
+
+# ══════════════════ 只读读取器（管理面板用）══════════════════
+
+def read_pool_overview(db_path: Path | str, *, limit: int = 60,
+                       only_alive: bool = False,
+                       pool: str = "") -> dict[str, Any]:
+    """**只读**读节点库，给管理面板画灯用。
+
+    为什么不直接 new 一个 NodePool：构造函数会 `_ensure()` 建表、
+    `_migrate()` 改库、`_secure()` chmod —— 而面板是**独立进程**，
+    只为了在页面上画个灯就去动服务端正在用的库，风险远大于收益。
+
+    这里用 `file:...?mode=ro` 打开：不建表、不迁移、不改权限、不拿写锁，
+    连 sqlite 自己的 WAL 恢复也不会做（只读连接不允许）。服务端在写、
+    面板在读，两边互不干扰。
+
+    幂等且**绝不抛异常**：面板页面不该因为库没生成/被锁就 500。
+
+    权限模型（用户定的，勿改）：自养池是**程序自己跑的**，用户只能看。
+    所以本函数是纯读，面板上也不给任何增删入口。
+    """
+    p = Path(db_path)
+    empty = {"available": False, "stats": {}, "nodes": []}
+    if not p.exists():
+        return {**empty, "note": "节点库还没生成（服务跑过一轮搜索后才会有）"}
+    try:
+        uri = p.resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=3.0)
+    except Exception as e:
+        log.warning("只读打开节点库失败: %s", type(e).__name__)
+        return {**empty, "note": f"节点库打不开（{type(e).__name__}）"}
+    try:
+        def _one(sql: str, args: tuple = ()) -> int:
+            row = conn.execute(sql, args).fetchone()
+            return int(row[0] or 0) if row else 0
+
+        total = _one("SELECT COUNT(*) FROM nodes")
+        alive = _one("SELECT COUNT(*) FROM nodes WHERE alive=1")
+        untested = _one("SELECT COUNT(*) FROM nodes WHERE last_probe_at=0")
+        by_pool: dict[str, dict[str, int]] = {}
+        for name in ("cust", "free"):
+            t = conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(alive=1),0),"
+                " COALESCE(SUM(last_probe_at=0),0) FROM nodes WHERE pool=?",
+                (name,),
+            ).fetchone()
+            by_pool[name] = {"total": t[0] or 0, "alive": t[1] or 0,
+                             "untested": t[2] or 0}
+
+        where, args = "WHERE 1=1", []
+        if only_alive:
+            where += " AND alive=1"
+        if pool in ("cust", "free"):
+            where += " AND pool=?"
+            args.append(pool)
+        # 活的排前面，其次按延迟；没测过的（avg_ms=0）排最后
+        rows = conn.execute(
+            f"SELECT protocol, server, port, country, tag, avg_ms, alive,"
+            f" ok_count, fail_count, last_ok_at, pool FROM nodes {where}"
+            f" ORDER BY alive DESC,"
+            f" (CASE WHEN avg_ms>0 THEN avg_ms ELSE 99999 END) ASC LIMIT ?",
+            (*args, int(limit)),
+        ).fetchall()
+    except sqlite3.Error as e:
+        log.warning("读节点库失败: %s", e)
+        return {**empty, "note": f"节点库读取失败（{e}）"}
+    finally:
+        conn.close()
+
+    return {
+        "available": True,
+        "stats": {"total": total, "alive": alive,
+                  "dead": max(0, total - alive - untested),
+                  "untested": untested, "by_pool": by_pool},
+        "nodes": [
+            {
+                "protocol": r[0], "server": r[1], "port": r[2],
+                "country": r[3] or "", "tag": r[4] or "",
+                "avg_ms": int(r[5] or 0), "alive": bool(r[6]),
+                "ok_count": r[7] or 0, "fail_count": r[8] or 0,
+                "last_ok_at": r[9] or 0, "pool": r[10] or "free",
+            }
+            for r in rows
+        ],
+    }

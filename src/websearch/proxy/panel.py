@@ -22,8 +22,6 @@ from __future__ import annotations
 import asyncio
 import html
 import json
-import asyncio
-import json
 import logging
 import os
 import secrets
@@ -35,6 +33,7 @@ from starlette.applications import Starlette
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 from starlette.routing import Route
 
+from ..nodes.pool import read_pool_overview
 from .manager import ProxyManager
 from .store import ConfigError, Store
 from .subparse import SubscriptionError
@@ -154,9 +153,31 @@ def _read_mcp_token() -> str:
     return ""
 
 
-def build_panel_app(store: Store, manager: ProxyManager, *, require_token: bool = True):
-    """构造面板 ASGI 应用。"""
+def build_panel_app(store: Store, manager: ProxyManager, *,
+                    require_token: bool = True,
+                    pool_db: Path | str | None = None):
+    """构造面板 ASGI 应用。
+
+    pool_db：节点库路径。面板是独立进程，读池走**只读** sqlite 连接
+    （见 nodes.pool.read_pool_overview），不依赖搜索服务在线。留空则按
+    与搜索服务相同的配置解析（WS_CACHE_DIR/nodes.sqlite3）。
+    """
     panel = Panel(store, manager)
+    if pool_db is None:
+        # 不能走 Config.from_env()：那只读环境变量，而 WS_CACHE_DIR 在
+        # start-mcp.sh 里是给**搜索服务**导出的，面板进程拿不到 ——
+        # 会解析到系统临时目录，池子卡片永远是空的。
+        # Store.get 的优先级是「环境变量 > .env > 默认值」，才对得上
+        # 搜索服务实际用的那个库。默认值取配置文件同级目录下的 cache/
+        # （与 start-mcp.sh 的 ${WS_CACHE_DIR:-$APP/cache} 一致）。
+        try:
+            cache_dir = store.get("WS_CACHE_DIR", "")
+            base = (Path(cache_dir) if cache_dir
+                    else Path(store.path).resolve().parent / "cache")
+            pool_db = base / "nodes.sqlite3"
+        except Exception as e:            # 解析失败不该让面板起不来
+            log.warning("解析节点库路径失败（节点池卡片将不可用）: %s", e)
+            pool_db = None
 
     def client_ip(request) -> str:
         # 不信任 X-Forwarded-For（面板直接暴露，没有可信代理在前面）
@@ -595,6 +616,37 @@ def build_panel_app(store: Store, manager: ProxyManager, *, require_token: bool 
             return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
         return JSONResponse({"ok": True, "nodes": manager.list_nodes()})
 
+    async def api_pool(request):
+        """自养节点池概览 —— **只读**，给面板画灯。
+
+        权限模型（用户定的，勿改）：自养池是程序自己搜来、自己实测维护的，
+        用户**只能看**，不能碰。所以这里没有 POST、没有增删改，页面上也不
+        给任何入口 —— 唯一动作是把灯点亮，让用户知道哪个通、哪个不通。
+
+        走只读 sqlite（不是 MCP、不是搜索服务的接口），因为面板是独立进程：
+        搜索服务挂了/在重启时，池子的历史状态照样能看。
+        """
+        if not authed(request):
+            return JSONResponse({"ok": False, "error": "unauthorized"},
+                                status_code=401)
+        if pool_db is None:
+            return JSONResponse({"ok": False, "available": False,
+                                 "note": "节点库路径未解析（面板配置受限）"})
+        try:
+            limit = int(request.query_params.get("limit", "60"))
+        except ValueError:
+            limit = 60
+        limit = max(1, min(limit, 200))
+        only_alive = request.query_params.get("only_alive") in ("1", "true")
+        try:
+            data = read_pool_overview(pool_db, limit=limit,
+                                     only_alive=only_alive)
+        except Exception as e:            # 兜底：面板页面不该 500
+            log.warning("读节点池失败: %s", e)
+            return JSONResponse({"ok": False, "available": False,
+                                 "note": f"节点池读取失败（{type(e).__name__}）"})
+        return JSONResponse({"ok": True, **data})
+
     # ── 路由 ──
 
     routes = [
@@ -614,6 +666,8 @@ def build_panel_app(store: Store, manager: ProxyManager, *, require_token: bool 
         Route("/api/proxy/stop", api_proxy_stop, methods=["POST"]),
         Route("/api/proxy/check", api_proxy_check, methods=["POST"]),
         Route("/api/proxy/nodes", api_proxy_nodes),
+        # 自养节点池：只读，仅用于展示「哪个通/哪个不通」
+        Route("/api/pool", api_pool),
         # 健康探活：不回显任何状态，专供不带口令的监控
         Route("/healthz", lambda r: JSONResponse({"ok": True})),
     ]
@@ -740,27 +794,45 @@ td:first-child{color:#8b93a3;width:38%}
   </div>
 
   <div class="card">
-    <h2>机场订阅</h2>
+    <h2>你自己的订阅（可增可删）</h2>
     <p class="hint">填入你的订阅链接。它只写入本机 600 权限文件，不会上传到任何地方。</p>
     <label for="sub">订阅链接</label>
-    <input id="sub" type="password" placeholder="留空 = 不修改现有订阅"
-           autocomplete="off" spellcheck="false">
-    <div class="warn">当前订阅：<span id="curSub">未配置</span>　（只显示掩码与域名，用于确认你配的是哪个机场）</div>
+    <div class="row">
+      <input id="sub" type="password" placeholder="留空 = 不修改现有订阅　（点右边可显示）"
+             autocomplete="off" spellcheck="false">
+      <button class="ghost" id="btnShowSub" type="button"
+              style="flex:0 0 auto;min-width:0">显示</button>
+    </div>
+    <div class="warn">当前订阅：<span id="curSub">未配置</span>　
+      出于安全只显示掩码与域名。<b>保存后输入框会清空，这是正常的（不是没存上）</b> ——
+      要删掉它，点下面的「删除订阅」。</div>
     <label for="httpPort">本地 HTTP 代理端口</label>
     <input id="httpPort" type="number" min="1024" max="65535">
     <label for="socksPort">本地 SOCKS5 端口</label>
     <input id="socksPort" type="number" min="1024" max="65535">
     <div class="btns">
       <button id="btnSave">保存</button>
-      <button class="danger" id="btnClear">清除订阅</button>
+      <button class="danger" id="btnClear">删除订阅</button>
     </div>
     <div class="msg" id="saveMsg"></div>
   </div>
 
   <div class="card">
-    <h2>节点列表</h2>
-    <p class="hint">只显示名称与协议。凭据不出现在页面里。</p>
-    <div id="nodes"><span style="color:#8b93a3">代理未启动</span></div>
+    <h2>订阅里的节点</h2>
+    <p class="hint">你订阅解析出来的节点（只显示名称与协议）。凭据不出现在页面里。</p>
+    <div id="nodes"><span style="color:#8b93a3">未配置订阅 / 代理未启动</span></div>
+  </div>
+
+  <div class="card" id="poolCard">
+    <h2>节点池（程序自动维护 · 只读）</h2>
+    <p class="hint">这些是服务自己满世界搜来、并逐一实测过出网的节点，用来给墙外搜索兜底。
+      你只能看 —— 🟢通 / ⚪不通。它们的搜集与淘汰由程序负责，页面不提供任何增删入口。</p>
+    <div id="poolStats" class="mono" style="color:#8b93a3">加载中…</div>
+    <div class="btns" style="margin-top:12px">
+      <button class="ghost" id="btnPoolAlive">只看可用的</button>
+      <button class="ghost" id="btnPoolRefresh">刷新</button>
+    </div>
+    <div id="pool"></div>
   </div>
 
   <div class="card" id="connectCard">
@@ -814,18 +886,36 @@ async function post(url,body){
   return r.json();
 }
 
+// 订阅链接默认打码 —— 但用户得能确认自己到底粘了什么，所以给一个显示开关
+$('btnShowSub').onclick=()=>{
+  const i=$('sub'),show=i.type==='password';
+  i.type=show?'text':'password';
+  $('btnShowSub').textContent=show?'隐藏':'显示';
+};
+function resetSubField(){
+  $('sub').value='';$('sub').type='password';$('btnShowSub').textContent='显示';
+}
+function subLabel(s){
+  return s&&s.configured?`${s.masked}${s.host?' @ '+s.host:''}`:'未配置';
+}
 $('btnSave').onclick=async()=>{
   const b={};
   if($('sub').value.trim())b.subscription_url=$('sub').value.trim();
   b.http_port=+$('httpPort').value; b.socks_port=+$('socksPort').value;
   const d=await post('/api/save',b);
-  setMsg($('saveMsg'),d.ok?'已保存。可点「启动代理」生效。':(d.error||'保存失败'),d.ok);
-  if(d.ok){$('sub').value='';load();}
+  if(!d.ok){setMsg($('saveMsg'),d.error||'保存失败',false);return;}
+  // 别静默清空 —— 明确告诉用户「存进去了、现在存的是哪个」
+  const s=(d.config&&d.config.subscription)||{};
+  setMsg($('saveMsg'),
+    b.subscription_url?`已保存：${subLabel(s)}　（可点「启动代理」生效）`
+                      :'已保存。可点「启动代理」生效。',true);
+  resetSubField();load();
 };
 $('btnClear').onclick=async()=>{
-  if(!confirm('确定清除订阅并停止代理？'))return;
+  if(!confirm('删除订阅？\n\n会清掉本机保存的订阅链接并停止代理。\n（搜索服务的自养节点池不受影响。）'))return;
   const d=await post('/api/subscription/clear');
-  setMsg($('saveMsg'),d.ok?'已清除':(d.error||'失败'),d.ok);load();
+  setMsg($('saveMsg'),d.ok?'订阅已删除（输入框和上方状态都已清空）':(d.error||'删除失败'),d.ok);
+  resetSubField();load();
 };
 $('btnStart').onclick=async()=>{
   setMsg($('statusMsg'),'启动中…',true);
@@ -844,10 +934,45 @@ $('btnCheck').onclick=async()=>{
 async function loadNodes(){
   const r=await fetch('/api/proxy/nodes');
   const d=await r.json();
-  if(!d.nodes||!d.nodes.length){$('nodes').innerHTML='<span style="color:#8b93a3">暂无节点（先启动代理）</span>';return;}
+  if(!d.nodes||!d.nodes.length){$('nodes').innerHTML='<span style="color:#8b93a3">未配置订阅 / 代理未启动</span>';return;}
   $('nodes').innerHTML='<table>'+d.nodes.map(n=>
-    `<tr><td>${n.tag}</td><td><span class="mono">${n.protocol}</span></td></tr>`).join('')+'</table>';
+    `<tr><td>${esc(n.tag)}</td><td><span class="mono">${esc(n.protocol)}</span></td></tr>`).join('')+'</table>';
 }
+// 池子里的 server/country 来自**第三方公开源**，是不可信输入 → 必须转义再进 innerHTML
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,
+  c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+
+// ── 自养节点池（只读：只看哪个通、哪个不通）──
+let poolOnlyAlive=false;
+function lamp(a){return a?'<span class="badge b-ok">🟢 通</span>'
+                         :'<span class="badge b-off">⚪ 不通</span>';}
+async function loadPool(){
+  const st=$('poolStats'),box=$('pool');
+  let d={};
+  try{
+    const r=await fetch('/api/pool?limit=60'+(poolOnlyAlive?'&only_alive=1':''));
+    if(r.status===401)return;
+    d=await r.json();
+  }catch(e){st.textContent='节点池读取失败（网络错误）';box.innerHTML='';return;}
+  if(!d.ok||!d.available){st.textContent=d.note||'节点池不可用';box.innerHTML='';return;}
+  const s=d.stats||{},by=s.by_pool||{},free=by.free||{},cust=by.cust||{};
+  const rate=s.total?Math.round(s.alive/s.total*100):0;
+  st.innerHTML=`共 <b>${s.total}</b> 个 · 🟢通 <b>${s.alive}</b> · ⚪不通 ${s.dead} ·`
+    +` 待测 ${s.untested} · 存活率 ${rate}%`
+    +`<br>自养池 ${free.total||0}（通 ${free.alive||0}）`
+    +(cust.total?`　订阅池 ${cust.total}（通 ${cust.alive||0}）`:'');
+  if(!d.nodes.length){box.innerHTML='<span style="color:#8b93a3">暂无节点</span>';return;}
+  box.innerHTML='<table>'+d.nodes.map(n=>
+    `<tr><td style="width:34%">${lamp(n.alive)} <span class="mono">${esc(n.protocol)}</span></td>
+      <td>${esc(n.country)||'—'}${n.avg_ms?` <span class="mono">${n.avg_ms}ms</span>`:''}
+      <div class="mono" style="color:#6b7280">${esc(n.server)}:${esc(n.port)}</div></td></tr>`).join('')+'</table>';
+}
+$('btnPoolAlive').onclick=()=>{
+  poolOnlyAlive=!poolOnlyAlive;
+  $('btnPoolAlive').textContent=poolOnlyAlive?'看全部':'只看可用的';
+  loadPool();
+};
+$('btnPoolRefresh').onclick=loadPool;
 $('logout').onclick=async()=>{await post('/api/logout');location.href='/login';};
 
 // ── 接入 AI 客户端（最后一公里）──
@@ -913,8 +1038,8 @@ async function doAction(id,btn){
     btn.textContent=old; btn.disabled=false; return;
   }
   btn.textContent=old; btn.disabled=false;
-  loadHealth(); load(); loadNodes();
+  loadHealth(); load(); loadNodes(); loadPool();
 }
 $('btnRefreshHealth').onclick=()=>loadHealth();
-load();loadNodes();loadSnippets();loadHealth();
+load();loadNodes();loadSnippets();loadHealth();loadPool();
 </script></body></html>"""

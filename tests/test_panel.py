@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import pytest
 from starlette.testclient import TestClient
 
+from websearch.nodes.pool import fingerprint
 from websearch.proxy.manager import ProxyManager
 from websearch.proxy.panel import build_panel_app
 from websearch.proxy.store import ConfigError, Store
@@ -160,7 +161,7 @@ def test_check_gitignored_passes_when_present(tmp_path):
 
 def test_api_requires_auth(client):
     """未登录访问任何 API 都是 401。"""
-    for path in ("/api/config", "/api/proxy/nodes"):
+    for path in ("/api/config", "/api/proxy/nodes", "/api/pool"):
         r = client.get(path)
         assert r.status_code == 401, f"{path} 未鉴权！"
     for path in ("/api/save", "/api/proxy/start", "/api/proxy/stop",
@@ -304,3 +305,122 @@ def test_proxy_nodes_empty_when_not_started(client):
     r = client.get("/api/proxy/nodes")
     assert r.status_code == 200
     assert r.json()["nodes"] == []
+
+
+# ══════════════════ 节点池卡片（只读） ══════════════════
+#
+# 权限模型（用户定的）：自养池是程序自己跑的，用户**只能看**，不能碰。
+# 所以这里钉死两件事：① 有灯（哪个通/哪个不通）② 绝不给写入口。
+
+
+def _pool_app(tmp_path, n_alive=1, n_dead=1):
+    """造一个带节点库的面板 —— 模拟「面板进程读服务端正在用的库」。"""
+    from websearch.nodes.pool import NodePool
+    store = Store(tmp_path / ".env")
+    store.set_many({"WS_PANEL_TOKEN": FAKE_PANEL_TOKEN})
+    db = tmp_path / "cache" / "nodes.sqlite3"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    pool = NodePool(db)
+    nodes = [("alive%d.example.com" % i, "ss",
+              {"server": "alive%d.example.com" % i, "server_port": 443,
+               "method": "aes-256-gcm", "password": "pw"})
+             for i in range(n_alive)]
+    nodes += [("dead%d.example.com" % i, "ss",
+               {"server": "dead%d.example.com" % i, "server_port": 443,
+                "method": "aes-256-gcm", "password": "pw"})
+              for i in range(n_dead)]
+    pool.upsert_nodes(nodes, "s1", pool="free")
+    for i in range(n_alive):
+        host = "alive%d.example.com" % i
+        pool.record_probe(fingerprint("ss", {
+            "server": host, "server_port": 443,
+            "method": "aes-256-gcm", "password": "pw"}), True, 80 + i)
+    pool.close()
+    mgr = ProxyManager(tmp_path / "proxy-run", singbox_bin="/nonexistent/sing-box")
+    return build_panel_app(store, mgr, pool_db=db)
+
+
+def test_pool_card_shows_lights(tmp_path):
+    client = TestClient(_pool_app(tmp_path, n_alive=2, n_dead=1))
+    client.post("/api/login", json={"token": FAKE_PANEL_TOKEN})
+    r = client.get("/api/pool")
+    assert r.status_code == 200
+    d = r.json()
+    assert d["ok"] is True and d["available"] is True
+    assert d["stats"]["total"] == 3 and d["stats"]["alive"] == 2
+    assert sum(1 for n in d["nodes"] if n["alive"]) == 2
+    # 活的排前面
+    assert d["nodes"][0]["alive"] is True
+    # 不给凭据
+    assert "password" not in json.dumps(d)
+
+
+def test_pool_card_missing_db_is_graceful(client):
+    """库没生成也要给个人话说明，不能 500。"""
+    client.post("/api/login", json={"token": FAKE_PANEL_TOKEN})
+    r = client.get("/api/pool")
+    assert r.status_code == 200
+    d = r.json()
+    assert d["ok"] is True and d["available"] is False
+    assert d.get("note")
+
+
+def test_pool_api_is_readonly(client):
+    """用户不能碰自养池：没有 POST/PUT/DELETE，只有 GET。"""
+    client.post("/api/login", json={"token": FAKE_PANEL_TOKEN})
+    for method in ("post", "put", "delete", "patch"):
+        fn = getattr(client, method)
+        # TestClient.delete 不吃 json=，单独走一次
+        r = fn("/api/pool") if method == "delete" else fn("/api/pool", json={})
+        assert r.status_code in (405, 404), f"{method.upper()} /api/pool 竟然被接受"
+
+
+def test_pool_card_only_alive_filter(tmp_path):
+    client = TestClient(_pool_app(tmp_path, n_alive=2, n_dead=3))
+    client.post("/api/login", json={"token": FAKE_PANEL_TOKEN})
+    d = client.get("/api/pool?only_alive=1").json()
+    assert len(d["nodes"]) == 2 and all(n["alive"] for n in d["nodes"])
+
+
+# ══════════════════ 订阅：能增也能删 ══════════════════
+
+
+def test_clear_subscription_actually_removes_it(store, client):
+    """「只能写不能删」的反向回归：删完必须真的没了。"""
+    client.post("/api/login", json={"token": FAKE_PANEL_TOKEN})
+    assert store.read_public()["subscription"]["configured"] is True
+
+    r = client.post("/api/subscription/clear")
+    assert r.status_code == 200 and r.json()["ok"] is True
+    assert store.read_public()["subscription"]["configured"] is False
+    # 面板再读也不能把它读回来
+    assert client.get("/api/config").json()["config"]["subscription"]["configured"] is False
+
+
+def test_save_then_clear_roundtrip(client, store):
+    """保存 → 覆盖 → 删除 三步都通，且全程不回显原文。"""
+    client.post("/api/login", json={"token": FAKE_PANEL_TOKEN})
+    new_sub = "https://sub.another-airport.net/api?token=SECONDsecret"
+    r = client.post("/api/save", json={"subscription_url": new_sub})
+    assert r.status_code == 200 and r.json()["ok"] is True
+    body = r.text
+    assert "SECONDsecret" not in body, "保存接口回显了订阅 token"
+    assert store.get("WS_SUBSCRIPTION_URL") == new_sub
+
+    assert client.post("/api/subscription/clear").json()["ok"] is True
+    assert store.get("WS_SUBSCRIPTION_URL", "") == ""
+
+
+def test_page_renders_pool_card_and_sub_toggle(client):
+    """页面模板别写坏：节点池卡片、显示开关、删除订阅按钮都得在。"""
+    client.post("/api/login", json={"token": FAKE_PANEL_TOKEN})
+    r = client.get("/")
+    assert r.status_code == 200
+    body = r.text
+    for marker in ('id="poolCard"', 'id="poolStats"', 'btnPoolAlive',
+                   'id="btnShowSub"', 'id="btnClear"', 'loadPool()'):
+        assert marker in body, f"页面缺少 {marker}"
+    # 删除按钮的文案必须是「删除订阅」，不能再说「清除订阅」这种含糊话
+    assert "删除订阅" in body
+    # 池子卡片必须明说「只读 / 程序维护」
+    assert "只读" in body
