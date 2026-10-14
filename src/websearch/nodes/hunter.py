@@ -353,8 +353,29 @@ class NodeHunter:
         out: list[dict[str, str]] = []
         seen: set[str] = set()
 
+        # 无贡献源黑名单。判据：抓过 >=DEAD_SOURCE_MIN_FAILS 次，累计贡献
+        # （解析出的节点数，或 page 源挖出的订阅链接数）仍然是 0。
+        # 为什么必须在**这里**拦：主循环紧接着会 `source_list[:max_sources]`
+        # 截断，无用源会实打实挤掉有用源的名额；而且搜索发现每轮都会把
+        # 游戏站/词典站（爱奇艺类聚合页、4399/7k7k、cambridge/iciba…）
+        # 重新塞回来，只在历史源上做过滤挡不住。
+        # 历史背景（2026-10-14）：page 源抓取成功一律记 ok，`source_health`
+        # 按 ok/(ok+fail) 排序，于是「返回 200 但一条链接都挖不出」的站点
+        # 长期霸占榜首、每轮必抓 —— 62 个源里只有 25 个有产出。
+        health = self.pool.source_health(limit=200)
+        dead_sids = {
+            s["sid"] for s in health
+            if (s.get("nodes_found") or 0) == 0
+            and ((s.get("ok") or 0) + (s.get("fail") or 0)) >= DEAD_SOURCE_MIN_FAILS
+        }
+        dead_skipped = 0
+
         def add(url: str, kind: str, note: str = "") -> None:
+            nonlocal dead_skipped
             if not url or url in seen:
+                return
+            if source_id(url) in dead_sids:
+                dead_skipped += 1
                 return
             seen.add(url)
             out.append({"url": url, "kind": kind, "note": note})
@@ -363,12 +384,10 @@ class NodeHunter:
             add(s["url"], s.get("kind", "sub"), s.get("note", ""))
 
         # 历史源：健康度高的在前（失败多的自然沉底）
-        for s in self.pool.source_health(limit=60):
-            # 死源（从未成功且反复失败）不再重抓，避免挤占预算空转
-            if (s.get("ok") or 0) == 0 and (s.get("fail") or 0) >= DEAD_SOURCE_MIN_FAILS:
-                continue
+        for s in health[:60]:
             kind = s.get("kind") or "sub"
             add(s["url"], kind, "history")
+        report["sources_dead_skipped"] = dead_skipped
 
         # 搜索自举：发现新聚合站（页面类）
         if discover and self.orch is not None:
@@ -405,23 +424,49 @@ class NodeHunter:
             # 按实际内容形态决定处理方式（源声明可能不准）
             ck = r.content_kind
             if ck == "page" or kind == "page":
-                # 页面：提取订阅链接，回填成下一层源
-                subs = extract_subscription_urls(r.text, url)
-                report["sources_ok"] += 1
-                self.pool.record_source_fetch(sid, True, nodes_found=0)
+                # 页面：提取订阅链接，回填成下一层源。
+                # 页面源的「贡献」= 挖出的订阅链接数。原来这里一律记
+                # `ok=True, nodes_found=0`，把「返回 200 但一个链接都没有」
+                # 也算成功 —— 于是游戏站/词典站永远排在健康榜前列被反复抓。
+                # 现在挖不出链接就记失败，交给无贡献源黑名单自然淘汰。
+                subs = [su for su in extract_subscription_urls(r.text, url)
+                        if su != url]
+                if subs:
+                    report["sources_ok"] += 1
+                    self.pool.record_source_fetch(sid, True,
+                                                  nodes_found=len(subs))
+                else:
+                    report["sources_fail"] += 1
+                    self.pool.record_source_fetch(sid, False,
+                                                  error="no_sub_links")
                 for su in subs:
-                    if su != url:
-                        second_wave.append({"url": su, "kind": "sub",
-                                            "note": "extracted"})
+                    second_wave.append({"url": su, "kind": "sub",
+                                        "note": "extracted"})
                 return
             if ck in ("sub", "unknown"):
                 # 订阅内容：解析
+                from ..proxy.subparse import SubscriptionError
                 try:
                     n, added = self._ingest_text(r.text, sid)
+                except SubscriptionError:
+                    # 解析器对「空内容 / 一行节点都没有 / 订阅已失效」
+                    # 一律抛 SubscriptionError（属于源没货，不是代码 bug）。
+                    # 归一成 empty_sub：源健康表里能一眼区分「没货」
+                    # 与真正的解析异常，也喂给无贡献源黑名单淘汰。
+                    report["sources_fail"] += 1
+                    self.pool.record_source_fetch(sid, False,
+                                                  error="empty_sub")
+                    return
                 except Exception as e:
                     report["sources_fail"] += 1
                     self.pool.record_source_fetch(
                         sid, False, error=f"parse:{type(e).__name__}")
+                    return
+                # 解析出 0 个节点 = 这份内容里根本没有节点行（页面被换成
+                # 博客/登录页、或订阅已失效），记 ok 会让它永远绿着。
+                if n <= 0:
+                    report["sources_fail"] += 1
+                    self.pool.record_source_fetch(sid, False, error="empty_sub")
                     return
                 report["sources_ok"] += 1
                 report["parsed"] += n

@@ -395,11 +395,14 @@ async def test_build_sources_skips_dead_sources(tmp_path):
     from websearch.nodes.probe import NodeProber
 
     pool = NodePool(tmp_path / "p.sqlite3")
-    pool.upsert_source("dead_sid", "https://junk.example/dead", "page")
+    dead_url = "https://junk.example/dead"
+    pool.upsert_source(source_id(dead_url), dead_url, "page")
     for _ in range(DEAD_SOURCE_MIN_FAILS):
-        pool.record_source_fetch("dead_sid", False, error="fetch fail")
-    pool.upsert_source("ok_sid", "https://good.example/sub.txt", "sub")
-    pool.record_source_fetch("ok_sid", True, nodes_found=12)
+        pool.record_source_fetch(source_id(dead_url), False, error="fetch fail")
+    pool.upsert_source(source_id("https://good.example/sub.txt"),
+                       "https://good.example/sub.txt", "sub")
+    pool.record_source_fetch(source_id("https://good.example/sub.txt"),
+                             True, nodes_found=12)
 
     hunter = NodeHunter(
         pool=pool, fetcher=SourceFetcher(timeout=1),
@@ -411,15 +414,145 @@ async def test_build_sources_skips_dead_sources(tmp_path):
 
     # 反例：还没到阈值（失败 DEAD-1 次）仍应保留，避免误伤偶发失败
     pool2 = NodePool(tmp_path / "p2.sqlite3")
-    pool2.upsert_source("flaky_sid", "https://flaky.example/sub.txt", "sub")
+    flaky_url = "https://flaky.example/sub.txt"
+    pool2.upsert_source(source_id(flaky_url), flaky_url, "sub")
     for _ in range(DEAD_SOURCE_MIN_FAILS - 1):
-        pool2.record_source_fetch("flaky_sid", False, error="fetch fail")
+        pool2.record_source_fetch(source_id(flaky_url), False, error="fetch fail")
     h2 = NodeHunter(
         pool=pool2, fetcher=SourceFetcher(timeout=1),
         prober=NodeProber(singbox_bin="", work_dir=tmp_path), orch=None,
     )
     urls2 = [s["url"] for s in await h2._build_sources(discover=False, report={})]
     assert "https://flaky.example/sub.txt" in urls2, "未到阈值的源不应被跳过"
+
+
+@pytest.mark.asyncio
+async def test_build_sources_skips_zero_contribution_sources(tmp_path):
+    """返回 200 但贡献恒为 0 的源必须被淘汰，哪怕 ok_count 很高。
+
+    2026-10-14 生产实测：62 个源里 37 个是这样 —— 智能发现把
+    poki.com / 4399 / 7k7k / cambridge / iciba / runoob 当成了节点源，
+    它们 HTTP 200 但一条节点/订阅链接都挖不出来。旧逻辑把它们记成
+    ok=True，`source_health` 按 ok/(ok+fail) 排序，于是它们长期霸占
+    榜首、每轮必抓，还挤掉 `source_list[:max_sources]` 的名额。
+    """
+    from websearch.nodes.hunter import DEAD_SOURCE_MIN_FAILS, NodeHunter
+    from websearch.nodes.probe import NodeProber
+
+    pool = NodePool(tmp_path / "p.sqlite3")
+    junk = "https://www.poki.com/category/games"
+    good = "https://good.example/sub.txt"
+    pool.upsert_source(source_id(junk), junk, "page")
+    # 旧口径：抓取成功但零产出 → ok_count 一路涨，nodes_found 恒为 0
+    for _ in range(DEAD_SOURCE_MIN_FAILS + 40):
+        pool.record_source_fetch(source_id(junk), True, nodes_found=0)
+    pool.upsert_source(source_id(good), good, "sub")
+    pool.record_source_fetch(source_id(good), True, nodes_found=12)
+
+    hunter = NodeHunter(
+        pool=pool, fetcher=SourceFetcher(timeout=1),
+        prober=NodeProber(singbox_bin="", work_dir=tmp_path), orch=None,
+    )
+    report: dict = {}
+    urls = [s["url"] for s in await hunter._build_sources(discover=False,
+                                                          report=report)]
+    assert junk not in urls, "零贡献源不该再占用抓取预算"
+    assert good in urls, "有产出的源必须保留"
+    assert report["sources_dead_skipped"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_page_source_with_no_links_counts_as_failure(tmp_path):
+    """page 源挖不出订阅链接 → 记失败，而不是永远记成功。"""
+    from websearch.nodes.hunter import NodeHunter
+    from websearch.nodes.probe import NodeProber
+
+    class _Stub:
+        def __init__(self, text: str, kind: str):
+            self._text, self._kind = text, kind
+
+        async def fetch(self, url: str):
+            return type("R", (), {"ok": True, "text": self._text,
+                                  "content_kind": self._kind, "error": ""})()
+
+    pool = NodePool(tmp_path / "p.sqlite3")
+    page = "https://game.example/list"
+    pool.upsert_source(source_id(page), page, "page")
+
+    # 1) 游戏站：200，但页面里没有任何订阅链接
+    h = NodeHunter(pool=pool, fetcher=_Stub("<html>小游戏大全</html>", "page"),
+                   prober=NodeProber(singbox_bin="", work_dir=tmp_path),
+                   orch=None)
+    rep1 = {"sources_ok": 0, "sources_fail": 0, "parsed": 0, "new_nodes": 0}
+    await h._fetch_and_ingest([{"url": page, "kind": "page"}], rep1)
+    assert rep1["sources_ok"] == 0 and rep1["sources_fail"] == 1
+    row = [s for s in pool.source_health(limit=10) if s["url"] == page][0]
+    assert row["ok"] == 0 and row["fail"] == 1
+    assert row["last_error"] == "no_sub_links"
+
+    # 2) 真聚合页：页面里能挖出订阅链接 → 记成功，且贡献数 = 链接数。
+    #    stub 按 URL 分流：page 返回 HTML，第二层的订阅地址返回真订阅内容
+    #    （否则第二层抓到同一份 HTML，自指链接被滤掉后会反记一条失败）。
+    sub_url = "https://agg.example/sub.txt"
+    body = f'<a href="{sub_url}">sub</a>'
+
+    class _Stub2:
+        async def fetch(self, url: str):
+            if url == page:
+                return type("R", (), {"ok": True, "text": body,
+                                      "content_kind": "page", "error": ""})()
+            return type("R", (), {"ok": True,
+                                  "text": "trojan://pw@agg.example.com:443#n",
+                                  "content_kind": "sub", "error": ""})()
+
+    h2 = NodeHunter(pool=pool, fetcher=_Stub2(),
+                    prober=NodeProber(singbox_bin="", work_dir=tmp_path),
+                    orch=None)
+    rep2 = {"sources_ok": 0, "sources_fail": 0, "parsed": 0, "new_nodes": 0}
+    await h2._fetch_and_ingest([{"url": page, "kind": "page"}], rep2)
+    # 第一层 page 记 1 次成功；第二层订阅也记 1 次成功（含解析出的节点）
+    assert rep2["sources_ok"] == 2 and rep2["sources_fail"] == 0
+    assert rep2["parsed"] == 1 and rep2["new_nodes"] == 1
+    row2 = [s for s in pool.source_health(limit=10) if s["url"] == page][0]
+    assert row2["ok"] == 1 and row2["nodes_found"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_sub_source_yielding_no_nodes_counts_as_failure(tmp_path):
+    """订阅内容里一行节点都没有（失效订阅/被换成博客）→ 记失败。"""
+    from websearch.nodes.hunter import NodeHunter
+    from websearch.nodes.probe import NodeProber
+
+    class _Stub:
+        async def fetch(self, url: str):
+            return type("R", (), {"ok": True, "text": "not a subscription",
+                                  "content_kind": "sub", "error": ""})()
+
+    pool = NodePool(tmp_path / "p.sqlite3")
+    url = "https://dead.example/sub.txt"
+    pool.upsert_source(source_id(url), url, "sub")
+    h = NodeHunter(pool=pool, fetcher=_Stub(),
+                   prober=NodeProber(singbox_bin="", work_dir=tmp_path),
+                   orch=None)
+    rep = {"sources_ok": 0, "sources_fail": 0, "parsed": 0, "new_nodes": 0}
+    await h._fetch_and_ingest([{"url": url, "kind": "sub"}], rep)
+    assert rep["sources_ok"] == 0 and rep["sources_fail"] == 1
+    row = [s for s in pool.source_health(limit=10) if s["url"] == url][0]
+    assert row["ok"] == 0 and row["last_error"] == "empty_sub"
+
+
+def test_healthy_sources_counts_output_not_http_200(tmp_path):
+    """stats 的 healthy_sources 只算「有产出」的源，不算「能返回 200」的。"""
+    pool = NodePool(tmp_path / "p.sqlite3")
+    pool.upsert_source("junk", "https://junk.example/x", "page")
+    for _ in range(156):
+        pool.record_source_fetch("junk", True, nodes_found=0)
+    pool.upsert_source("good", "https://good.example/sub.txt", "sub")
+    pool.record_source_fetch("good", True, nodes_found=7)
+
+    st = pool.stats()
+    assert st.source_count == 2
+    assert st.healthy_sources == 1
 
 
 @pytest.mark.asyncio

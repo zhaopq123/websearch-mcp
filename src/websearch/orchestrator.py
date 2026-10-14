@@ -333,12 +333,19 @@ class Orchestrator:
         fresh: bool = False,
     ) -> dict[str, Any]:
         """准入控制包装：限制同时在飞的搜索数（FIFO），防扇出风暴。"""
+        t_enter = time.monotonic()
+
+        def _pre_wait_ms() -> int:
+            """进入 search() 之后、真正发请求之前耗掉的时间（排队+等令牌）。"""
+            return int((time.monotonic() - t_enter) * 1000)
+
         def _busy(reason: str) -> dict[str, Any]:
             return {
                 "query": query,
                 "results": [],
                 "meta": {
                     "elapsed_ms": 0,
+                    "queue_wait_ms": _pre_wait_ms(),
                     "fetched_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                     "realtime": bool(time_range) or fresh,
                     "time_range": time_range or "",
@@ -372,8 +379,13 @@ class Orchestrator:
         # 引擎可用"：剩一个 workhorse 也要串行服务（降级优于拒绝），
         # 令牌等待会自然把并发压到 1/s。到点仍无任何引擎可用才
         # 诚实返回 server_busy。
-        cap_deadline = time.monotonic() + self.cfg.search_queue_timeout
-        relax_at = time.monotonic() + 3.0
+        #
+        # 截止时间与上面的准入排队**共用同一个**：过去两段各自用满一个
+        # `search_queue_timeout`，最坏是「先等 12s 拿准入、再等 12s 等令牌」
+        # = 24s 纯空转才开始发请求（2026-10-14 全量测试实测最坏 21s，且
+        # 这段耗时不在 meta.elapsed_ms 里，看起来像「凭空多等 20 秒」）。
+        cap_deadline = t_enter + self.cfg.search_queue_timeout
+        relax_at = t_enter + 3.0
         while True:
             n_ready = self.gov.ready_count()
             if n_ready >= self.cfg.min_ready_engines:
@@ -387,7 +399,7 @@ class Orchestrator:
                 return _busy("搜索引擎容量暂枯竭（限流恢复中），请稍后重试")
             await asyncio.sleep(0.25)
         try:
-            return await self._search_impl_gate(
+            res = await self._search_impl_gate(
                 query, max_results=max_results, engine_names=engine_names,
                 lang=lang, region=region, time_range=time_range,
                 use_cache=use_cache, include_snippets=include_snippets,
@@ -395,6 +407,15 @@ class Orchestrator:
             )
         finally:
             self._adm.release()
+        # 排队 + 等令牌是用户真能感知的耗时，但都发生在 `_search_impl_gate`
+        # 的 t0 **之前**，只报引擎耗时会让这段凭空消失（上面 21s 的抱怨就是这么来的）。
+        # 这里把它单列出来，并计入 elapsed_ms，口径恢复成墙钟时间。
+        wait_ms = _pre_wait_ms()
+        if isinstance(res, dict) and isinstance(res.get("meta"), dict):
+            meta = res["meta"]
+            meta["queue_wait_ms"] = wait_ms
+            meta["elapsed_ms"] = int(meta.get("elapsed_ms") or 0) + wait_ms
+        return res
 
     async def _search_impl_gate(
         self,

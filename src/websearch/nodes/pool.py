@@ -619,8 +619,12 @@ class NodePool:
             "SELECT country, COUNT(*) FROM nodes WHERE alive=1 AND country<>''"
             " GROUP BY country ORDER BY COUNT(*) DESC LIMIT 12").fetchall())
         src_total = conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0]
+        # 「健康」= 抓得到**且**有产出。只看 ok_count 会把「返回 200 但
+        # 一条节点/链接都挖不出」的游戏站、词典站算成健康源（2026-10-14
+        # 实测 62 个源里 37 个是这类），面板上会给出过于乐观的结论。
         src_ok = conn.execute(
-            "SELECT COUNT(*) FROM sources WHERE ok_count>0").fetchone()[0]
+            "SELECT COUNT(*) FROM sources WHERE ok_count>0 AND nodes_found>0"
+        ).fetchone()[0]
         last_run_row = conn.execute(
             "SELECT at, trigger, sources_ok, sources_fail, parsed, new_nodes,"
             " probed, alive, elapsed_ms, note FROM runs"
