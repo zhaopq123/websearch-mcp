@@ -1413,3 +1413,145 @@ def test_prune_never_touches_cust_pool(tmp_path):
     conn.commit()
     assert pool.prune() == 0
     assert pool.list_public(only_alive=False, pool="cust")
+
+
+# ══════════════════════ 单轮入库预算闸门 ══════════════════════
+
+
+def _vless_uri(i: int) -> str:
+    """构造一条可解析的 vless 节点 URI（测试用，不触网）。"""
+    return (f"vless://00000000-0000-0000-0000-{i:012d}"
+            f"@10.0.0.{i % 250 + 1}:443"
+            f"?encryption=none&security=tls&type=tcp#node-{i}")
+
+
+def _make_hunter(tmp_path, ingest_cap=0, round_cap=None):
+    """造一个只用到入库路径的猎手（不启循环、不触网）。"""
+    from websearch.nodes.hunter import NodeHunter
+
+    h = NodeHunter.__new__(NodeHunter)
+    h.pool = NodePool(tmp_path / "n.sqlite3")
+    h.ingest_cap = ingest_cap
+    h.customer_subs = []
+    h._round_ingest_left = round_cap
+    return h
+
+
+def test_round_ingest_cap_truncates_across_sources(tmp_path):
+    """单轮总预算应跨源累计：多源叠加也不能突破 ROUND_INGEST_CAP。
+
+    背景（2026-10-15 实测）：ingest_cap 是**单源**上限，多个高产源
+    叠加起来单轮能入 13853 个，而单轮探测上限只有 400 —— 入库比探测
+    快 34 倍，未测库存无限积压（当日全库 27265、未测 27161），
+    新节点永远排不到探测窗口。总闸门就是修这个失衡。
+    """
+    h = _make_hunter(tmp_path, round_cap=10)
+    text = "\n".join(_vless_uri(i) for i in range(50))
+
+    # 第一源：预算 10，入 10 个
+    n1, a1 = h._ingest_text(text, "src-1")
+    assert n1 == 50 and a1 == 10, "首源应被截断到预算上限"
+    assert h._round_ingest_left == 0
+
+    # 第二源：预算耗尽，应整源丢弃
+    n2, a2 = h._ingest_text(text, "src-2")
+    assert a2 == 0, "预算耗尽后不应再入库"
+    assert h._round_ingest_left == 0
+
+    # 库中只应有首源的 10 个
+    nodes = h.pool.list_public(only_alive=False)
+    assert len(nodes) == 10
+
+
+def test_round_ingest_cap_none_means_unlimited(tmp_path):
+    """轮外直接调用（预算为 None）不受总闸门限制，只受单源上限约束。"""
+    h = _make_hunter(tmp_path, ingest_cap=5, round_cap=None)
+    text = "\n".join(_vless_uri(i) for i in range(50))
+
+    n, added = h._ingest_text(text, "src")
+    assert n == 50 and added == 5, "无总闸时应只受单源 ingest_cap 限制"
+    assert h._round_ingest_left is None
+
+
+def test_round_ingest_cap_partial_then_exhausted(tmp_path):
+    """预算部分消耗：首源吃掉一部分，第二源用完剩余额度。"""
+    h = _make_hunter(tmp_path, round_cap=7)
+    text = "\n".join(_vless_uri(i) for i in range(20))
+
+    _, a1 = h._ingest_text(text, "src-1")
+    assert a1 == 7 and h._round_ingest_left == 0
+
+    _, a2 = h._ingest_text(text, "src-2")
+    assert a2 == 0
+    assert len(h.pool.list_public(only_alive=False)) == 7
+
+
+# ══════════════════════ 单轮入库预算闸门 ══════════════════════
+
+
+def _vless_uri(i: int) -> str:
+    """构造一条可解析的 vless 节点 URI（测试用，不触网）。"""
+    return (f"vless://00000000-0000-0000-0000-{i:012d}"
+            f"@10.0.0.{i % 250 + 1}:443"
+            f"?encryption=none&security=tls&type=tcp#node-{i}")
+
+
+def _make_hunter(tmp_path, ingest_cap=0, round_cap=None):
+    """造一个只用到入库路径的猎手（不启循环、不触网）。"""
+    from websearch.nodes.hunter import NodeHunter
+
+    h = NodeHunter.__new__(NodeHunter)
+    h.pool = NodePool(tmp_path / "n.sqlite3")
+    h.ingest_cap = ingest_cap
+    h.customer_subs = []
+    h._round_ingest_left = round_cap
+    return h
+
+
+def test_round_ingest_cap_truncates_across_sources(tmp_path):
+    """单轮总预算应跨源累计：多源叠加也不能突破 ROUND_INGEST_CAP。
+
+    背景（2026-10-15 实测）：ingest_cap 是**单源**上限，多个高产源
+    叠加起来单轮能入 13853 个，而单轮探测上限只有 400 —— 入库比探测
+    快 34 倍，未测库存无限积压（当日全库 27265、未测 27161），
+    新节点永远排不到探测窗口。总闸门就是修这个失衡。
+    """
+    h = _make_hunter(tmp_path, round_cap=10)
+    text = "\n".join(_vless_uri(i) for i in range(50))
+
+    # 第一源：预算 10，入 10 个
+    n1, a1 = h._ingest_text(text, "src-1")
+    assert n1 == 50 and a1 == 10, "首源应被截断到预算上限"
+    assert h._round_ingest_left == 0
+
+    # 第二源：预算耗尽，应整源丢弃
+    n2, a2 = h._ingest_text(text, "src-2")
+    assert a2 == 0, "预算耗尽后不应再入库"
+    assert h._round_ingest_left == 0
+
+    # 库中只应有首源的 10 个
+    nodes = h.pool.list_public(only_alive=False)
+    assert len(nodes) == 10
+
+
+def test_round_ingest_cap_none_means_unlimited(tmp_path):
+    """轮外直接调用（预算为 None）不受总闸门限制，只受单源上限约束。"""
+    h = _make_hunter(tmp_path, ingest_cap=5, round_cap=None)
+    text = "\n".join(_vless_uri(i) for i in range(50))
+
+    n, added = h._ingest_text(text, "src")
+    assert n == 50 and added == 5, "无总闸时应只受单源 ingest_cap 限制"
+    assert h._round_ingest_left is None
+
+
+def test_round_ingest_cap_partial_then_exhausted(tmp_path):
+    """预算部分消耗：首源吃掉一部分，第二源用完剩余额度。"""
+    h = _make_hunter(tmp_path, round_cap=7)
+    text = "\n".join(_vless_uri(i) for i in range(20))
+
+    _, a1 = h._ingest_text(text, "src-1")
+    assert a1 == 7 and h._round_ingest_left == 0
+
+    _, a2 = h._ingest_text(text, "src-2")
+    assert a2 == 0
+    assert len(h.pool.list_public(only_alive=False)) == 7

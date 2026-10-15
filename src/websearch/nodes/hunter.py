@@ -84,6 +84,16 @@ FRESH_PRUNE_SEC = 2 * 3600
 # 单轮探测硬上限。probe.py 的 PROBE_PORT_SPAN=800 是端口段上限，
 # 这里留一半余量：手机 CPU 上一次别开太多代理端口（实测并发 12 已接近饱和）。
 PROBE_HARD_CAP = 400
+# 单轮**总**入库预算（跨所有源累加，env WS_NODE_ROUND_INGEST_CAP）。
+# 为什么需要：ingest_cap 是「单源」上限，多个高产源叠加起来没有总量闸门
+# ——实测 2026-10-15 单轮入库 13853 个，而单轮探测上限只有 400。
+# 入库比探测快 34 倍，未测库存必然无限积压（当日实测全库 27265、未测
+# 27161，存活率卡在 74 上不去）：新节点排不到探测窗口，永远测不到，
+# 相当于白收。本闸门让入库速率与探测吞吐匹配——积压被 prune 消化后，
+# 下一轮又能收新的，库保持「周转」而不是「堆积」。
+# 取值取探测上限的数倍：允许入库略快于探测（源解析有随机性，偶尔小轮
+# 解析少），但不允许无节制膨胀。
+ROUND_INGEST_CAP = 4000
 
 
 def _env_int(name: str, default: int) -> int:
@@ -188,6 +198,9 @@ class NodeHunter:
         # 存活率 EMA：决定探测量要放大多少倍才能养住目标活节点数。
         # 首次探测前没有样本，先用一个保守的悲观值（免费节点存活率极低）。
         self._alive_rate_ema: float = 0.0
+        # 本轮剩余入库预算。None = 不受限（hunt 轮内每轮重置为
+        # ROUND_INGEST_CAP；轮外单独调 _ingest_text 时不限额）。
+        self._round_ingest_left: int | None = None
 
     # ══════════════════ 保活规划器 ══════════════════
 
@@ -306,6 +319,10 @@ class NodeHunter:
                 source_list = source_list[:max_sources]
 
                 # 2) 抓取 + 解析 + 入库
+                # 每轮重置单轮入库预算（ROUND_INGEST_CAP）：它是「本轮」
+                # 的闸门，跨轮累计会让服务跑几轮后再也不收新节点。
+                self._round_ingest_left = _env_int(
+                    "WS_NODE_ROUND_INGEST_CAP", ROUND_INGEST_CAP)
                 parsed_nodes = await self._fetch_and_ingest(source_list, report)
 
                 # 3) 探测候选（cust 配额 + free 补量）
@@ -557,7 +574,22 @@ class NodeHunter:
         cap = getattr(self, "ingest_cap", 0) or 0
         if cap and len(items) > cap:
             items = items[:cap]
+        # 单轮总预算闸（ROUND_INGEST_CAP）：单源上限管不住多源叠加，
+        # 这里按「本轮已入库数」再截一次，保证入库速率不超过探测吞吐的
+        # 合理倍数。预算耗尽时丢弃本源剩余部分（源下轮还会来）。
+        budget = getattr(self, "_round_ingest_left", None)
+        if budget is not None:
+            if budget <= 0:
+                log.info("单轮入库预算耗尽，丢弃本源 %d 个（源下轮再来）",
+                         len(items))
+                return len(rep.nodes), 0
+            if len(items) > budget:
+                log.info("单轮入库预算 %d，截断本源 %d→%d",
+                         budget, len(items), budget)
+                items = items[:budget]
         added = self.pool.upsert_nodes(items, source_sid=sid, pool="free")
+        if budget is not None:
+            self._round_ingest_left = budget - len(items)
         return len(rep.nodes), added
 
     def import_customer(self, text: str, sid: str = "customer") -> tuple[int, int]:
