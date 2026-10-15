@@ -105,6 +105,21 @@ class ProbeEnv:
         }
 
 
+def _is_plain_proxy(ob: dict[str, Any]) -> bool:
+    """是否 httpx 可直测的普通代理。
+
+    http 全部可直测；socks 只接 version=5 —— httpx 的 socks 支持经
+    socksio，**不支持 socks4**（实测 version=4 会 ImportError）。
+    socks4 节点归 tunnel 组走 sing-box（sing-box 原生支持 version 4）。
+    """
+    t = str(ob.get("type") or "")
+    if t == "http":
+        return True
+    if t == "socks":
+        return str(ob.get("version") or "5") != "4"
+    return False
+
+
 class NodeProber:
     """节点测速器。
 
@@ -179,11 +194,9 @@ class NodeProber:
         concurrency = concurrency or self.concurrency
 
         plain = [n for n in nodes
-                 if str((n.get("outbound") or {}).get("type")) in
-                 ("socks", "http")]
+                 if _is_plain_proxy(n.get("outbound") or {})]
         tunnel = [n for n in nodes
-                  if str((n.get("outbound") or {}).get("type")) not in
-                  ("socks", "http")]
+                  if not _is_plain_proxy(n.get("outbound") or {})]
 
         results: list[ProbeResult] = []
         if plain:
@@ -219,9 +232,8 @@ class NodeProber:
             ob = n.get("outbound") or {}
             host = str(ob.get("server") or "")
             port = int(ob.get("server_port") or 0)
-            scheme = "socks5" if ob.get("type") == "socks" else "http"
-            if ob.get("type") == "socks" and ob.get("version") == "4":
-                scheme = "socks4"
+            # _is_plain_proxy 已保证：http 或 socks5（socks4 走 sing-box）
+            scheme = "http" if ob.get("type") == "http" else "socks5"
             auth = ""
             if ob.get("username"):
                 auth = f"{ob['username']}:{ob.get('password', '')}@"
