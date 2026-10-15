@@ -394,10 +394,11 @@ class NodeHunter:
                 self.state.last_error = ""
                 self.pool.record_run(report)
                 log.info("hunt 完成(%s)：源 %d 成功/%d 失败，解析 %d，新增 %d，"
-                         "探测 %d，存活 %d，耗时 %dms",
+                         "探测 %d，回写 %d，存活 %d，耗时 %dms",
                          trigger, report["sources_ok"], report["sources_fail"],
                          report["parsed"], report["new_nodes"],
-                         report["probed"], report["alive"], report["elapsed_ms"])
+                         report["probed"], report.get("probe_written", -9),
+                         report["alive"], report["elapsed_ms"])
                 return report
             except Exception as e:
                 self.state.consecutive_fail += 1
