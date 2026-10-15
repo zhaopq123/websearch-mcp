@@ -129,6 +129,50 @@ SEED_SOURCES: list[dict[str, str]] = [
      "kind": "sub", "note": "FastNodes 中国香港"},
     {"url": "https://raw.githubusercontent.com/rtwo2/FastNodes/main/sub/countries/DE.txt",
      "kind": "sub", "note": "FastNodes 德国"},
+    # ── 2026-10-15 优化文档二轮摸底后新增（vivo 实测产出）──
+    # GFP wiki 系列（漏掉的超级产源）：实测每轮新增 ss 12885 /
+    # trojan 17885 / vless 16665 / vmess 7029 / hy2 912。wireguard/
+    # anytls 解析 0 节点（sing-box 不支持），不接。
+    {"url": "https://raw.githubusercontent.com/wiki/gfpcom/free-proxy-list/lists/ss.txt",
+     "kind": "sub", "note": "GFP Shadowsocks 专集"},
+    {"url": "https://raw.githubusercontent.com/wiki/gfpcom/free-proxy-list/lists/trojan.txt",
+     "kind": "sub", "note": "GFP Trojan 专集"},
+    {"url": "https://raw.githubusercontent.com/wiki/gfpcom/free-proxy-list/lists/vless.txt",
+     "kind": "sub", "note": "GFP VLESS 专集"},
+    {"url": "https://raw.githubusercontent.com/wiki/gfpcom/free-proxy-list/lists/vmess.txt",
+     "kind": "sub", "note": "GFP VMess 专集"},
+    {"url": "https://raw.githubusercontent.com/wiki/gfpcom/free-proxy-list/lists/hy2.txt",
+     "kind": "sub", "note": "GFP Hysteria2 专集"},
+    # Barabama（AI 爬虫多源聚合）：clashmeta 实测新增 1925
+    {"url": "https://raw.githubusercontent.com/Barabama/FreeNodes/refs/heads/feat/ai-crawler-v2/nodes/clashmeta.txt",
+     "kind": "sub", "note": "Barabama ClashMeta 聚合"},
+    # freenodess：日更多协议，实测新增 ~275
+    {"url": "https://raw.githubusercontent.com/freenodess/freenodess/refs/heads/main/nodes/v2ray-base64.txt",
+     "kind": "sub", "note": "freenodess 日更订阅"},
+    # ── 普通 SOCKS/HTTP 代理列表（低延迟突破口，2026-10-15）──
+    # 公网代理多在欧美 VPS，实测 RTT 比免费 VPN 节点（4.9s+）快一个
+    # 数量级。解析走 parse_proxy_list（_sniff_proxy_proto 按 URL 判
+    #协议），入库 cap=6000/源/轮（WS_NODE_INGEST_CAP）。
+    # proxifly 在 jsdelivr CDN（墙内直连可达）；其余 GitHub raw 走
+    # fetcher 代理兜底路径。混合 all.txt 靠 URI/ipport 行自动分辨。
+    {"url": "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks5/data.txt",
+     "kind": "sub", "note": "proxifly SOCKS5（实测 6 万条，5 分钟级更新）"},
+    {"url": "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.txt",
+     "kind": "sub", "note": "proxifly HTTP（实测 5248 条）"},
+    {"url": "https://raw.githubusercontent.com/hproxy-com/free-proxy-list/main/live.txt",
+     "kind": "sub", "note": "HProxy 实时在线池（实测 7061 条）"},
+    {"url": "https://raw.githubusercontent.com/hproxy-com/free-proxy-list/main/socks5.txt",
+     "kind": "sub", "note": "HProxy SOCKS5（实测 2759 条）"},
+    {"url": "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
+     "kind": "sub", "note": "monosans SOCKS5（每小时验证，实测 770 条）"},
+    {"url": "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/all.txt",
+     "kind": "sub", "note": "monosans 全协议（实测 1166 条混合）"},
+    {"url": "https://raw.githubusercontent.com/litportnet/free-proxy-list/live/proxies/stable.txt",
+     "kind": "sub", "note": "Litport 稳定候选（7 天在线率≥90%，实测 361 条）"},
+    {"url": "https://raw.githubusercontent.com/litportnet/free-proxy-list/live/proxies/all.txt",
+     "kind": "sub", "note": "Litport 全协议（实测 2438 条混合）"},
+    {"url": "https://raw.githubusercontent.com/Thordata/awesome-free-proxy-list/main/proxies/all.txt",
+     "kind": "sub", "note": "Thordata 全协议（实测 502 条）"},
 ]
 
 # 自举搜索词：发现新聚合站。多词覆盖不同表述（免费节点/白嫖/每日更新）
