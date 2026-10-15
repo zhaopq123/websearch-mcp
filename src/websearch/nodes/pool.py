@@ -394,6 +394,7 @@ class NodePool:
             # 这个分支命中说明探测结果 fp 与库对不上（候选/结果错位）
             log.warning("record_probe: fp 不在库中，跳过 %s…", fp[:12])
             return
+        log.warning("record_probe HIT fp=%s ok=%s", fp[:12], ok)
         ok_count, fail_count, avg_ms, streak = row
         if ok:
             # 延迟 EMA，alpha=0.4（新样本权重大，快速反映节点当前状态）

@@ -751,6 +751,7 @@ class NodeHunter:
         # 回写自证（2026-10-15 排查「探测记录丢失」）：数一下本轮
         # 探测的 fp 里有多少 last_probe_at 真的被更新了。理论上应
         # == len(results)；若小于，说明回写链路有问题（事务/并发/连接）。
+        log.warning("probe 回写循环完成：results=%d alive=%d", len(results), alive)
         written = 0
         try:
             fps = list({r.fp for r in results})
