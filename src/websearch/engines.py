@@ -30,6 +30,12 @@ class RequestSpec:
     data: dict[str, Any] | None = None
     referer: str = ""
     extra_headers: dict[str, str] = field(default_factory=dict)
+    # 是否走直连（跳过本地代理）。2026-10-15：国内引擎（百度/360/搜狗/
+    # 微信/头条/cn.bing）在国内直连更快更稳，走海外代理出口反而被
+    # 目标站拒绝（实测香港节点经代理请求百度恒 ConnectError）；
+    # 国外引擎（DDG/bing_intl）必须走代理。由 Engine.needs_proxy 决定，
+    # orchestrator 在 build 后填充。
+    direct: bool = False
 
 
 # ────────────────────────── 通用兜底解析器 ──────────────────────────
@@ -176,6 +182,10 @@ class Engine:
     weight = 1.0
     homepage = ""
     supports_time = False
+    # 是否需要翻墙（走本地代理）。国内引擎置 False → 直连：
+    # 实测国内站经海外代理出口恒被拒（百度 ConnectError），
+    # 而直连百度仅 1.1s。默认 True 保持原行为（国外引擎）。
+    needs_proxy = True
 
     def build(self, query: str, *, count: int = 10, lang: str = "",
               region: str = "", time_range: str = "", page: int = 1) -> RequestSpec:
@@ -197,6 +207,7 @@ class BingEngine(Engine):
     name = "bing"
     label = "必应（中国）"
     weight = 1.0
+    needs_proxy = False   # 国内站直连（2026-10-15）
     homepage = "https://cn.bing.com/"
     supports_time = True
 
@@ -252,6 +263,7 @@ class BingEngine(Engine):
 
 
 class BingIntlEngine(BingEngine):
+    needs_proxy = True    # 国际版必须走代理（覆盖基类）
     """www.bing.com。国际版，作为国内版的互补（索引略有差异）。"""
 
     name = "bing_intl"
@@ -280,6 +292,7 @@ class BaiduEngine(Engine):
     name = "baidu"
     label = "百度"
     weight = 1.0
+    needs_proxy = False   # 国内站直连（2026-10-15）
     homepage = "https://www.baidu.com/"
     supports_time = True
 
@@ -347,6 +360,7 @@ class SogouEngine(Engine):
     name = "sogou"
     label = "搜狗"
     weight = 0.85
+    needs_proxy = False   # 国内站直连（2026-10-15）
     homepage = "https://www.sogou.com/"
     supports_time = True
 
@@ -423,6 +437,7 @@ class So360Engine(Engine):
     name = "so360"
     label = "360搜索"
     weight = 0.8
+    needs_proxy = False   # 国内站直连（2026-10-15）
     homepage = "https://www.so.com/"
 
     def build(self, query, *, count=10, lang="", region="", time_range="", page=1):
@@ -641,6 +656,7 @@ class ToutiaoEngine(Engine):
     name = "toutiao"
     label = "头条搜索"
     weight = 0.7
+    needs_proxy = False   # 国内站直连（2026-10-15）
     homepage = "https://so.toutiao.com/"
 
     def build(self, query, *, count=10, lang="", region="", time_range="", page=1):
@@ -715,6 +731,7 @@ class BaiduMobileEngine(Engine):
     name = "baidu_m"
     label = "百度（移动版）"
     weight = 1.0
+    needs_proxy = False   # 国内站直连（2026-10-15）
     homepage = "https://m.baidu.com/"
     supports_time = True
 
@@ -782,6 +799,7 @@ class SogouMobileEngine(Engine):
     name = "sogou_m"
     label = "搜狗（移动版）"
     weight = 0.85
+    needs_proxy = False   # 国内站直连（2026-10-15）
     homepage = "https://m.sogou.com/"
     supports_time = True
 
@@ -853,6 +871,7 @@ class So360MobileEngine(Engine):
     name = "so360_m"
     label = "360搜索（移动版）"
     weight = 0.8
+    needs_proxy = False   # 国内站直连（2026-10-15）
     homepage = "https://m.so.com/"
 
     def build(self, query, *, count=10, lang="", region="", time_range="", page=1):
@@ -905,6 +924,7 @@ class WeixinEngine(Engine):
     name = "weixin"
     label = "微信公众号"
     weight = 0.7
+    needs_proxy = False   # 国内站直连（2026-10-15）
     homepage = "https://weixin.sogou.com/"
 
     def build(self, query, *, count=10, lang="", region="", time_range="", page=1):

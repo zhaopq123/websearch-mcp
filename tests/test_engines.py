@@ -215,3 +215,27 @@ def test_orchestrator_noise_filter_wiring():
     # 源码里确实出现在解析之后（而不是只 import 不用的死 import）
     src = Path(orch_mod.__file__).read_text(encoding="utf-8")
     assert "_is_noise_result(r.url)" in src
+
+
+# ══════════════ 2026-10-15 国内引擎直连路由 ══════════════
+
+
+def test_domestic_engines_go_direct():
+    """国内引擎 needs_proxy=False（直连）——实测国内站经海外代理恒被拒。"""
+    from websearch.engines import get_engine
+
+    for name in ("baidu", "baidu_m", "so360", "so360_m", "sogou",
+                 "sogou_m", "weixin", "toutiao", "bing"):
+        e = get_engine(name)
+        assert e is not None, f"{name} 未注册"
+        assert e.needs_proxy is False, f"{name} 应直连（needs_proxy=False）"
+
+
+def test_foreign_engines_need_proxy():
+    """国外引擎必须走代理；bing_intl 继承 BingEngine 但不得误继承 False。"""
+    from websearch.engines import get_engine
+
+    for name in ("duckduckgo", "bing_intl"):
+        e = get_engine(name)
+        assert e is not None, f"{name} 未注册"
+        assert e.needs_proxy is True, f"{name} 必须走代理"

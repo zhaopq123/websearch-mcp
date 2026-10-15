@@ -524,8 +524,13 @@ class HttpPool:
         timeout_ms: int | None = None,
         max_bytes: int | None = None,
         referer: str = "",
+        direct: bool = False,
     ) -> httpx.Response:
         """发起请求，带并发闸门 + 大小上限。
+
+        direct=True 时绕过本地代理走直连（2026-10-15：国内引擎用）——
+        直连 client 在 __init__ 里已按需建好（_direct_client）。
+        
 
         max_bytes 用流式读取实现：先看 Content-Length，超了直接放弃，
         避免把 100MB 的页面读进内存（vivo 只有 3.7G）。
@@ -554,7 +559,10 @@ class HttpPool:
                     )
 
                 # 按代理健康状态选 client（未配代理时恒为主 client，行为不变）
-                client = self.active_client()
+                # direct=True（国内引擎）：绕过代理走直连。
+                # 其余沿用 active_client()（含代理 bypass 的自愈逻辑）。
+                client = ((self._direct_client or self._client)
+                          if direct else self.active_client())
                 try:
                     if method.upper() == "POST":
                         resp = await client.post(

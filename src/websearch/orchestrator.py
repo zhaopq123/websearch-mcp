@@ -230,13 +230,13 @@ class Orchestrator:
                         spec.url, method="POST", data=spec.data,
                         params=spec.params, timeout_ms=timeout_ms,
                         referer=spec.referer, headers=spec.extra_headers,
-                        max_bytes=cap,
+                        max_bytes=cap, direct=spec.direct,
                     )
                 else:
                     resp = await self.pool.fetch(
                         spec.url, params=spec.params, timeout_ms=timeout_ms,
                         referer=spec.referer, headers=spec.extra_headers,
-                        max_bytes=cap,
+                        max_bytes=cap, direct=spec.direct,
                     )
                 return resp, resp.status_code
             except (httpx.TimeoutException, httpx.ConnectError,
@@ -502,6 +502,9 @@ class Orchestrator:
                 specs[e.name] = e.build(
                     query, count=limit, lang=lang, region=region, time_range=time_range
                 )
+                # 国内引擎直连（2026-10-15）：实测国内站经海外代理出口
+                # 恒被拒（百度 ConnectError），直连仅 1.1s。
+                specs[e.name].direct = not getattr(e, "needs_proxy", True)
             except Exception as ex:
                 log.warning("引擎 %s 构造请求失败: %s", e.name, ex)
                 skipped.append({"engine": e.name, "reason": f"build:{ex}"})
@@ -699,6 +702,7 @@ class Orchestrator:
         async def probe(e: Engine) -> tuple[str, bool, str]:
             try:
                 spec = e.build(query, count=5)
+                spec.direct = not getattr(e, "needs_proxy", True)
                 o = await self._run_engine(
                     e, spec, count=5, budget=Budget(10_000), timeout_ms=8_000,
                     query_for_check=query,
