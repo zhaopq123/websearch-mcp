@@ -400,26 +400,32 @@ class NodePool:
         if ok:
             # 延迟 EMA，alpha=0.4（新样本权重大，快速反映节点当前状态）
             avg_ms = (ms if not avg_ms else avg_ms * 0.6 + ms * 0.4)
-            conn.execute(
+            cur = conn.execute(
                 "UPDATE nodes SET alive=1, last_ms=?, avg_ms=?, ok_count=?,"
                 " streak_fail=0, last_ok_at=?, last_probe_at=? WHERE fp=?",
                 (ms, avg_ms, ok_count + 1, now, now, fp),
             )
+            log.warning("record_probe UPDATE ok=%s rowcount=%s now=%.3f",
+                        fp[:12], cur.rowcount, now)
         else:
             streak = (streak or 0) + 1
             alive = 0 if streak >= self.DEAD_STREAK else None
             if alive is None:
-                conn.execute(
+                cur = conn.execute(
                     "UPDATE nodes SET fail_count=?, streak_fail=?,"
                     " last_probe_at=? WHERE fp=?",
                     (fail_count + 1, streak, now, fp),
                 )
+                log.warning("record_probe UPDATE fail(NULL)=%s rowcount=%s "
+                            "now=%.3f", fp[:12], cur.rowcount, now)
             else:
-                conn.execute(
+                cur = conn.execute(
                     "UPDATE nodes SET alive=0, fail_count=?, streak_fail=?,"
                     " last_probe_at=? WHERE fp=?",
                     (fail_count + 1, streak, now, fp),
                 )
+                log.warning("record_probe UPDATE dead=%s rowcount=%s "
+                            "now=%.3f", fp[:12], cur.rowcount, now)
         self._secure()
 
     def upsert_source(self, sid: str, url: str, kind: str = "sub") -> None:
