@@ -631,6 +631,7 @@ class Orchestrator:
             [o.results for o in ok_outcomes],
             weights=weights, max_results=limit,
             per_domain_cap=cfg.per_domain_cap,
+            authority_weight=cfg.authority_weight,
         )
         if not include_snippets:
             for r in merged:

@@ -66,9 +66,10 @@ DEFAULT_ENGINES = [
     "weixin",      # 垂直：微信公众号
     "toutiao",     # 垂直：资讯，时效性强
     "bing_intl",   # 必应国际版：实测与 cn 版结果有差异，是有效的交叉验证源
-    "duckduckgo",  # 国际
-    "mojeek",      # 独立索引
-    "brave",       # 国际
+    "duckduckgo",  # 国际（2026-10-15 实测唯一稳定的国外引擎）
+    # mojeek / brave 已移除（2026-10-15 全天实测 0 命中且硬封：
+    # mojeek 恒定 http_403、brave 恒定 http_429；国外需求由
+    # duckduckgo 覆盖，留着只增加每轮的无效请求与熔断噪声）。
     "baidu",       # PC 版（常被拦，保留待恢复）
     "sogou",       # PC 版（常被拦，保留待恢复）
 ]
@@ -160,6 +161,9 @@ class Config:
     cb_cooldown_sec: int = 60        # 初始冷却（每次再触发翻倍，上限见下）
     cb_cooldown_max_sec: int = 600
     cb_ema_alpha: float = 0.2        # 成功率 EMA 平滑系数
+    # 来源权威度权重（2026-10-15）：fusion 排序里乘 domain_authority()
+    # 的分值。保真实性、压 SEO/GEO 脏数据（用户诉求）。0 = 关闭。
+    authority_weight: float = 0.5
     # 连续 soft fail（zero_results/timeout）几次跳闸。默认 hard 阈值
     # 的 3 倍：偶发无结果不杀（weixin 误熔断 600s 的教训），持续死透
     # 才杀（实测 DDG 被免费池出口 IP 全量拉黑后 sr=0.065 仍永远

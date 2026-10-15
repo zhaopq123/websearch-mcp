@@ -34,6 +34,7 @@ def fuse(
     weights: dict[str, float],
     max_results: int = 20,
     per_domain_cap: int = 3,
+    authority_weight: float = 0.5,
 ) -> tuple[list[SearchResult], dict[str, int]]:
     """把多个引擎的结果融合成一份有序结果。
 
@@ -85,6 +86,17 @@ def fuse(
         # 有摘要的略加分（无摘要的多半是解析不全的残条）
         if r.snippet:
             base += 0.05
+        # 来源权威度（2026-10-15 用户诉求：保真实性、压 SEO/GEO 脏数据）。
+        # 权威源 +、低质源 −，权重可配（authority_weight，默认 0.5）。
+        # 量级设计：单引擎首条约 1.0 分，±0.5 足以重排相邻档，
+        # 但压不过「多引擎交叉验证」的强信号——真实性第一信号仍是
+        # 多源一致，权威度是第二信号。
+        try:
+            from .authority import domain_authority
+
+            base += authority_weight * domain_authority(r.url)
+        except Exception:
+            pass
         r.score = round(base, 4)
 
     # 3) 标题 SimHash 去重（同一内容不同 URL 标题一致 → 视为重复）
