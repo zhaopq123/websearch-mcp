@@ -602,22 +602,42 @@ class NodeHunter:
         cap = getattr(self, "ingest_cap", 0) or 0
         if cap and len(items) > cap:
             items = items[:cap]
-        # 单轮总预算闸（ROUND_INGEST_CAP）：单源上限管不住多源叠加，
-        # 这里按「本轮已入库数」再截一次，保证入库速率不超过探测吞吐的
-        # 合理倍数。预算耗尽时丢弃本源剩余部分（源下轮还会来）。
+        # 单轮总预算闸（ROUND_INGEST_CAP）：保证**新增**入库速率不超过
+        # 探测吞吐的合理倍数。
+        #
+        # 2026-10-15 关键修正：预算只对**新节点**生效，重复指纹永远
+        # 不占预算、不丢弃（它们只刷新 last_seen，是 prune 语义需要）。
+        # 实测库存饱和后（24k 指纹覆盖全部源）每轮解析 14 万几乎全是
+        # 重复——旧口径按 len(items) 扣预算，前 5 个源解析 1 万、
+        # added=0，照样烧光 10000 预算，后面的源全被「预算耗尽」丢弃
+        # （服务日志刷屏，本轮 hunt 新增恒 0）。
+        #
+        # 实现：budget < len(items) 时先 known_fps 判新——预算内的新
+        # 节点保留、超出的丢弃、重复项全部保留。budget 充足时跳过判新
+        # （省一次批量查询）。
         budget = getattr(self, "_round_ingest_left", None)
-        if budget is not None:
-            if budget <= 0:
-                log.info("单轮入库预算耗尽，丢弃本源 %d 个（源下轮再来）",
-                         len(items))
-                return len(rep.nodes), 0
-            if len(items) > budget:
-                log.info("单轮入库预算 %d，截断本源 %d→%d",
-                         budget, len(items), budget)
-                items = items[:budget]
+        if budget is not None and budget < len(items):
+            from .pool import fingerprint
+
+            fps = [fingerprint(proto, ob) for _, proto, ob in items]
+            known = self.pool.known_fps(fps)
+            kept: list[tuple[str, str, dict[str, Any]]] = []
+            fresh_n = 0
+            for it, fp in zip(items, fps):
+                if fp in known:
+                    kept.append(it)                    # 重复：免费刷新
+                elif fresh_n < budget:
+                    kept.append(it)                    # 预算内的新节点
+                    fresh_n += 1
+                # else: 超预算的新节点丢弃（源下轮还会来）
+            if len(kept) < len(items):
+                log.info("单轮入库预算 %d：新节点 %d→%d，重复 %d 照常刷新",
+                         budget, len(items) - len(known), fresh_n,
+                         len(known))
+            items = kept
         added = self.pool.upsert_nodes(items, source_sid=sid, pool="free")
         if budget is not None:
-            self._round_ingest_left = budget - len(items)
+            self._round_ingest_left = budget - added
         return len(rep.nodes), added
 
     def import_customer(self, text: str, sid: str = "customer") -> tuple[int, int]:
