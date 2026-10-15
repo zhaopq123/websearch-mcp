@@ -407,38 +407,30 @@ class NodePool:
             # 这个分支命中说明探测结果 fp 与库对不上（候选/结果错位）
             log.warning("record_probe: fp 不在库中，跳过 %s…", fp[:12])
             return
-        log.warning("record_probe HIT fp=%s ok=%s", fp[:12], ok)
-        log.warning("record_probe HIT fp=%s ok=%s", fp[:12], ok)
         ok_count, fail_count, avg_ms, streak = row
         if ok:
             # 延迟 EMA，alpha=0.4（新样本权重大，快速反映节点当前状态）
             avg_ms = (ms if not avg_ms else avg_ms * 0.6 + ms * 0.4)
-            cur = conn.execute(
+            conn.execute(
                 "UPDATE nodes SET alive=1, last_ms=?, avg_ms=?, ok_count=?,"
                 " streak_fail=0, last_ok_at=?, last_probe_at=? WHERE fp=?",
                 (ms, avg_ms, ok_count + 1, now, now, fp),
             )
-            log.warning("record_probe UPDATE ok=%s rowcount=%s now=%.3f",
-                        fp[:12], cur.rowcount, now)
         else:
             streak = (streak or 0) + 1
             alive = 0 if streak >= self.DEAD_STREAK else None
             if alive is None:
-                cur = conn.execute(
+                conn.execute(
                     "UPDATE nodes SET fail_count=?, streak_fail=?,"
                     " last_probe_at=? WHERE fp=?",
                     (fail_count + 1, streak, now, fp),
                 )
-                log.warning("record_probe UPDATE fail(NULL)=%s rowcount=%s "
-                            "now=%.3f", fp[:12], cur.rowcount, now)
             else:
-                cur = conn.execute(
+                conn.execute(
                     "UPDATE nodes SET alive=0, fail_count=?, streak_fail=?,"
                     " last_probe_at=? WHERE fp=?",
                     (fail_count + 1, streak, now, fp),
                 )
-                log.warning("record_probe UPDATE dead=%s rowcount=%s "
-                            "now=%.3f", fp[:12], cur.rowcount, now)
         self._secure()
 
     def record_site_check(self, fp: str, ok_sites: int) -> None:
