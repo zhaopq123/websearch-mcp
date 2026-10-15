@@ -390,6 +390,9 @@ class NodePool:
             (fp,),
         ).fetchone()
         if not row:
+            # 2026-10-15 排查「探测记录丢失」：静默跳过改为可观测——
+            # 这个分支命中说明探测结果 fp 与库对不上（候选/结果错位）
+            log.warning("record_probe: fp 不在库中，跳过 %s…", fp[:12])
             return
         ok_count, fail_count, avg_ms, streak = row
         if ok:
