@@ -783,6 +783,8 @@ def build_mcp(cfg: Config):
 
         参数：
           action  status（库统计，默认）| list（节点列表）| sources（源健康度）
+                  | verify（探测记录一致性自检，服务进程内视角）
+                  | verify（探测记录一致性自检，服务进程内视角）
                   | import_customer（导入客户订阅，见下）
           limit   list/sources 的返回条数上限
           pool    cust（只看客户池）| free（只看免费池）| 留空=全部
@@ -819,6 +821,42 @@ def build_mcp(cfg: Config):
             return {
                 "sources": p.source_health(limit=limit),
                 "stats": p.stats().to_dict(),
+            }
+        if action == "verify":
+            # **服务进程内**的探测记录自检（2026-10-15）。
+            # 为什么要「进程内」：独立进程只读查询与服务进程写入之间
+            # 存在 proot/WAL 可见性疑云（独立查询只见到 ~alive 条探测
+            # 记录，而服务逻辑自洽）。此 action 由服务自己的连接读，
+            # 数字就是服务眼里的真相；两方对比即可定性。
+            # 同时做「一致性交叉验证」：last_probe_at / ok_count /
+            # fail_count 是同一条 UPDATE 写的，三者应恒等；不等说明
+            # 回写链路有分支漏写。
+            conn = svc.hunter.pool._ensure()
+            row = conn.execute(
+                "SELECT COUNT(*),"
+                " SUM(CASE WHEN last_probe_at>0 THEN 1 ELSE 0 END),"
+                " SUM(CASE WHEN ok_count>0 THEN 1 ELSE 0 END),"
+                " SUM(CASE WHEN fail_count>0 THEN 1 ELSE 0 END),"
+                " SUM(CASE WHEN last_probe_at=0 AND (ok_count>0"
+                "     OR fail_count>0) THEN 1 ELSE 0 END),"
+                " SUM(CASE WHEN alive=1 THEN 1 ELSE 0 END)"
+                " FROM nodes").fetchone()
+            recent = conn.execute(
+                "SELECT COUNT(*) FROM nodes WHERE last_probe_at > ?",
+                (time.time() - 900,)).fetchone()[0]
+            return {
+                "action": "verify",
+                "view": "服务进程内（本连接）",
+                "total": row[0],
+                "last_probe_at>0": row[1],
+                "ok_count>0": row[2],
+                "fail_count>0": row[3],
+                "timestamp=0 但计数器>0（矛盾数，应为 0）": row[4],
+                "alive=1": row[5],
+                "recent_15min_probed": recent,
+                "hint": ("三者（last_probe_at/ok_count/fail_count）应恒等；"
+                         "若独立进程查询得到的数字更小 → proot/WAL "
+                         "跨进程可见性问题，功能以本视角为准。"),
             }
         if action == "import_customer":
             # 手动导入客户订阅：粘贴订阅内容（text）或给订阅 URL（sub_url）。
