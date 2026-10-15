@@ -61,6 +61,26 @@ _LINK_PATH = re.compile(r"^/(?:link|jump|url)\b", re.I)
 _CHALLENGE_HOSTS = {
     "challenges.cloudflare.com",
 }
+# ── 游戏/小说/泛娱乐聚合站（2026-10-15 实测加入）──
+# 搜「免费vpn节点」时 bing 返回 10 条里 9 条是游戏站（Poki/4399/7k7k/
+# Playhop/小猪秒玩/Yandex Games）+ 小说站（17K）+ Steam——「免费」
+# 一词命中混过了相关性校验。这类站对**任何信息检索查询**都是噪声
+#（websearch 是查资料的服务，不是找游戏），域名级拉黑。
+# 注意与 nodes/sources.py 的 _NOISE_DOMAINS 区分：那是节点源场景
+#（github 在名单里），通用搜索里 github 是好结果，两份名单不共用。
+_SEARCH_NOISE_HOSTS = {
+    # 网页游戏平台
+    "4399.com", "7k7k.com", "poki.com", "playhop.com", "pigame.cc",
+    "yandex.com", "yandex.net", "4399dj.com", "3839.com", "2144.com",
+    "337.com", "kaopu.com",
+    # 免费小说站
+    "17k.com", "qidian.com", "zongheng.com", "hongxiu.com",
+    # 游戏商店（信息检索场景的泛娱乐噪声）
+    "steampowered.com", "epicgames.com",
+}
+# ⚠️ 不拉黑正经媒体（澎湃/搜狐/网易等）——它们偶尔是搜索query的
+# 正经结果（如「免费vpn节点」返回的校园 VPN 指南）。黑名单只收
+# 「对任何信息检索查询都不可能相关」的纯娱乐聚合站。
 _CHALLENGE_PATH = re.compile(r"/_cdn-cgi/|/cdn-cgi/", re.I)
 _IMPERSONATION_HOSTS = {
     "chatgpt-ai.com",
@@ -89,6 +109,9 @@ def _is_noise_result(url: str) -> bool:
     except ValueError:
         return False
     if host in _CHALLENGE_HOSTS or _CHALLENGE_PATH.search(path):
+        return True
+    if any(host == h or host.endswith("." + h)
+           for h in _SEARCH_NOISE_HOSTS):
         return True
     return host in _IMPERSONATION_HOSTS
 
