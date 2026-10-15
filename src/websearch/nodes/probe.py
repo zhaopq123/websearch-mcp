@@ -256,7 +256,23 @@ class NodeProber:
                     return ProbeResult(fp=n["fp"], ok=False,
                                        error=type(e).__name__)
 
-        return await asyncio.gather(*(one(n) for n in nodes))
+        # 整体预算（2026-10-15 实测）：proot 单核 + 并发 TLS 握手会让
+        # per-request timeout 放大 3-7 倍（event loop 饥饿，timeout 回调
+        # 排队延迟执行）——实测 60 个 socks 直测拖 158s，把 hunt 探测
+        # 阶段拖到极限，「探测记录丢失」假象的元凶。用 asyncio.wait +
+        # 整体预算强收：完成的收结果，未完成的记失败占位，保证本函数
+        # 限时返回、record_probe 全量对账。
+        budget = max(60.0, timeout * 6)
+        tasks = {asyncio.create_task(one(n)): n["fp"] for n in nodes}
+        done, pending = await asyncio.wait(tasks.keys(), timeout=budget)
+        for t in pending:
+            t.cancel()
+        out = [t.result() for t in done if not t.cancelled()]
+        done_fps = {r.fp for r in out}
+        for t, fp in tasks.items():
+            if fp not in done_fps:
+                out.append(ProbeResult(fp=fp, ok=False, error="probe_budget"))
+        return out
 
     # ── 出网探测（主路径）──
 
