@@ -115,17 +115,17 @@ def test_dsh_snippet_matches_manager_format(authed, monkeypatch):
 def test_url_uses_request_host(authed, monkeypatch):
     """URL 要用用户实际访问的地址 —— 那才是可达的。
 
-    用户从 192.168.3.35 访问面板，生成的配置就该是那个 IP，
+    用户从局域网 IP 访问面板，生成的配置就该是那个 IP，
     而不是 127.0.0.1（后者在用户机器上指向用户自己，连不通）。
     """
     monkeypatch.setattr(
         "websearch.proxy.panel._read_mcp_token", lambda: FAKE_MCP_TOKEN
     )
-    r = authed.get("/api/client-config", headers={"host": "192.168.3.35:8500"})
+    r = authed.get("/api/client-config", headers={"host": "192.168.1.100:8500"})
     d = r.json()
     if not d.get("ok"):
         pytest.skip("环境无 token")
-    assert "192.168.3.35" in d["url"], f"URL 没用请求 Host：{d['url']}"
+    assert "192.168.1.100" in d["url"], f"URL 没用请求 Host：{d['url']}"
     assert "8500" not in d["url"], "URL 误用了面板端口（应为 MCP 服务端口 8300）"
 
 

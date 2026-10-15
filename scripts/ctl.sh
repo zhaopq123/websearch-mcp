@@ -38,7 +38,7 @@ case "${1:-status}" in
       curl -s -m 5 "http://127.0.0.1:$PORT/health" | head -c 600; echo
     else
       echo "未监听 :$PORT —— 查宿主看门狗面板："
-      echo "  ssh vivo-152 'tmux capture-pane -t websearch -p | tail -20'"
+      echo "  ssh <your-host> 'tmux capture-pane -t websearch -p | tail -20'"
       exit 1
     fi
     ;;
@@ -61,7 +61,7 @@ case "${1:-status}" in
       curl -s -m 5 "http://127.0.0.1:$PORT/health" | head -c 400; echo
     else
       echo "90s 未恢复，查宿主面板："
-      echo "  ssh vivo-152 'tmux capture-pane -t websearch -p | tail -20'"
+      echo "  ssh <your-host> 'tmux capture-pane -t websearch -p | tail -20'"
       exit 1
     fi
     ;;
@@ -72,7 +72,7 @@ case "${1:-status}" in
     ;;
   stop)
     echo "看门狗会自动重拉，容器内杀 python 停不干净。彻底停止请在宿主执行："
-    echo "  ssh vivo-152 'tmux kill-session -t websearch'"
+    echo "  ssh <your-host> 'tmux kill-session -t websearch'"
     echo "（若要重启手机后也保持停止，注释掉 ubuntu-autostart 第 2e 节）"
     exit 1
     ;;

@@ -14,7 +14,7 @@
 用法：
     python -m websearch.proxy.ticket              # 打印链接（默认 5 分钟有效）
     python -m websearch.proxy.ticket --ttl 1800   # 自定义有效期（秒）
-    python -m websearch.proxy.ticket --host 192.168.1.5   # 指定地址
+    python -m websearch.proxy.ticket --host 192.168.1.100 # 指定地址
 """
 from __future__ import annotations
 

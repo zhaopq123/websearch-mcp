@@ -28,7 +28,7 @@ def cfg(**kw):
 def test_block_private_literal_ip():
     c = cfg()
     for u in ("http://127.0.0.1/", "http://localhost/", "http://10.0.0.1/",
-              "http://192.168.3.35/", "http://172.16.0.1/", "http://169.254.1.1/"):
+              "http://192.168.1.100/", "http://172.16.0.1/", "http://169.254.1.1/"):
         ok, reason = check_url(u, c)
         assert not ok, f"{u} 应被拒绝"
         assert "private" in reason
@@ -149,7 +149,7 @@ def test_block_ipv4_mapped_ipv6():
     """
     c = cfg()
     for u in ("http://[::ffff:127.0.0.1]/", "http://[::ffff:169.254.169.254]/",
-              "http://[::ffff:10.0.0.1]/", "http://[::ffff:192.168.3.35]/"):
+              "http://[::ffff:10.0.0.1]/", "http://[::ffff:192.168.1.100]/"):
         ok, reason = check_url(u, c)
         assert not ok, f"{u} 应被拒绝（IPv4-mapped IPv6 绕过）"
         assert "private" in reason
