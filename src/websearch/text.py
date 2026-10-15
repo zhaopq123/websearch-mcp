@@ -238,6 +238,16 @@ def _solid_terms(terms: list[str]) -> list[str]:
     return out
 
 
+def _numeric_query(query: str) -> bool:
+    """是否纯数字串查询（单号/订单号/ID 类）。
+
+    ≥6 位数字（允许空格/连字符分隔）。这类查询跳过投毒判定：
+    引擎对陌生数字返回模糊推荐是「没收录」不是投毒。
+    """
+    compact = re.sub(r"[\s\-]", "", query or "")
+    return bool(re.fullmatch(r"\d{6,}", compact))
+
+
 def relevance_ratio(query: str, results: list[Any]) -> tuple[float, int]:
     """结果里有多少条和查询相关。返回 (比例, 命中条数)。
 

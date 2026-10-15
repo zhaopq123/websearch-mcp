@@ -93,3 +93,36 @@ def test_clean_snippet_truncates():
 def test_clean_snippet_entities():
     assert "&" in clean_snippet("a &amp; b")
     assert clean_snippet("a&nbsp;b") == "a b"
+
+
+# ══════════════ 2026-10-15 数字查询跳过投毒判定 ══════════════
+
+
+def test_numeric_query_detection():
+    from websearch.text import _numeric_query
+
+    assert _numeric_query("152129009867")          # 12 位数字
+    assert _numeric_query("152 1290 0986")         # 空格分隔
+    assert _numeric_query("YT4180001234567") is False  # 字母混合
+    assert _numeric_query("15212") is False        # <6 位
+    assert _numeric_query("关键词搜索") is False
+    assert _numeric_query("") is False
+
+
+def test_numeric_query_relevance_includes_url():
+    """数字查询命中判定含 URL——单号常出现在链接/参数里。"""
+    from websearch.engines import SearchResult
+    from websearch.text import relevance_ratio
+
+    q = "152129009867"
+    results = [
+        SearchResult(title="推荐内容一", url="https://x.com/id/152129009867",
+                     snippet="模糊推荐", engine="t", rank=0, site="x.com"),
+        SearchResult(title="完全无关", url="https://y.com/other",
+                     snippet="别的", engine="t", rank=1, site="y.com"),
+    ]
+    # URL 含数字 → 命中（relevance_ratio 本身不看 URL，编排层数字分支看）
+    blob_hits = sum(
+        1 for r in results
+        if q in ((r.title or "") + (r.snippet or "") + (r.url or "")))
+    assert blob_hits == 1

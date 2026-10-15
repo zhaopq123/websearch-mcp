@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from typing import Any
 
@@ -30,7 +31,7 @@ from .http_pool import (
     detect_block,
 )
 from .models import Budget, EngineOutcome, FetchResult, SearchResult
-from .text import relevance_ratio, sha1_key
+from .text import _numeric_query, relevance_ratio, sha1_key
 
 log = logging.getLogger("websearch.orch")
 
@@ -182,11 +183,27 @@ class Orchestrator:
         # **和查询完全无关的结果**。状态码 200、结构完整、条数正常，
         # 只有相关性检查能抓出来。不拦的话，垃圾结果会污染最终排序，
         # 而且会让早停条件被垃圾结果提前满足，把好引擎的结果砍掉。
-        ratio, hits = relevance_ratio(query_for_check, results)
+        # 纯数字串查询（单号/订单号/ID 类，≥6 位）跳过投毒判定：
+        # 引擎对陌生数字常返回「无结果 + 模糊推荐页」，不含数字 ≠ 投毒
+        # （投毒者不会针对随机数字伪造内容）。实测 2026-10-15：搜
+        # 「152129009867」一次把 bing/so360 的推荐结果全判 irrelevant →
+        # 4 连败 → 9 个引擎熔断 600s，服务瘫痪。数字查询的「没结果」
+        # 是合法状态，正常记成功让 fusion 兜底；命中判定放宽到 URL
+        # （单号常出现在链接/参数里）。
+        if _numeric_query(query_for_check):
+            hits = sum(
+                1 for r in results
+                if query_for_check.replace(" ", "")
+                in ((r.title or "") + (r.snippet or "") + (getattr(r, "url", "") or ""))
+            )
+            ratio = hits / len(results) if results else 0.0
+        else:
+            ratio, hits = relevance_ratio(query_for_check, results)
         # 用**比例**而不是「有没有命中」：投毒结果里往往混着一两条碰巧相关的
         # （实测必应投毒时 10 条里有 1 条含「咖啡」），只数命中数会漏网。
         # 正常引擎对多词查询的相关率普遍在 60% 以上，0.3 是很宽松的线。
-        if hits == 0 or ratio < self.cfg.min_relevance_ratio:
+        if not _numeric_query(query_for_check) and (
+                hits == 0 or ratio < self.cfg.min_relevance_ratio):
             self.gov.record(name, False, elapsed,
                             f"irrelevant(0/{len(results)} 条命中查询词)", blocked=True)
             return EngineOutcome(
