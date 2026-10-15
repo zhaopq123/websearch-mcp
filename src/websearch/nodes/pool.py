@@ -274,6 +274,27 @@ class NodePool:
 
     # ── 写入 ──
 
+    def known_fps(self, fps: list[str]) -> set[str]:
+        """批量查哪些指纹已在库（入库前判新，省掉逐条 SELECT）。
+
+        2026-10-15 压测后新增：morpheusadam/FastNodes 每轮解析 3.2 万
+        节点，原 upsert_nodes 逐条 SELECT 3.2 万次（SQLite 全表扫），
+        大 bundle 源入库耗时占满一轮 hunt。分批 IN 查询 + executemany
+        后同批次从分钟级降到百毫秒级。
+        """
+        if not fps:
+            return set()
+        out: set[str] = set()
+        chunk = 400   # SQLite 变量数默认上限 999，400 稳妥
+        conn = self._ensure()
+        for i in range(0, len(fps), chunk):
+            batch = fps[i:i + chunk]
+            q = ",".join("?" * len(batch))
+            for (fp,) in conn.execute(
+                    f"SELECT fp FROM nodes WHERE fp IN ({q})", batch):
+                out.add(fp)
+        return out
+
     def upsert_nodes(self, nodes: Iterable[tuple[str, str, dict[str, Any]]],
                      source_sid: str = "", pool: str = "free") -> int:
         """批量入库。nodes 每项 = (tag, protocol, outbound)。
@@ -286,10 +307,15 @@ class NodePool:
         见 _SCHEMA.nodes.pool。同一节点被两个来源同时提供时，
         **已有记录不覆盖归属**：客户池优先，避免客户付费节点
         被一次免费源命中就降级成 free（进而被 prune 淘汰）。
+
+        实现：两阶段批量（2026-10-15 重构，原逐条 SELECT+INSERT）。
+        阶段一 known_fps 分批 IN 查已有；阶段二 executemany。
+        「归属只升不降」用 SQL CASE 表达（pool='cust' 永不被降级），
+        sources 合并用 instr 判重后拼接，语义与旧逐条版一致。
         """
         conn = self._ensure()
         now = time.time()
-        added = 0
+        cleaned: list[tuple[str, str, int, str, str, str, dict[str, Any]]] = []
         for tag, protocol, outbound in nodes:
             server = str(outbound.get("server", "")).strip()
             port = outbound.get("server_port", outbound.get("port", 0))
@@ -299,36 +325,57 @@ class NodePool:
                 continue
             if not server or not port:
                 continue
-            fp = fingerprint(protocol, outbound)
-            country = _guess_country(tag)
-            exists = conn.execute(
-                "SELECT sources, pool FROM nodes WHERE fp=?", (fp,)
-            ).fetchone()
-            if exists:
-                srcs = set(filter(None, (exists[0] or "").split(",")))
-                if source_sid:
-                    srcs.add(source_sid)
-                # 归属只升不降：free 命中已有 cust 节点时保留 cust
-                keep = exists[1] or "free"
-                if pool == "cust":
-                    keep = "cust"
-                conn.execute(
-                    "UPDATE nodes SET last_seen=?, sources=?, tag=?, pool=?"
-                    " WHERE fp=?",
-                    (now, ",".join(sorted(srcs)), tag, keep, fp),
-                )
+            cleaned.append((tag, protocol, port, server,
+                            _guess_country(tag),
+                            fingerprint(protocol, outbound), outbound))
+        if not cleaned:
+            return 0
+
+        known = self.known_fps([c[5] for c in cleaned])
+        inserts: list[tuple[Any, ...]] = []
+        updates: list[tuple[Any, ...]] = []
+        seen_batch: set[str] = set()
+        for tag, protocol, port, server, country, fp, outbound in cleaned:
+            if fp in known:
+                # (now, tag, newpool, sid, sid, sid, fp)
+                # sources 合并：空则直接放 sid；已含则不追加；否则追加
+                updates.append((now, tag, pool, source_sid,
+                                source_sid, source_sid, fp))
+            elif fp in seen_batch:
+                # 同批次内重复（bundle 源常见：同一节点在一个文件里
+                # 出现多次）。旧逐条版靠「上一条已提交」自然走到 update
+                # 分支；批量版必须显式去重，否则 executemany 撞 UNIQUE。
+                updates.append((now, tag, pool, source_sid,
+                                source_sid, source_sid, fp))
             else:
-                conn.execute(
-                    "INSERT INTO nodes (fp, protocol, server, port, country, tag,"
-                    " pool, outbound, sources, first_seen, last_seen)"
+                seen_batch.add(fp)
+                inserts.append((
+                    fp, protocol, server, port, country, tag, pool,
+                    json.dumps(outbound, ensure_ascii=False),
+                    source_sid, now, now,
+                ))
+        with conn:
+            if inserts:
+                conn.executemany(
+                    "INSERT INTO nodes (fp, protocol, server, port, country,"
+                    " tag, pool, outbound, sources, first_seen, last_seen)"
                     " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                    (fp, protocol, server, port, country, tag, pool,
-                     json.dumps(outbound, ensure_ascii=False),
-                     source_sid, now, now),
+                    inserts,
                 )
-                added += 1
+            if updates:
+                conn.executemany(
+                    "UPDATE nodes SET last_seen=?, tag=?,"
+                    " pool=CASE WHEN pool='cust' THEN 'cust' ELSE ? END,"
+                    " sources=CASE"
+                    "   WHEN IFNULL(sources,'')='' THEN ?"
+                    "   WHEN instr(','||sources||',', ','||?||',') > 0"
+                    "        THEN sources"
+                    "   ELSE sources||','||? END"
+                    " WHERE fp=?",
+                    updates,
+                )
         self._secure()
-        return added
+        return len(inserts)
 
     def record_probe(self, fp: str, ok: bool, ms: int = 0) -> None:
         """记录一次探测结果，更新健康分。
