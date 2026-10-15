@@ -738,6 +738,7 @@ class NodeHunter:
         if not cands:
             return {"probed": 0, "alive": 0, "probe_start_failed": False}
         nodes = [{"fp": c["fp"], "outbound": c["outbound"]} for c in cands]
+        probe_t0 = time.time()
         results = await self.prober.probe_batch(nodes)
         alive = 0
         start_failed = 0
@@ -747,11 +748,27 @@ class NodeHunter:
                 alive += 1
             elif getattr(r, "error", "") == "探测实例启动失败":
                 start_failed += 1
+        # 回写自证（2026-10-15 排查「探测记录丢失」）：数一下本轮
+        # 探测的 fp 里有多少 last_probe_at 真的被更新了。理论上应
+        # == len(results)；若小于，说明回写链路有问题（事务/并发/连接）。
+        written = 0
+        try:
+            fps = list({r.fp for r in results})
+            marks = ",".join("?" * len(fps))
+            row = self.pool._ensure().execute(
+                f"SELECT COUNT(*) FROM nodes WHERE fp IN ({marks})"
+                " AND last_probe_at >= ?",
+                (*fps, probe_t0 - 5),
+            ).fetchone()
+            written = row[0] if row else 0
+        except Exception:
+            written = -1
         # 整批因实例起不来而判失败 ≠ 节点都差：单独标记，别污染存活率 EMA
         systemic = bool(results) and start_failed == len(results)
         return {
             "probed": len(results),
             "alive": alive,
+            "probe_written": written,
             "probe_mode": "exit_verified" if self.prober.has_singbox else "tcp_only",
             "probe_start_failed": systemic,
         }
