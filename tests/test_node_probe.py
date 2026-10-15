@@ -372,3 +372,169 @@ def test_probe_start_failed_flag_false_when_nodes_really_dead():
     rep = asyncio.run(_hunter_with(_P())._probe_candidates(100))
     assert rep["probe_start_failed"] is False
     assert rep["probed"] == 2
+
+
+# ══════════════ 2026-10-15 普通代理直测分流 ══════════════
+
+
+@pytest.mark.asyncio
+async def test_plain_proxy_probe_skips_singbox(tmp_path, monkeypatch):
+    """socks/http 代理走 httpx 直测，不起 sing-box。
+
+    实测背景：代理池 2533 个 socks 走 sing-box 管线因端口竞态 + 探测
+    预算只能排到 5 个/轮；直测路径不受 PROBE_PORT_SPAN 约束。
+    """
+    from websearch.nodes.probe import NodeProber
+
+    p = NodeProber(singbox_bin="", work_dir=tmp_path)
+    # 没有 sing-box：若走 _probe_light 会全失败；直测路径应照常工作
+    nodes = [
+        {"fp": "s1", "protocol": "socks",
+         "outbound": {"type": "socks", "server": "127.0.0.1",
+                      "server_port": 1080, "version": "5"}},
+        {"fp": "h1", "protocol": "http",
+         "outbound": {"type": "http", "server": "127.0.0.1",
+                      "server_port": 8080}},
+    ]
+
+    called = {"n": 0}
+
+    class _Resp:
+        status_code = 204
+
+    class _Cli:
+        def __init__(self, **kw):
+            called["n"] += 1
+            self.kw = kw
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            return _Resp()
+
+    import websearch.nodes.probe as pm
+    monkeypatch.setattr(pm.httpx, "AsyncClient", _Cli)
+    res = await p._probe_plain_proxies(nodes, timeout=5.0, concurrency=50)
+    assert len(res) == 2
+    assert all(r.ok for r in res)
+    assert all(r.exit_verified for r in res)
+    assert called["n"] == 2   # 每个代理一个 client（并发 50 不串扰）
+
+
+@pytest.mark.asyncio
+async def test_probe_batch_mixes_plain_and_tunnel(tmp_path, monkeypatch):
+    """混合批次：普通代理直测 + 隧道节点走 sing-box，结果按 fp 对齐。"""
+    from websearch.nodes import probe as pm
+    from websearch.nodes.probe import NodeProber
+
+    p = NodeProber(singbox_bin="", work_dir=tmp_path)
+    nodes = [
+        {"fp": "s1", "protocol": "socks",
+         "outbound": {"type": "socks", "server": "127.0.0.1",
+                      "server_port": 1080, "version": "5"}},
+        {"fp": "t1", "protocol": "vless",
+         "outbound": {"type": "vless", "server": "127.0.0.1",
+                      "server_port": 443}},
+    ]
+
+    async def fake_plain(ns, timeout, concurrency):
+        return [pm.ProbeResult(fp="s1", ok=True, ms=100,
+                               exit_verified=True)]
+
+    async def fake_light(ns, timeout, concurrency):
+        return [pm.ProbeResult(fp="t1", ok=True, ms=200,
+                               exit_verified=True)]
+
+    monkeypatch.setattr(p, "_probe_plain_proxies", fake_plain)
+    monkeypatch.setattr(p, "_probe_light", fake_light)
+    res = await p.probe_batch(nodes, timeout=5.0, concurrency=12)
+    by_fp = {r.fp: r for r in res}
+    assert by_fp["s1"].ok and by_fp["t1"].ok
+    assert len(res) == 2   # 与输入等长
+
+
+# ══════════════ 2026-10-15 普通代理直测分流 ══════════════
+
+
+@pytest.mark.asyncio
+async def test_plain_proxy_probe_skips_singbox(tmp_path, monkeypatch):
+    """socks/http 代理走 httpx 直测，不起 sing-box。
+
+    实测背景：代理池 2533 个 socks 走 sing-box 管线因端口竞态 + 探测
+    预算只能排到 5 个/轮；直测路径不受 PROBE_PORT_SPAN 约束。
+    """
+    from websearch.nodes.probe import NodeProber
+
+    p = NodeProber(singbox_bin="", work_dir=tmp_path)
+    # 没有 sing-box：若走 _probe_light 会全失败；直测路径应照常工作
+    nodes = [
+        {"fp": "s1", "protocol": "socks",
+         "outbound": {"type": "socks", "server": "127.0.0.1",
+                      "server_port": 1080, "version": "5"}},
+        {"fp": "h1", "protocol": "http",
+         "outbound": {"type": "http", "server": "127.0.0.1",
+                      "server_port": 8080}},
+    ]
+
+    called = {"n": 0}
+
+    class _Resp:
+        status_code = 204
+
+    class _Cli:
+        def __init__(self, **kw):
+            called["n"] += 1
+            self.kw = kw
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            return _Resp()
+
+    import websearch.nodes.probe as pm
+    monkeypatch.setattr(pm.httpx, "AsyncClient", _Cli)
+    res = await p._probe_plain_proxies(nodes, timeout=5.0, concurrency=50)
+    assert len(res) == 2
+    assert all(r.ok for r in res)
+    assert all(r.exit_verified for r in res)
+    assert called["n"] == 2   # 每个代理一个 client（并发 50 不串扰）
+
+
+@pytest.mark.asyncio
+async def test_probe_batch_mixes_plain_and_tunnel(tmp_path, monkeypatch):
+    """混合批次：普通代理直测 + 隧道节点走 sing-box，结果按 fp 对齐。"""
+    from websearch.nodes import probe as pm
+    from websearch.nodes.probe import NodeProber
+
+    p = NodeProber(singbox_bin="", work_dir=tmp_path)
+    nodes = [
+        {"fp": "s1", "protocol": "socks",
+         "outbound": {"type": "socks", "server": "127.0.0.1",
+                      "server_port": 1080, "version": "5"}},
+        {"fp": "t1", "protocol": "vless",
+         "outbound": {"type": "vless", "server": "127.0.0.1",
+                      "server_port": 443}},
+    ]
+
+    async def fake_plain(ns, timeout, concurrency):
+        return [pm.ProbeResult(fp="s1", ok=True, ms=100,
+                               exit_verified=True)]
+
+    async def fake_light(ns, timeout, concurrency):
+        return [pm.ProbeResult(fp="t1", ok=True, ms=200,
+                               exit_verified=True)]
+
+    monkeypatch.setattr(p, "_probe_plain_proxies", fake_plain)
+    monkeypatch.setattr(p, "_probe_light", fake_light)
+    res = await p.probe_batch(nodes, timeout=5.0, concurrency=12)
+    by_fp = {r.fp: r for r in res}
+    assert by_fp["s1"].ok and by_fp["t1"].ok
+    assert len(res) == 2   # 与输入等长

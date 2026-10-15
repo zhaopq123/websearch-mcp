@@ -163,21 +163,88 @@ class NodeProber:
 
         nodes 每项需含：fp、outbound（sing-box outbound，**含凭据**）。
         返回与输入等长的结果列表。
+
+        2026-10-15 分流：普通 SOCKS/HTTP 代理（outbound type =
+        socks/http）**不走 sing-box 批处理**——它们本身就是代理，
+        httpx 直接经它们发请求就是真出网验证，且不受
+        PROBE_PORT_SPAN/PROBE_HARD_CAP 的 sing-box 实例上限约束，
+        并发可拉到 50+。实测代理池 2533 个 socks 走 sing-box 管线
+        只能排到 5 个/轮（端口竞态 + 探测预算），直测路径全池
+        2 分钟能过一遍。
         """
         nodes = list(nodes)
         if not nodes:
             return []
-        if len(nodes) > PROBE_PORT_SPAN:
-            nodes = nodes[:PROBE_PORT_SPAN]
         timeout = timeout or self.timeout
         concurrency = concurrency or self.concurrency
 
-        if not self.has_singbox:
-            # 退化：没有 sing-box 就没法做真出网验证，只能测 TCP/TLS
-            return await self._probe_light(nodes, timeout, concurrency)
+        plain = [n for n in nodes
+                 if str((n.get("outbound") or {}).get("type")) in
+                 ("socks", "http")]
+        tunnel = [n for n in nodes
+                  if str((n.get("outbound") or {}).get("type")) not in
+                  ("socks", "http")]
 
-        env = await self.detect_env()
-        return await self._probe_via_singbox(nodes, timeout, concurrency, env)
+        results: list[ProbeResult] = []
+        if plain:
+            results.extend(await self._probe_plain_proxies(
+                plain, timeout, max(concurrency, 50)))
+        if tunnel:
+            if len(tunnel) > PROBE_PORT_SPAN:
+                tunnel = tunnel[:PROBE_PORT_SPAN]
+            if not self.has_singbox:
+                results.extend(await self._probe_light(
+                    tunnel, timeout, concurrency))
+            else:
+                env = await self.detect_env()
+                results.extend(await self._probe_via_singbox(
+                    tunnel, timeout, concurrency, env))
+        # 按输入顺序返回（调用方按 fp 对齐，顺序无关也要保持）
+        by_fp = {r.fp: r for r in results}
+        return [by_fp.get(n["fp"], ProbeResult(fp=n["fp"], ok=False,
+                                               error="未探测"))
+                for n in nodes]
+
+    async def _probe_plain_proxies(self, nodes: list[dict[str, Any]],
+                                   timeout: float,
+                                   concurrency: int) -> list[ProbeResult]:
+        """普通 SOCKS/HTTP 代理直测：httpx 经代理请求 CHECK_URL。
+
+        与 sing-box 路径判定标准一致（CHECK_URL 返回 200/204 = 活），
+        出口验证语义相同。不需要 sing-box、不占探测端口段。
+        """
+        sem = asyncio.Semaphore(concurrency)
+
+        async def one(n: dict[str, Any]) -> ProbeResult:
+            ob = n.get("outbound") or {}
+            host = str(ob.get("server") or "")
+            port = int(ob.get("server_port") or 0)
+            scheme = "socks5" if ob.get("type") == "socks" else "http"
+            if ob.get("type") == "socks" and ob.get("version") == "4":
+                scheme = "socks4"
+            auth = ""
+            if ob.get("username"):
+                auth = f"{ob['username']}:{ob.get('password', '')}@"
+            proxy_url = f"{scheme}://{auth}{host}:{port}"
+            async with sem:
+                t0 = time.monotonic()
+                try:
+                    async with httpx.AsyncClient(
+                        proxy=proxy_url, timeout=timeout,
+                        follow_redirects=False,
+                    ) as c:
+                        r = await c.get(CHECK_URL)
+                    ms = int((time.monotonic() - t0) * 1000)
+                    if r.status_code in (200, 204):
+                        return ProbeResult(fp=n["fp"], ok=True, ms=ms,
+                                           exit_verified=True)
+                    return ProbeResult(fp=n["fp"], ok=False,
+                                       error=f"HTTP {r.status_code}")
+                except Exception as e:
+                    return ProbeResult(fp=n["fp"], ok=False,
+                                       error=type(e).__name__)
+
+        return await asyncio.gather(*(one(n) for n in nodes))
 
     # ── 出网探测（主路径）──
 
