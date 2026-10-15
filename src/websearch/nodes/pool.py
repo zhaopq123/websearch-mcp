@@ -202,11 +202,15 @@ class NodePool:
     # Proxifly/…）**每轮都列出死代理**（列表自己不删死条目）——
     # last_seen 被无限刷新，死代理永远删不掉，库无限膨胀。
     # 死透硬删：明确判死（alive=0）、测过（last_probe_at>0，没测过的
-    # 不误杀）、48h 没活过 → 删，不问 last_seen。
-    PRUNE_DEAD_AFTER_SEC = 48 * 3600
-    # 陈库存硬删：入库 3 天还从未排到探测（预算有限，新鲜节点一直在
-    # 前面）→ 删。留着既是纯负担，又会拖慢候选查询。
-    PRUNE_UNTESTED_AFTER_SEC = 3 * 24 * 3600
+    # 不误杀）、24h 没活过 → 删，不问 last_seen。
+    # 2026-10-15 收紧 48h→24h：实测公开代理存活率仅 17%、寿命以小时计
+    # （13:07 入库的 socks 到 14:00 直测 0/30 全死），48h 给「假活库存」
+    # 留太久。VPN 节点同理——24h 没活过的死节点没有复活动先例。
+    PRUNE_DEAD_AFTER_SEC = 24 * 3600
+    # 陈库存硬删：入库 2 天还从未排到探测（预算有限，新鲜节点一直在
+    # 前面）→ 删。实测 socks backlog 7.6k、探测 340/轮，3 天根本轮不
+    # 完一轮；2 天 + 每轮新鲜度优先，保证库存持续周转。
+    PRUNE_UNTESTED_AFTER_SEC = 2 * 24 * 3600
 
     def __init__(self, db_path: Path | str):
         self.path = Path(db_path)
