@@ -465,7 +465,9 @@ class NodePool:
 
     def candidates_for_probe(self, limit: int = 200,
                              prefer_untested: bool = True,
-                             pool: str = "") -> list[dict[str, Any]]:
+                             pool: str = "",
+                             only_protocols: tuple[str, ...] = (),
+                             ) -> list[dict[str, Any]]:
         """挑一批候选节点去探测。
 
         优先级（**分层，不是简单按 last_probe_at 排序**）：
@@ -477,13 +479,26 @@ class NodePool:
         「最近测过且死了」的节点排在最前 —— 库里死节点上千时
         （实测免费池 807 个存活 0），探测预算全花在重测已知死节点上，
         新入库的节点永远测不到。保活必须是「先测新的，再刷老的」。
+
+        only_protocols：只返回这些协议（探测侧按协议分配额用）。
+        2026-10-15 实测盲区：纯 first_seen DESC 在「同轮多源入库」
+        时退化成「最后入库的源优先」——socks 13:06 入库、GFP vless
+        13:07 入库，1 分钟之差让 7635 个未测 socks 被同秒入库的
+        vless 全部挤出窗口。探测侧按协议分配额解决。
         """
         conn = self._ensure()
         where = ""
         params: list[Any] = []
+        conds: list[str] = []
         if pool in ("cust", "free"):
-            where = "WHERE pool=?"
+            conds.append("pool=?")
             params.append(pool)
+        if only_protocols:
+            conds.append(
+                f"protocol IN ({','.join('?' * len(only_protocols))})")
+            params.extend(only_protocols)
+        if conds:
+            where = "WHERE " + " AND ".join(conds)
         # 活着 > 未测 > 很久没测（>2h 视为需要刷新）> 其他。
         # ⚠️ 2026-10-14 修新鲜度：未测层里必须**最新的优先**。免费节点
         # 按小时死（实测库存抽样 60 个全 ConnectError，0% 存活），旧排序

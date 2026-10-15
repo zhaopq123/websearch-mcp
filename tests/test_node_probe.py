@@ -324,7 +324,10 @@ def _hunter_with(prober):
 
     class _Pool:
         def candidates_for_probe(self, limit=200, prefer_untested=True,
-                                 pool=""):
+                                 pool="", only_protocols=()):
+            # 2026-10-15 起探测侧按协议分额（plain/tunnel 两次查询），
+            # stub 用 **kwargs 兼容新参数；两个 free 查询都会拿到节点，
+            # 去重后仍是 n1/n2
             if pool == "free":
                 return [{"fp": "n1", "outbound": {}},
                         {"fp": "n2", "outbound": {}}]

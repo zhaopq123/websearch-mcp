@@ -714,11 +714,27 @@ class NodeHunter:
                 limit=cust_quota, pool="cust"), "cust"))
         free_quota = max(0, limit - cust_quota)
         if free_quota > 0:
-            parts.append((self.pool.candidates_for_probe(
-                limit=free_quota, pool="free"), "free"))
+            # free 池内再按协议分额（2026-10-15）：普通代理（socks/http）
+            # 拿一半 —— 实测盲区：纯 first_seen DESC 在「同轮多源入库」
+            # 时退化成「最后入库的源优先」，代理源前置先入库反而永远被
+            # 后入库的 VPN 源挤出窗口（7635 个未测 socks vs 候选 0 个）。
+            # 普通代理探测走 httpx 直测（并发 50+，秒级一批），成本极低。
+            plain_q = free_quota // 2
+            plain = self.pool.candidates_for_probe(
+                limit=plain_q, pool="free",
+                only_protocols=("socks", "http"))
+            parts.append((plain, "free"))
+            tunnel_q = free_quota - len(plain)
+            if tunnel_q > 0:
+                parts.append((self.pool.candidates_for_probe(
+                    limit=tunnel_q, pool="free"), "free"))
         cands: list[dict[str, Any]] = []
+        seen_fps: set[str] = set()
         for batch, _pool in parts:
-            cands.extend(batch)
+            for c in batch:
+                if c["fp"] not in seen_fps:   # plain/tunnel 两查可能重叠
+                    seen_fps.add(c["fp"])
+                    cands.append(c)
         if not cands:
             return {"probed": 0, "alive": 0, "probe_start_failed": False}
         nodes = [{"fp": c["fp"], "outbound": c["outbound"]} for c in cands]
