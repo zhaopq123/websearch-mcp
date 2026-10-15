@@ -346,6 +346,15 @@ class NodeHunter:
                 # 3) 探测候选（cust 配额 + free 补量）
                 probe_report = await self._probe_candidates(probe_limit)
                 report.update(probe_report)
+
+                # 3b) 站点可达性抽检（2026-10-15 实测驱动）：选路只按
+                # 延迟会选中「快而残」的节点——实测 5 个香港节点延迟
+                # 最优但对 github/DDG/快递100 全不通，英国节点慢 4%
+                # 却全通。每轮抽 3 个 top 节点测盲区站（github/DDG），
+                # 结果喂 best() 的「站点覆盖优先」排序。
+                site_report = await self._site_check(limit=3)
+                if site_report.get("checked"):
+                    report["site_checked"] = site_report["checked"]
                 # 探测实例没起来（端口竞态等）造成的 0 存活不是「节点都差」，
                 # 别喂给存活率 EMA —— 否则坏一轮就让下轮 batch 缩水（负反馈）
                 if not report.get("probe_start_failed"):
@@ -774,6 +783,48 @@ class NodeHunter:
             "probe_mode": "exit_verified" if self.prober.has_singbox else "tcp_only",
             "probe_start_failed": systemic,
         }
+
+    async def _site_check(self, limit: int = 3) -> dict[str, Any]:
+        """站点可达性抽检：top alive 节点测盲区站（github/DDG）。
+
+        为什么必须抽检而不能只看延迟：实测（2026-10-15）延迟最优的
+        一批香港节点对 github/DDG/快递100 全部 ConnectError，而慢 4%
+        的英国节点全通。盲区是**批次特征**（同源节点同出口段被封），
+        抽 top 3 即可代表选路档位，成本可控（3 节点 × 2 站 ≈ 30s）。
+
+        复用 NodeProber 的多节点批量机制（check_url 参数），不另起
+        proxy 实例——不动服务正在用的 17892。
+        """
+        try:
+            cands = self.pool.site_check_candidates(limit)
+        except Exception:
+            return {"checked": 0}
+        if not cands:
+            return {"checked": 0}
+        nodes = [{"fp": c["fp"], "outbound": c["outbound"]} for c in cands]
+        # 盲区站：实测有区分度（google/bing 全通、github/DDG 分批次）
+        targets = [
+            "https://github.com",
+            "https://html.duckduckgo.com/html/?q=test",
+        ]
+        ok_map: dict[str, int] = {c["fp"]: 0 for c in cands}
+        for url in targets:
+            try:
+                results = await self.prober.probe_batch(
+                    nodes, timeout=10.0, check_url=url)
+                for r in results:
+                    if r.ok:
+                        ok_map[r.fp] = ok_map.get(r.fp, 0) + 1
+            except Exception as e:
+                log.info("站点抽检异常（%s）：%s", url, type(e).__name__)
+        checked = 0
+        for fp, n_ok in ok_map.items():
+            self.pool.record_site_check(fp, n_ok)
+            checked += 1
+        if checked:
+            log.info("站点抽检完成：%d 个节点（github/DDG 可达数：%s）",
+                     checked, sorted(ok_map.values(), reverse=True))
+        return {"checked": checked}
 
     # ══════════════════ 持续搜索循环 ══════════════════
 

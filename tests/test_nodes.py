@@ -1555,3 +1555,52 @@ def test_round_ingest_cap_partial_then_exhausted(tmp_path):
     _, a2 = h._ingest_text(text, "src-2")
     assert a2 == 0
     assert len(h.pool.list_public(only_alive=False)) == 7
+
+
+# ══════════════ 2026-10-15 站点可达性抽检 ══════════════
+
+
+def test_site_check_candidates_and_record(tmp_path):
+    """抽检候选只取 alive 延迟档；记录写入 site_ok。"""
+    from websearch.nodes.pool import NodePool
+
+    p = NodePool(tmp_path / "n.sqlite3")
+    p.upsert_nodes([
+        (f"n{i}", "vless", {"type": "vless", "server": f"10.0.0.{i}",
+                            "server_port": 443}) for i in range(5)
+    ])
+    for i in range(5):
+        fp = [r[0] for r in p._ensure().execute(
+            "SELECT fp FROM nodes WHERE server=?", (f"10.0.0.{i}",))][0]
+        p.record_probe(fp, True, 1000 + i * 100)
+    cands = p.site_check_candidates(limit=3)
+    assert len(cands) == 3
+    # 最快的最先抽（500ms 档优先）
+    assert cands[0]["outbound"]["server"] == "10.0.0.0"
+    # 记录 + best 排序：全通节点压过更快但盲区的节点
+    slow_fp = cands[0]["fp"]
+    p.record_site_check(slow_fp, 2)          # 全通
+    p.record_site_check(cands[1]["fp"], 0)   # 盲区
+    best = p.best(prefer="free")
+    assert best["fp"] == slow_fp, "站点全通的节点应压过更快的盲区节点"
+
+
+def test_best_prefers_site_coverage_over_latency(tmp_path):
+    """站点覆盖优先于延迟（实测：香港快 4% 但盲区，英国全通）。"""
+    from websearch.nodes.pool import NodePool
+
+    p = NodePool(tmp_path / "n.sqlite3")
+    p.upsert_nodes([
+        ("hk", "vless", {"type": "vless", "server": "10.0.0.1",
+                         "server_port": 443}),
+        ("gb", "vless", {"type": "vless", "server": "10.0.0.2",
+                         "server_port": 443}),
+    ])
+    fps = {r[1]: r[0] for r in p._ensure().execute(
+        "SELECT fp, server FROM nodes")}
+    p.record_probe(fps["10.0.0.1"], True, 3900)   # HK 更快
+    p.record_probe(fps["10.0.0.2"], True, 4100)   # GB 稍慢
+    p.record_site_check(fps["10.0.0.1"], 0)        # HK 盲区
+    p.record_site_check(fps["10.0.0.2"], 2)        # GB 全通
+    best = p.best(prefer="free")
+    assert best["fp"] == fps["10.0.0.2"], "应选站点全通的 GB 而非更快的 HK"

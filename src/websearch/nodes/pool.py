@@ -54,7 +54,12 @@ CREATE TABLE IF NOT EXISTS nodes (
     fail_count  INTEGER DEFAULT 0,
     streak_fail INTEGER DEFAULT 0,  -- 连续失败次数（智能降级用）
     last_ok_at  REAL DEFAULT 0,
-    last_probe_at REAL DEFAULT 0
+    last_probe_at REAL DEFAULT 0,
+    -- 站点可达性抽检（2026-10-15）：0-2 = 覆盖的盲区站数（github/DDG），
+    -- -1 = 未检。实测香港批次节点对 github/DDG 全不通但 google/bing 通
+    -- （延迟还最优），选路若只看延迟就会选中盲区节点。
+    site_ok      INTEGER DEFAULT -1,
+    site_checked_at REAL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS sources (
@@ -257,6 +262,10 @@ class NodePool:
                 "ALTER TABLE nodes ADD COLUMN pool TEXT DEFAULT 'cust'"
             )
             log.info("节点库迁移：新增 pool 列，历史节点归入 cust 池")
+        if "site_ok" not in cols:
+            conn.execute("ALTER TABLE nodes ADD COLUMN site_ok INTEGER DEFAULT -1")
+            conn.execute("ALTER TABLE nodes ADD COLUMN site_checked_at REAL DEFAULT 0")
+            log.info("节点库迁移：新增 site_ok/site_checked_at 列（站点可达性抽检）")
 
     def _secure(self) -> None:
         """强制 600 —— 库里含节点凭据。"""
@@ -432,6 +441,40 @@ class NodePool:
                             "now=%.3f", fp[:12], cur.rowcount, now)
         self._secure()
 
+    def record_site_check(self, fp: str, ok_sites: int) -> None:
+        """记录一次站点可达性抽检结果（0-2 = 覆盖的盲区站数）。
+
+        Args:
+            fp: 节点指纹。
+            ok_sites: 可达的盲区站数（github/DDG 两个）。
+        """
+        conn = self._ensure()
+        conn.execute(
+            "UPDATE nodes SET site_ok=?, site_checked_at=? WHERE fp=?",
+            (int(ok_sites), time.time(), fp),
+        )
+        self._secure()
+
+    def site_check_candidates(self, limit: int = 10) -> list[dict[str, Any]]:
+        """选站点抽检对象：alive 且延迟最优的节点（选路候选所在）。
+
+        只抽 top N——盲区是**批次特征**（实测同批 5 个香港节点全盲），
+        抽检最优档即可代表选路结果，不必全池抽检（成本 ×1000）。
+        """
+        conn = self._ensure()
+        rows = conn.execute(
+            "SELECT fp, protocol, server, port, country, tag, outbound"
+            " FROM nodes WHERE alive=1 AND avg_ms>0"
+            " ORDER BY (CASE WHEN site_ok < 0 THEN 1 ELSE 0 END) ASC,"
+            "  site_checked_at ASC, avg_ms ASC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [
+            {"fp": r[0], "protocol": r[1], "server": r[2], "port": r[3],
+             "country": r[4], "tag": r[5], "outbound": json.loads(r[6])}
+            for r in rows
+        ]
+
     def upsert_source(self, sid: str, url: str, kind: str = "sub") -> None:
         conn = self._ensure()
         conn.execute(
@@ -587,10 +630,19 @@ class NodePool:
         params: list[Any] = [pool]
         if only_alive:
             where += " AND alive=1"
+        # 排序（2026-10-15 加站点覆盖）：已抽检且盲区站全通的优先，
+        # 未检的次之，已检但盲区不通的垫底；同档再按延迟。
+        # 实测依据：香港批次节点延迟最优但对 github/DDG/快递100 全不通，
+        # 英国节点慢 4% 但全通——只按延迟选会选中「快而残」的节点。
         rows = conn.execute(
             f"SELECT fp, protocol, server, port, country, tag, avg_ms,"
-            f" ok_count, fail_count, alive, last_ok_at FROM nodes {where}"
-            f" ORDER BY (CASE WHEN avg_ms>0 THEN avg_ms ELSE 99999 END) ASC"
+            f" ok_count, fail_count, alive, last_ok_at, site_ok FROM nodes {where}"
+            f" ORDER BY"
+            # 站点覆盖档位（好→差）：全通(2) > 部分(1) > 未检(-1) > 盲区(0)。
+            # 未检排在盲区前——未知的值得一试，已证伪的别浪费。
+            f"  (CASE WHEN site_ok >= 2 THEN 0 WHEN site_ok = 1 THEN 1"
+            f"        WHEN site_ok < 0 THEN 2 ELSE 3 END) ASC,"
+            f"  (CASE WHEN avg_ms>0 THEN avg_ms ELSE 99999 END) ASC"
             f" LIMIT 20",
             params,
         ).fetchall()
@@ -602,7 +654,22 @@ class NodePool:
             total = ok_c + fail_c
             rate = (ok_c / total) if total else 0.5
             ms = r[6] or 99999
-            score = rate * 1000 - ms
+            # 站点覆盖 bonus（2026-10-15）：量级必须压过延迟差
+            # （实测港/英节点延迟仅差 ~200ms，而盲区差是「能用 vs
+            # 不能用」）。全通 +4000 / 部分 +2000 / 未检 +500 / 盲区 +0；
+            # 延迟项是 -ms（~4000），故 bonus 与延迟同量级但方向明确。
+            site_ok = r[11] if len(r) > 11 else -1
+            if site_ok is None:
+                site_ok = -1
+            if site_ok >= 2:
+                bonus = 4000
+            elif site_ok == 1:
+                bonus = 2000
+            elif site_ok < 0:
+                bonus = 500
+            else:
+                bonus = 0
+            score = rate * 1000 - ms + bonus
             scored.append((score, r))
         scored.sort(key=lambda x: -x[0])
         r = scored[0][1]

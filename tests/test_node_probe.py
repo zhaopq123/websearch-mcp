@@ -301,7 +301,7 @@ def test_poison_node_reported_as_failure(tmp_path, monkeypatch):
     p._wait_port_free = _Noop(True)        # type: ignore
     p._wait_port = _Noop(True)             # type: ignore
 
-    async def fake_check(port, timeout, env):
+    async def fake_check(port, timeout, env, check_url=""):
         return True, True, ""
 
     p._check_via_proxy = fake_check         # type: ignore
@@ -444,7 +444,7 @@ async def test_probe_batch_mixes_plain_and_tunnel(tmp_path, monkeypatch):
                       "server_port": 443}},
     ]
 
-    async def fake_plain(ns, timeout, concurrency):
+    async def fake_plain(ns, timeout, concurrency, check_url=""):
         return [pm.ProbeResult(fp="s1", ok=True, ms=100,
                                exit_verified=True)]
 
@@ -527,7 +527,7 @@ async def test_probe_batch_mixes_plain_and_tunnel(tmp_path, monkeypatch):
                       "server_port": 443}},
     ]
 
-    async def fake_plain(ns, timeout, concurrency):
+    async def fake_plain(ns, timeout, concurrency, check_url=""):
         return [pm.ProbeResult(fp="s1", ok=True, ms=100,
                                exit_verified=True)]
 

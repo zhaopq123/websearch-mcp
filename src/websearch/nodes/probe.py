@@ -173,6 +173,7 @@ class NodeProber:
     async def probe_batch(self, nodes: Iterable[dict[str, Any]], *,
                           timeout: float | None = None,
                           concurrency: int | None = None,
+                          check_url: str = "",
                           ) -> list[ProbeResult]:
         """并发探测一批节点。
 
@@ -201,7 +202,8 @@ class NodeProber:
         results: list[ProbeResult] = []
         if plain:
             results.extend(await self._probe_plain_proxies(
-                plain, timeout, max(concurrency, 50)))
+                plain, timeout, max(concurrency, 50),
+                check_url=check_url or CHECK_URL))
         if tunnel:
             if len(tunnel) > PROBE_PORT_SPAN:
                 tunnel = tunnel[:PROBE_PORT_SPAN]
@@ -211,7 +213,8 @@ class NodeProber:
             else:
                 env = await self.detect_env()
                 results.extend(await self._probe_via_singbox(
-                    tunnel, timeout, concurrency, env))
+                    tunnel, timeout, concurrency, env,
+                    check_url=check_url or CHECK_URL))
         # 按输入顺序返回（调用方按 fp 对齐，顺序无关也要保持）
         by_fp = {r.fp: r for r in results}
         return [by_fp.get(n["fp"], ProbeResult(fp=n["fp"], ok=False,
@@ -219,8 +222,8 @@ class NodeProber:
                 for n in nodes]
 
     async def _probe_plain_proxies(self, nodes: list[dict[str, Any]],
-                                   timeout: float,
-                                   concurrency: int) -> list[ProbeResult]:
+                                   timeout: float, concurrency: int,
+                                   check_url: str = "") -> list[ProbeResult]:
         """普通 SOCKS/HTTP 代理直测：httpx 经代理请求 CHECK_URL。
 
         与 sing-box 路径判定标准一致（CHECK_URL 返回 200/204 = 活），
@@ -245,7 +248,7 @@ class NodeProber:
                         proxy=proxy_url, timeout=timeout,
                         follow_redirects=False,
                     ) as c:
-                        r = await c.get(CHECK_URL)
+                        r = await c.get(check_url or CHECK_URL)
                     ms = int((time.monotonic() - t0) * 1000)
                     if r.status_code in (200, 204):
                         return ProbeResult(fp=n["fp"], ok=True, ms=ms,
@@ -278,7 +281,8 @@ class NodeProber:
 
     async def _probe_via_singbox(self, nodes: list[dict[str, Any]],
                                  timeout: float, concurrency: int,
-                                 env: ProbeEnv) -> list[ProbeResult]:
+                                 env: ProbeEnv,
+                                 check_url: str = "") -> list[ProbeResult]:
         def build(ns: list[dict[str, Any]]) -> dict[str, Any]:
             inbounds: list[dict[str, Any]] = []
             outbounds: list[dict[str, Any]] = []
@@ -361,7 +365,8 @@ class NodeProber:
             async def one(port: int, fp: str) -> None:
                 async with sem:
                     t0 = time.monotonic()
-                    ok, verified, err = await self._check_via_proxy(port, timeout, env)
+                    ok, verified, err = await self._check_via_proxy(
+                        port, timeout, env, check_url=check_url)
                     ms = int((time.monotonic() - t0) * 1000)
                     results.append(ProbeResult(
                         fp=fp, ok=ok, ms=ms if ok else 0,
@@ -428,15 +433,16 @@ class NodeProber:
                 + self._drop_poison(nodes[mid:], build))
 
     async def _check_via_proxy(self, port: int, timeout: float,
-                               env: ProbeEnv) -> tuple[bool, bool, str]:
+                               env: ProbeEnv,
+                               check_url: str = "") -> tuple[bool, bool, str]:
         """经本地代理端口请求 CHECK_URL。返回 (ok, exit_verified, error)。"""
         try:
             async with httpx.AsyncClient(
                 proxy=f"http://127.0.0.1:{port}", timeout=timeout,
                 follow_redirects=False,
             ) as c:
-                r = await c.get(CHECK_URL)
-            ok = r.status_code in (200, 204)
+                r = await c.get(check_url or CHECK_URL)
+            ok = r.status_code in (200, 204, 202)
             if ok:
                 # 墙内环境：经代理访问 Google 成功 = 真验证出网
                 # 墙外环境：直连也通，无法据此判定，标注未验证
