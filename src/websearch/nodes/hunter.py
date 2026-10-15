@@ -51,6 +51,14 @@ log = logging.getLogger("websearch.nodes.hunter")
 # [:24] 截断把新种子（GFP wiki + 8 个代理列表）全挡在轮换外，
 # 加了种子永远不抓（hunt 报告「源 34 成功」= 24 一层 + 11 二层）。
 # 40 覆盖全部种子 + 少量历史；抓取并发 6，多 13 源约 +30s/轮。
+# 代理列表源的 URL 特征（用于组源时前置，见 _build_sources）。
+# 普通 SOCKS/HTTP 代理列表：5 分钟级更新、公网欧美 VPS、低延迟候选，
+# 新鲜度与价值都高于日更 VPN bundle。
+_PROXY_LIST_HINTS = (
+    "proxifly", "hproxy-com", "monosans/proxy-list", "litportnet",
+    "Thordata", "proxyscrape", "databay-labs", "proxio-io", "jetkai",
+)
+
 DEFAULT_MAX_SOURCES = 40        # 单轮最多抓多少个源
 DEFAULT_PROBE_LIMIT = 120       # 单轮最多探测多少个节点
 DEFAULT_FETCH_CONCURRENCY = 6   # 源抓取并发
@@ -422,7 +430,17 @@ class NodeHunter:
             seen.add(url)
             out.append({"url": url, "kind": kind, "note": note})
 
-        for s in SEED_SOURCES:
+        # 代理列表源优先入轮（2026-10-15 实测教训）：proxifly socks5
+        # 6 万条/5 分钟级更新、公网欧美 VPS 低延迟候选，而 VPN 日更源
+        # 每轮解析 6 万但新增趋近 0（指纹全覆盖）。单轮总预算
+        # （ROUND_INGEST_CAP）按源序扣减 —— 代理源排后时预算已被
+        # 前面的 VPN 大源吃光，实测「抓到了但一个都没进库」。
+        def _is_proxy_list(u: str) -> bool:
+            return any(h in u for h in _PROXY_LIST_HINTS)
+
+        seeds = sorted(SEED_SOURCES,
+                       key=lambda s: 0 if _is_proxy_list(s["url"]) else 1)
+        for s in seeds:
             url = s["url"]
             # 日期型种子（clashnode-%Y%m%d.html）：按当天格式化成当日页，
             # 每天自动追新。格式化失败（URL 里没有 % 指令）就用原值。
