@@ -47,7 +47,11 @@ from .sources import (
 log = logging.getLogger("websearch.nodes.hunter")
 
 # 一轮 hunt 的默认规模（可用环境变量覆盖）
-DEFAULT_MAX_SOURCES = 24        # 单轮最多抓多少个源
+# 单轮最多抓多少个源。2026-10-15：24→40 —— 种子源涨到 37 个后，
+# [:24] 截断把新种子（GFP wiki + 8 个代理列表）全挡在轮换外，
+# 加了种子永远不抓（hunt 报告「源 34 成功」= 24 一层 + 11 二层）。
+# 40 覆盖全部种子 + 少量历史；抓取并发 6，多 13 源约 +30s/轮。
+DEFAULT_MAX_SOURCES = 40        # 单轮最多抓多少个源
 DEFAULT_PROBE_LIMIT = 120       # 单轮最多探测多少个节点
 DEFAULT_FETCH_CONCURRENCY = 6   # 源抓取并发
 DEFAULT_LOOP_INTERVAL = 600     # 持续搜索间隔（秒）——10 分钟一轮
@@ -93,7 +97,11 @@ PROBE_HARD_CAP = 400
 # 下一轮又能收新的，库保持「周转」而不是「堆积」。
 # 取值取探测上限的数倍：允许入库略快于探测（源解析有随机性，偶尔小轮
 # 解析少），但不允许无节制膨胀。
-ROUND_INGEST_CAP = 4000
+# 2026-10-15：4000→8000 —— 代理列表源（proxifly socks5 实测 6 万
+# 条）整源解析量远大过 VPN bundle，4000 会把一个源就吃光整轮预算，
+# 后面的源「抓了也白抓」（入库被闸门拦下）。8000 = 探测上限
+# PROBE_HARD_CAP(400) 的 20 倍，给混合协议源留出空间。
+ROUND_INGEST_CAP = 8000
 
 
 def _env_int(name: str, default: int) -> int:
