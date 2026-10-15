@@ -160,6 +160,11 @@ class Config:
     cb_cooldown_sec: int = 60        # 初始冷却（每次再触发翻倍，上限见下）
     cb_cooldown_max_sec: int = 600
     cb_ema_alpha: float = 0.2        # 成功率 EMA 平滑系数
+    # 连续 soft fail（zero_results/timeout）几次跳闸。默认 hard 阈值
+    # 的 3 倍：偶发无结果不杀（weixin 误熔断 600s 的教训），持续死透
+    # 才杀（实测 DDG 被免费池出口 IP 全量拉黑后 sr=0.065 仍永远
+    # closed，每轮搜索白跑一次）。2026-10-15 压测新增。
+    cb_soft_failure_threshold: int = 9
 
     # ── 缓存 ──
     cache_dir: str = ""              # 空 = 系统临时目录下 websearch-cache
@@ -277,6 +282,8 @@ class Config:
         c.rate_burst = _env_int("WS_RATE_BURST", c.rate_burst)
 
         c.cb_failure_threshold = _env_int("WS_CB_THRESHOLD", c.cb_failure_threshold)
+        c.cb_soft_failure_threshold = _env_int(
+            "WS_CB_SOFT_THRESHOLD", c.cb_soft_failure_threshold)
         c.cb_cooldown_sec = _env_int("WS_CB_COOLDOWN", c.cb_cooldown_sec)
         c.cb_cooldown_max_sec = _env_int("WS_CB_COOLDOWN_MAX", c.cb_cooldown_max_sec)
         c.cb_ema_alpha = _env_float("WS_CB_EMA_ALPHA", c.cb_ema_alpha)

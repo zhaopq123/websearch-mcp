@@ -175,3 +175,43 @@ def test_reset_all(cfg):
             g.record(name, False, 10, "boom")
     g.reset()
     assert all(h.state == "closed" for h in g._h.values())
+
+
+# ══════════════ 2026-10-15 压测复盘：soft fail 熔断 ══════════════
+
+
+def test_soft_fail_does_not_trip_below_threshold(cfg):
+    """偶发 soft fail（<9 次）不熔断 —— 小众查询/抖动的误杀防护。"""
+    g = Governor(cfg)
+    for _ in range(cfg.cb_soft_failure_threshold - 1):
+        g.record("weixin", False, 10, "zero_results", soft=True)
+    assert g.health("weixin").state == "closed"
+    assert g.health("weixin").consecutive_soft == cfg.cb_soft_failure_threshold - 1
+
+
+def test_soft_fail_trips_at_threshold(cfg):
+    """连续 soft fail 达阈值 → 熔断。
+
+    实测背景：DDG 被免费池出口 IP 全量拉黑，sr=0.065 但永远 closed，
+    每轮搜索白跑一次 8s 超时。
+    """
+    g = Governor(cfg)
+    for _ in range(cfg.cb_soft_failure_threshold):
+        g.record("ddg", False, 10, "zero_results", soft=True)
+    assert g.health("ddg").state == "open"
+    assert g.allow_now("ddg")[0] is False
+
+
+def test_success_resets_soft_streak(cfg):
+    """一次成功即清零 soft 连击 —— 恢复后不带着旧账。"""
+    g = Governor(cfg)
+    for _ in range(cfg.cb_soft_failure_threshold - 2):
+        g.record("ddg", False, 10, "zero_results", soft=True)
+    g.record("ddg", True, 100)
+    assert g.health("ddg").consecutive_soft == 0
+    # 再积累到阈值才熔断（证明清零生效）
+    for _ in range(cfg.cb_soft_failure_threshold - 1):
+        g.record("ddg", False, 10, "zero_results", soft=True)
+    assert g.health("ddg").state == "closed"
+    g.record("ddg", False, 10, "zero_results", soft=True)
+    assert g.health("ddg").state == "open"

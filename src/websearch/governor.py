@@ -81,6 +81,12 @@ class Health:
     latency_ema_ms: float = 0.0     # 延迟 EMA
     consecutive_fail: int = 0
     consecutive_ok: int = 0
+    # 连续 soft fail 次数（zero_results/timeout：引擎「没坏但没产出」）。
+    # 2026-10-15 压测新增字段：DDG 被免费池出口 IP 全量拉黑后连续
+    # zero_results，soft 不计熔断 → 每轮搜索都白跑一次（服务日志
+    # sr=0.065 仍 closed）。达 soft 阈值（hard 的 3 倍）才熔断，
+    # 偶发不杀（weixin 误熔断 600s 的教训）。
+    consecutive_soft: int = 0
     total_calls: int = 0
     total_ok: int = 0
     total_blocked: int = 0
@@ -221,6 +227,7 @@ class Governor:
             h.total_ok += 1
             h.consecutive_fail = 0
             h.consecutive_ok += 1
+            h.consecutive_soft = 0
             h.last_ok_at = time.monotonic()
             # 探测成功 → 闭合，冷却重置
             if h.state != "closed":
@@ -244,6 +251,19 @@ class Governor:
                 # （实测 bing 连超 2 次、返回 0 结果，面板仍报 4/4 全成功）。
                 # 不喂熔断是为了避免小众查询/偶发抖动误杀引擎
                 # （实测 weixin 被误熔断 600s）。
+                #
+                # 2026-10-15 补充：连续 soft fail 达 soft 阈值（hard 的
+                # 3 倍，见 cfg.cb_soft_failure_threshold）**也熔断**。
+                # 实测 DDG 被免费池出口 IP 全量拉黑：sr=0.065、连续
+                # zero_results 但永远 closed，每轮搜索白跑一次 8s 超时。
+                # 「偶发不杀 + 持续死透杀」两条都要 —— 阈值拉开档次即可。
+                h.consecutive_soft += 1
+                if (h.consecutive_soft
+                        >= self.cfg.cb_soft_failure_threshold):
+                    log.info(
+                        "引擎 %s 连续 %d 次无产出（soft fail）→ 熔断",
+                        engine, h.consecutive_soft)
+                    self._trip(h, engine)
                 return
             h.consecutive_fail += 1
             if h.consecutive_fail >= self.cfg.cb_failure_threshold:
