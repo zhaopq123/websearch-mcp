@@ -660,7 +660,10 @@ def build_mcp(cfg: Config):
           bypassed     true = 代理不可用，已降级为直连（搜索仍可用）
           bypass_count 累计降级次数
           last_error   最近一次代理失败原因
-          node_pool    **系统自养的节点库**：总量/存活/最优节点/自动更新状态
+          node_pool    **系统自养的节点库**：总量/存活/待测/最优节点/自动更新状态
+                       注意 `total` 含大量**未测库存**（刚搜集到还没探测），
+                       别拿它当「可用节点数」——可用数看 `alive`，健康度看 `alive_rate`。
+                       要看两池（cust/free）细分用 `node_pool(action="status")`。
           hint         人话解释当前状态该怎么办
 
         ⚠️ `configured` 指**用户订阅代理**。系统自养的节点池是另一回事，
@@ -672,9 +675,20 @@ def build_mcp(cfg: Config):
         pool_info: dict[str, Any] = {}
         if svc.hunter is not None:
             ps = svc.hunter.pool.stats().to_dict()
+            by_pool = ps.get("by_pool") or {}
+            # untested 只认真实统计；取不到宁可报 0 也不拿 total-alive 估
+            # （里面还混着 cust 池和已死透的，估出来是错的）。
+            untested = (by_pool.get("free") or {}).get("untested", 0)
+            total = ps["total"]
             pool_info = {
-                "total": ps["total"],
+                "total": total,
                 "alive": ps["alive"],
+                # 2026-10-16 加：`total` 里绝大多数是「刚搜集到还没探测」的库存，
+                # 光看 total=3 万会误以为池子很健康（实际 alive 只有个位数）。
+                # 把 alive_rate 和 untested 摆出来，一眼看清真实可用度。
+                "alive_rate": round(ps["alive"] / total, 4) if total else 0.0,
+                "untested": untested,
+                "by_pool": by_pool,
                 "best": ps["best"],
                 "by_country": ps["by_country"],
                 "auto_update": svc.hunter.state.loop_active,
@@ -812,6 +826,12 @@ def build_mcp(cfg: Config):
 
         import_customer 不传 text/sub_url 时，返回配置情况与最近一次
         自动导入结果（只计数，不吐 URL）。
+
+        ⚠️ `stats.total` **不是可用节点数**。自搜池每轮能 ingest 上万条，
+        但探测吞吐是按秒计的（每条要真的出网握手），所以库里长期堆积大量
+        **未测库存**（`plan.untested` / `stats.by_pool.free.untested`）。
+        真正的可用数看 `alive`，健康度看 `alive_rate`；
+        `total` 只是「库有多大」，别据此判断服务好不好使。
 
         返回**不含任何节点凭据**（uuid/密码永不外泄），
         只给协议、地区、延迟、健康分。

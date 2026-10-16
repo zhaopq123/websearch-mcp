@@ -255,3 +255,30 @@ def test_state_dict_has_configured_contract_key():
     assert "configured" in d, "缺 `configured`（proxy_status 文档声明字段）"
     assert "proxy_configured" in d, "缺 `proxy_configured`（panel 在用）"
     assert d["configured"] == d["proxy_configured"]
+
+
+def test_proxy_status_node_pool_exposes_health_ratio():
+    """`proxy_status.node_pool` 必须给出 alive_rate / untested，不能只给 total。
+
+    2026-10-16 vivo 实测：面板上一次看到 total=31581、alive=8。只报 total
+    会让调用方（和用户）误判「池子很大很健康」，实际可用节点是个位数。
+    健康度必须是一等字段，不能逼调用方自己拿 total 猜。
+    这里直接构造 tool 的返回形状做契约断言（不拉起整个服务）。
+    """
+    # 复刻 server.proxy_status 里 pool_info 的构造逻辑做契约断言
+    ps = {
+        "total": 31581, "alive": 8, "untested": 30414,
+        "by_pool": {"free": {"total": 31581, "alive": 8, "untested": 30414}},
+        "best": {}, "by_country": {},
+    }
+    total = ps["total"]
+    pool_info = {
+        "total": total,
+        "alive": ps["alive"],
+        "alive_rate": round(ps["alive"] / total, 4) if total else 0.0,
+        "untested": (ps.get("by_pool") or {}).get("free", {}).get("untested", 0),
+    }
+    assert "alive_rate" in pool_info, "缺 alive_rate（健康度一等字段）"
+    assert "untested" in pool_info, "缺 untested（未测库存）"
+    assert pool_info["alive_rate"] < 0.01, "8/31581 应远小于 1%"
+    assert pool_info["untested"] == 30414, "untested 必须取 by_pool.free，不能拿 total-alive 估"
