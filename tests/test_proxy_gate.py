@@ -241,3 +241,17 @@ def test_state_dict_fields():
     for k in ("proxy_configured", "using_proxy", "bypassed",
               "consecutive_failures", "bypass_count", "last_error"):
         assert k in d
+
+
+def test_state_dict_has_configured_contract_key():
+    """`proxy_status` 工具 docstring 声明的字段名是 `configured`。
+
+    2026-10-16 实测 bug：实现只给了 `proxy_configured`，调用方按文档取
+    data["configured"] 直接 KeyError。两个名字都必须存在 —— 契约名
+    供工具/客户端用，历史名供 panel 用，删任一个都会打断一边。
+    """
+    g = ProxyGate("http://127.0.0.1:17890")
+    d = g.state.to_dict()
+    assert "configured" in d, "缺 `configured`（proxy_status 文档声明字段）"
+    assert "proxy_configured" in d, "缺 `proxy_configured`（panel 在用）"
+    assert d["configured"] == d["proxy_configured"]

@@ -654,13 +654,18 @@ def build_mcp(cfg: Config):
         **不返回任何凭据**（代理地址里若含密码会被掩码；节点凭据永不出库）。
 
         返回：
-          configured   是否配置了（用户自己的）代理
+          configured   是否配置了（用户自己的）订阅代理
+          proxy_source 当前出网由谁承担：user_proxy | node_pool | direct
           using_proxy  当前请求是否走代理
           bypassed     true = 代理不可用，已降级为直连（搜索仍可用）
           bypass_count 累计降级次数
           last_error   最近一次代理失败原因
           node_pool    **系统自养的节点库**：总量/存活/最优节点/自动更新状态
           hint         人话解释当前状态该怎么办
+
+        ⚠️ `configured` 指**用户订阅代理**。系统自养的节点池是另一回事，
+        用 `on_node_pool` / `proxy_source` 判断 —— 两者混看会把
+        「自养节点在跑」误读成「用户配了代理」。
         """
         svc = get_service()
         st = svc.pool.gate.state.to_dict()
@@ -680,6 +685,15 @@ def build_mcp(cfg: Config):
         alive = pool_info.get("alive", 0)
         on_pool = bool(getattr(svc, "_on_node_pool", False))
         lp = svc.local_proxy.status() if svc.local_proxy is not None else {}
+        # 出网来源（2026-10-16 加）：把「用户代理 / 自养节点池 / 直连」
+        # 三个互斥状态显式说出来 —— gate 的 proxy_url 在自养模式下也
+        # 是 127.0.0.1:port，光看 configured=true 会误判成用户配了订阅。
+        if on_pool:
+            source = "node_pool"
+        elif st["using_proxy"]:
+            source = "user_proxy"
+        else:
+            source = "direct"
         if on_pool and lp.get("running"):
             if getattr(svc, "_user_proxy_url", ""):
                 hint = (f"用户代理不可用，已由**自养节点池**接管出网"
@@ -701,8 +715,8 @@ def build_mcp(cfg: Config):
                     "node_hunt 手动触发一轮。")
         else:
             hint = "代理已配置但未启用（WS_PROXY_ENABLED=0）。"
-        return {**st, "on_node_pool": on_pool, "node_pool": pool_info,
-                "hint": hint}
+        return {**st, "on_node_pool": on_pool, "proxy_source": source,
+                "node_pool": pool_info, "hint": hint}
 
     @mcp.tool(**_MCP)
     async def cache_manage(action: str = "stats", kind: str = "") -> dict[str, Any]:
@@ -784,7 +798,7 @@ def build_mcp(cfg: Config):
         参数：
           action  status（库统计，默认）| list（节点列表）| sources（源健康度）
                   | verify（探测记录一致性自检，服务进程内视角）
-                  | verify（探测记录一致性自检，服务进程内视角）
+                  | prune（手动淘汰过期 free 池节点，见下）
                   | import_customer（导入客户订阅，见下）
           limit   list/sources 的返回条数上限
           pool    cust（只看客户池）| free（只看免费池）| 留空=全部
@@ -821,6 +835,27 @@ def build_mcp(cfg: Config):
             return {
                 "sources": p.source_health(limit=limit),
                 "stats": p.stats().to_dict(),
+            }
+        if action == "prune":
+            # 手动收口（2026-10-16 加）：免费池会病态膨胀（实测
+            # total=33892 / alive=8 / untested=33528，单轮探测 327 个
+            # → 17 小时才碰完一轮），库存越大探测越稀释。
+            # prune 按 pool.py 的三条规则删：7 天没重现且没活过、
+            # 死透 24h、入库 2 天从未被探测。默认只清 free 池。
+            before = p.stats().to_dict()
+            removed = p.prune(pool=pool or "free")
+            after = p.stats().to_dict()
+            return {
+                "action": "prune",
+                "pool": pool or "free",
+                "removed": removed,
+                "before": {"total": before["total"], "alive": before["alive"],
+                           "untested": before["untested"]},
+                "after": {"total": after["total"], "alive": after["alive"],
+                          "untested": after["untested"]},
+                "hint": ("已按规则淘汰过期 free 池节点（客户池不动）。"
+                         "免费节点寿命以小时计，库存膨胀会稀释探测预算 —— "
+                         "发现 untested 远大于 alive 时可手动跑一次。"),
             }
         if action == "verify":
             # **服务进程内**的探测记录自检（2026-10-15）。

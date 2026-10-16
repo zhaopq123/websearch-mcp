@@ -362,6 +362,17 @@ class NodeHunter:
 
                 # 4) 清理。保活模式要**激进淘汰**：死节点堆积会拖慢
                 #    候选查询，且免费节点本就该按小时计寿命。
+                #    先把「陈库存硬删」窗口收敛到实际探测吞吐
+                #    （2026-10-16：固定 2 天对 33k 库存太宽松，
+                #    删的追不上进的；改由本轮探测量 + 下轮间隔算出
+                #    「扫完一遍库存的时间」×2）。
+                try:
+                    win = self.pool.set_probe_throughput(
+                        report.get("probed", 0),
+                        int(plan.get("delay_sec", self.state.interval_sec)))
+                    report["untested_window_sec"] = win
+                except Exception as e:  # noqa: BLE001
+                    log.debug("收敛陈库存窗口失败（不致命）：%s", e)
                 pruned = (self.pool.prune(max_age_sec=FRESH_PRUNE_SEC)
                           if self.state.target_alive > 0 else self.pool.prune())
                 if pruned:

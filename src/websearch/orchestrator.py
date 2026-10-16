@@ -378,6 +378,9 @@ class Orchestrator:
                                 "blocked": [], "skipped": []},
                     "error": "server_busy",
                     "message": reason,
+                    # 与正常路径同形：_busy 也是「0 条结果」，调用方不该
+                    # 因为走了忙路径就少一个可判断的字段。
+                    "diagnosis": f"服务繁忙，未执行搜索：{reason}",
                 },
             }
 
@@ -657,6 +660,33 @@ class Orchestrator:
             d["cached"] = bool(cached_outcomes)
             out_results.append(d)
 
+        coverage = round(len(succeeded) / len(attempted), 3) if attempted else 0.0
+
+        # ── 空结果/低覆盖的可操作诊断（2026-10-16 加）──
+        # 实测踩坑：全引擎熔断时 web_search 返回 results=[] + coverage=0.0，
+        # meta 里只有「成功引擎=[]」，调用方（AI/人）分不清这是
+        # 「该查询确实没有匹配」还是「服务整体退化了」。静默的空结果
+        # 是最坏的结果 —— 必须自己说清是哪一种。
+        diagnosis = ""
+        if not merged:
+            if not attempted:
+                diagnosis = ("没有任何引擎被尝试（全部熔断/被限流）。"
+                             "服务可能刚启动或长时间全失败，"
+                             "调 engine_health reset=all 重置熔断后重试。")
+            elif not succeeded:
+                diagnosis = (f"{len(attempted)} 个引擎全部失败或被熔断，"
+                             f"不是「该查询无结果」。看 meta.engines.failed "
+                             f"的 error_kind 判断原因（timeout=网络/代理不通，"
+                             f"irrelevant=反爬投毒，zero_results=引擎本身没返回）。")
+            else:
+                diagnosis = (f"引擎有响应（{', '.join(succeeded)}）但融合后 0 条 —— "
+                             f"可能是查询词过窄、或被相关性校验全部过滤。"
+                             f"换个说法或放宽查询词重试。")
+        elif coverage < 0.3:
+            diagnosis = (f"结果可能不完整：仅 {len(succeeded)}/{len(attempted)} "
+                         f"个引擎成功（coverage={coverage}）。"
+                         f"回答时应提示用户信息覆盖不足。")
+
         return {
             "query": query,
             "results": out_results,
@@ -678,7 +708,9 @@ class Orchestrator:
                 "early_stopped": early_stopped,
                 "total_unique": fstats["unique_url"],
                 "returned": len(merged),
-                "coverage": round(len(succeeded) / len(attempted), 3) if attempted else 0.0,
+                "coverage": coverage,
+                # 人话诊断：空/低覆盖时非空，正常时为空串（不占篇幅）
+                "diagnosis": diagnosis,
                 "engine_timings": {
                     o.engine: o.elapsed_ms for o in outcomes
                 },

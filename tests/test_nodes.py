@@ -1375,7 +1375,11 @@ def test_prune_deletes_dead_proxies_despite_fresh_last_seen(tmp_path):
 
 
 def test_prune_deletes_stale_untested_stock(tmp_path):
-    """陈库存硬删：入库 3 天从未排到探测 → 删（探测预算排不到，纯负担）。"""
+    """陈库存硬删：入库超过窗口且从未排到探测 → 删（探测预算排不到，纯负担）。
+
+    窗口默认 2 天，运行期由 set_probe_throughput 按实测吞吐收敛
+    （见 test_prune_untested_window_converges_to_throughput）。
+    """
     import time as _t
 
     pool = NodePool(tmp_path / "p.sqlite3")
@@ -1393,6 +1397,44 @@ def test_prune_deletes_stale_untested_stock(tmp_path):
     assert pruned == 2
     left = {r["tag"] for r in pool.list_public(only_alive=False)}
     assert left == {"n2"}
+
+
+def test_prune_untested_window_converges_to_throughput(tmp_path):
+    """陈库存窗口必须由实测探测吞吐收敛，不再写死 2 天。
+
+    2026-10-16 实测：vivo 生产 total=33892 / untested=33528，
+    单轮探 172–400、间隔 120–600s → 17 小时才扫完一遍，2 天窗口
+    删的追不上进的。改由「扫完一轮的时间 × 2」算，夹在 12h–3d。
+    """
+    pool = NodePool(tmp_path / "p.sqlite3")
+    # 塞 10000 个未测节点
+    pool.upsert_nodes([
+        (f"n{i}", "socks", {"type": "socks", "server": f"10.9.{i // 250}.{i % 250}",
+                            "server_port": 1080, "version": "5"})
+        for i in range(10000)
+    ])
+    default = pool.PRUNE_UNTESTED_AFTER_SEC
+
+    # 库存 10000 个。低吞吐 200/轮 × 300s → 扫完一遍 15000s（4.2h），
+    # ×2 = 30000s 低于下限 → 夹到下限 12h（43200s），比默认 2 天更紧。
+    win = pool.set_probe_throughput(200, 300)
+    assert win == pool.PRUNE_UNTESTED_MIN_SEC, win
+    assert win < default, f"低吞吐应收紧窗口：{win} vs {default}"
+    assert pool.PRUNE_UNTESTED_AFTER_SEC == win
+
+    # 中吞吐：20/轮 × 600s → 扫一遍 300000s，×2 = 600000s
+    # → 夹到上限 3 天（259200s），避免窗口无限放宽（否则库存永远清不掉）。
+    win_mid = pool.set_probe_throughput(20, 600)
+    assert win_mid == pool.PRUNE_UNTESTED_MAX_SEC, win_mid
+
+    # 高吞吐：10000/轮 × 60s → 扫一遍 60s，×2 = 120s → 夹到下限 12h
+    win2 = pool.set_probe_throughput(10000, 60)
+    assert win2 == pool.PRUNE_UNTESTED_MIN_SEC, win2
+
+    # 非法输入不改变现状（不崩、不乱写窗口）
+    before = pool.PRUNE_UNTESTED_AFTER_SEC
+    assert pool.set_probe_throughput(0, 300) == before
+    assert pool.set_probe_throughput(200, 0) == before
 
 
 def test_prune_never_touches_cust_pool(tmp_path):

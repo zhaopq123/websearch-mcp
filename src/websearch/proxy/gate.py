@@ -47,6 +47,12 @@ class GateState:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            # ⚠️ 2026-10-16：`configured` 是 `proxy_status` 工具 docstring
+            # 一直声明的字段名，实现里却只给了 `proxy_configured` ——
+            # 调用方按文档取 data["configured"] 直接 KeyError。
+            # 两个都发：`configured` 是契约名，`proxy_configured` 是历史名
+            # （panel 在用），删任一个都会打断一边，所以并存。
+            "configured": self.proxy_configured,
             "proxy_configured": self.proxy_configured,
             # 掩码后再输出 —— 代理地址常写成 http://user:pass@host:port，
             # 原样返回会让面板/日志/工具输出泄露代理密码。
