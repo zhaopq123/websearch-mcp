@@ -1,0 +1,37 @@
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+cache/
+service.log
+*.log
+# 轮转产物（maintenance 保留 .1/.2）。`*.log` 匹配不到 `panel.log.1`
+# （模式要整段匹配 basename），不补这行每次轮转都会把 git status 弄脏
+*.log.*
+.tokens
+*.bak-*
+*-out.txt
+.DS_Store
+
+# ══════════════ 代理/订阅敏感文件（红线：绝不入 git）══════════════
+# 用户的订阅链接、节点凭据、面板口令全部落在这些文件里。
+# 任何一条进了 git，开源出去就等于把用户资产公开。
+.env
+.env.*
+!.env.example
+singbox.json
+singbox.log
+*.sub
+*.subscription
+subscription.txt
+nodes.txt
+panel.secret
+secrets/
+# 运行时生成的代理配置目录（含节点凭据）
+proxy-run/
+
+# build artifacts
+*.egg-info/
+
+# 运维备份（可能含凭据）：绝不入库
+backups/
