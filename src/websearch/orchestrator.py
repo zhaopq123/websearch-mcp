@@ -36,6 +36,30 @@ from .text import _numeric_query, relevance_ratio, sha1_key
 log = logging.getLogger("websearch.orch")
 
 
+def _proxy_might_be_at_fault(e: Exception) -> bool:
+    """判断「这次抓取失败，换个直连 client 重试有没有意义」。
+
+    只认**网络层**的失败信号：超时、连不上、隧道/CONNECT 被拒。
+    站点答复类的（4xx/5xx、被反爬标记）不算 —— 换条路照样被拒，
+    重试只会白等一次超时。
+
+    和 proxy/gate.py 的 `_is_proxy_failure` 是同一判断标准，但那边
+    只看错误字符串（它拿到的是 note_result 传来的 str），这里拿到的是
+    异常对象，所以按类型判更稳。
+    """
+    if isinstance(e, (httpx.ConnectTimeout, httpx.ReadTimeout,
+                      httpx.WriteTimeout, httpx.PoolTimeout,
+                      httpx.ConnectError, httpx.ProxyError,
+                      httpx.NetworkError)):
+        return True
+    s = f"{type(e).__name__}: {e}".lower()
+    return any(m in s for m in (
+        "connecttimeout", "readtimeout", "timeout", "proxyerror",
+        "connection refused", "tunnel connection failed",
+        "all connection attempts failed", "network is unreachable",
+    ))
+
+
 class Orchestrator:
     def __init__(self, cfg: Config, pool: HttpPool, cache: Cache, gov: Governor):
         self.cfg = cfg
@@ -269,7 +293,6 @@ class Orchestrator:
         if isinstance(e, httpx.HTTPError):
             return "network"
         return "unknown"
-
     # ══════════════════════ 搜索主流程 ══════════════════════
 
     @staticmethod
@@ -787,6 +810,16 @@ class Orchestrator:
                 fr.from_cache = True
                 return fr
 
+        # 走代理抓一次；**代理类失败就立刻用直连重试一次**。
+        #
+        # 2026-10-16 vivo 实测踩的坑：自养节点池里的免费节点延迟能到 9 秒+，
+        # 而 web_fetch 过去无条件走代理 —— 结果是「搜索能用、抓正文全超时」，
+        # 而且 gate 永远不降级（见 fetch_many 的注释），整个 web_fetch 功能
+        # 等于瘫掉，面板上却看不出任何异常。
+        #
+        # 代理是**增强**不是**依赖**：它能让墙外站可达，但墙内站（百度/腾讯/
+        # 网易）直连本来就又快又稳。所以抓取失败且失败原因指向代理时，
+        # 直连兜底一次 —— 代价是多花一次超时，收益是功能不瘫。
         try:
             resp = await self.pool.fetch(
                 url, timeout_ms=cfg.fetch_timeout_ms, max_bytes=cfg.fetch_max_bytes
@@ -794,11 +827,31 @@ class Orchestrator:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            return FetchResult(
-                url=url, ok=False, error=str(e)[:200],
-                error_kind=self._classify_exception(e),
-                elapsed_ms=int((time.monotonic() - t0) * 1000),
-            )
+            kind = self._classify_exception(e)
+            # 只有「网络层」失败才值得直连重试：404/403 是站点答复，
+            # 直连重试也没用（还可能被当成爬虫）。cancel 更不能重试。
+            if kind in ("timeout", "network") and _proxy_might_be_at_fault(e):
+                log.info("经代理抓取失败（%s: %s），改用直连重试一次：%s",
+                         type(e).__name__, str(e)[:80], url)
+                try:
+                    resp = await self.pool.fetch(
+                        url, timeout_ms=cfg.fetch_timeout_ms,
+                        max_bytes=cfg.fetch_max_bytes, direct=True,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e2:
+                    return FetchResult(
+                        url=url, ok=False, error=str(e2)[:200],
+                        error_kind=self._classify_exception(e2),
+                        elapsed_ms=int((time.monotonic() - t0) * 1000),
+                    )
+            else:
+                return FetchResult(
+                    url=url, ok=False, error=str(e)[:200],
+                    error_kind=kind,
+                    elapsed_ms=int((time.monotonic() - t0) * 1000),
+                )
 
         ct = resp.headers.get("content-type", "")
         html = decode_bytes(resp.content, ct)
@@ -839,15 +892,26 @@ class Orchestrator:
             async with sem:
                 # 每 URL 硬超时兜底：否则一个不可达站点能把整批拖到几十秒。
                 # 实测一个抓不到的站点让 6 个 URL 的批量抓取花了 30 秒。
+                #
+                # 预算 = 2×单次超时 + 3s：fetch_one 内部「代理失败→直连重试」
+                # 可能真的花掉两次超时。预算要是只给一次，重试会在半路被
+                # 这里 cancel —— 那就白重试了，而且 CancelledError 绕过
+                # except Exception，代理门收不到失败反馈，gate 永远不降级。
                 try:
                     return await asyncio.wait_for(
                         self.fetch_one(
                             u, max_chars=max_chars, use_cache=use_cache,
                             untrusted_wrap=untrusted_wrap,
                         ),
-                        timeout=self.cfg.fetch_timeout_ms / 1000.0 + 3.0,
+                        timeout=self.cfg.fetch_timeout_ms / 1000.0 * 2 + 3.0,
                     )
                 except asyncio.TimeoutError:
+                    # 连兜底重试都超时 = 网络真的不通，给代理门一个明确信号
+                    # （否则 gate 的 consecutive_failures 永远涨不上去）。
+                    try:
+                        self.pool.gate.note_result(False, "fetch hard timeout")
+                    except Exception:
+                        pass
                     return FetchResult(
                         url=u, ok=False, error="fetch hard timeout",
                         error_kind="timeout",
