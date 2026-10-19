@@ -9,6 +9,7 @@
 
 测试重点：链接真能用、能覆盖「面板被重启后旧链接失效」这个坑。
 """
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -21,10 +22,24 @@ from websearch.proxy.store import Store
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 
+# ⚠️ 整个模块依赖 POSIX 权限位（2026-10-19 实测）：ticket 工具在凭据文件
+# 权限不是 600 时**拒绝签发**（安全红线，产品行为不改）。Windows 的 chmod
+# 只能切只读位、stat 恒报 0o666，于是这里 11 个用例全红。
+# 处理方式是**跳过**而不是放宽断言 —— 放宽等于废掉那条红线。
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows 无 POSIX 权限语义"
+)
+
 
 def run_ticket(cfg_path: Path, *args: str, extra_env: dict | None = None) -> subprocess.CompletedProcess:
-    """以子进程方式跑 ticket 工具（模拟用户敲命令）。"""
-    env = {"PYTHONPATH": str(SRC), "PATH": "/usr/bin:/bin"}
+    """以子进程方式跑 ticket 工具（模拟用户敲命令）。
+
+    ⚠️ 必须继承 os.environ（2026-10-19）：原先写死
+    `{"PYTHONPATH": ..., "PATH": "/usr/bin:/bin"}` —— 在 Windows 上
+    子进程会丢掉 SystemRoot/PATHEXT 等必需变量，python 起不来。
+    """
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(SRC)
     if extra_env:
         env.update(extra_env)
     return subprocess.run(

@@ -100,24 +100,38 @@ class Cache:
         if hit is None:
             return None
         expires, value = hit
-        if expires < time.time():
+        if expires <= time.time():
             self._mem.pop(key, None)
             return None
         self._mem.move_to_end(key)
         self._l1_hits += 1
         return value
 
-    def _mem_put(self, key: str, value: Any, ttl: int) -> None:
-        if ttl <= 0:
-            return
-        self._mem[key] = (time.time() + ttl, value)
+    def _mem_put_until(self, key: str, value: Any, expires: float) -> None:
+        """按**绝对过期时刻**写 L1。
+
+        ⚠️ 2026-10-19：L2 命中回填必须用原始 expires，不能重新给一个
+        整段 TTL —— 否则每次 L2 命中都把条目续命一轮，缓存永不过期
+        （实测：ttl=1 的条目在 1.2s 后仍能读到）。
+        """
+        self._mem[key] = (expires, value)
         self._mem.move_to_end(key)
         while len(self._mem) > self.cfg.cache_memory_items:
             self._mem.popitem(last=False)
 
+    def _mem_put(self, key: str, value: Any, ttl: int) -> None:
+        if ttl <= 0:
+            return
+        self._mem_put_until(key, value, time.time() + ttl)
+
     # ── L2 ──
 
-    def _db_get(self, key: str) -> Any | None:
+    def _db_get(self, key: str) -> tuple[Any, float] | None:
+        """返回 (值, 原始过期时刻)；过期/不存在返回 None。
+
+        带上 expires 是为了让 L2 命中回填 L1 时能沿用原过期时刻，
+        而不是重新给一整段 TTL（那会把条目续命，见 _mem_put_until）。
+        """
         conn = self._ensure_conn()
         if conn is None:
             return None
@@ -131,27 +145,35 @@ class Cache:
         if not row:
             return None
         value, expires = row
-        if expires < time.time():
+        if expires <= time.time():
             try:
                 conn.execute("DELETE FROM cache WHERE key=?", (key,))
             except Exception:
                 pass
             return None
         try:
-            return json.loads(value)
+            return json.loads(value), float(expires)
         except Exception:
             return None
 
-    def _db_put(self, key: str, kind: str, value: Any, ttl: int) -> None:
+    def _db_put(self, key: str, kind: str, value: Any,
+                created: float, expires: float) -> None:
+        """写 L2。
+
+        ⚠️ 2026-10-19：created/expires 由 `put()` 在**入缓存那一刻**算好传进来。
+        原先在这里用 `time.time() + ttl` —— 这个函数跑在单线程 executor 里，
+        排队久了就会把过期时刻往后推（实测排队 0.47s，ttl=1 的条目实际
+        活了 1.47s）。TTL 必须从 put 时刻起算，不能从落盘时刻起算。
+        """
         conn = self._ensure_conn()
-        if conn is None or ttl <= 0:
+        if conn is None or expires <= created:
             return
         try:
             conn.execute(
                 "INSERT OR REPLACE INTO cache(key,kind,value,created,expires) "
                 "VALUES(?,?,?,?,?)",
                 (key, kind, json.dumps(value, ensure_ascii=False),
-                 time.time(), time.time() + ttl),
+                 created, expires),
             )
             self._writes += 1
             # 过期清理按概率触发（1/64），不做常驻线程 —— 手机 CPU 省着用
@@ -176,11 +198,13 @@ class Cache:
         v = self._mem_get(key)
         if v is not None:
             return v
-        v = await self._run(self._db_get, key)
-        if v is not None:
+        hit = await self._run(self._db_get, key)
+        if hit is not None:
+            v, expires = hit
             self._l2_hits += 1
-            # L2 命中后回填 L1：同一个 key 的第二次访问就是内存速度
-            self._mem_put(key, v, self.cfg.cache_search_ttl)
+            # L2 命中后回填 L1：同一个 key 的第二次访问就是内存速度。
+            # 沿用原过期时刻（不重新给整段 TTL），否则缓存会被无限续命。
+            self._mem_put_until(key, v, expires)
             return v
         self._misses += 1
         return None
@@ -188,9 +212,13 @@ class Cache:
     async def put(self, key: str, value: Any, ttl: int, kind: str = "search") -> None:
         if not self.enabled or ttl <= 0:
             return
-        self._mem_put(key, value, ttl)
-        # 写 DB 不 await 返回：异步落盘，不阻塞本次响应
-        asyncio.create_task(self._run(self._db_put, key, kind, value, ttl))
+        now = time.time()
+        expires = now + ttl
+        self._mem_put_until(key, value, expires)
+        # 写 DB 不 await 返回：异步落盘，不阻塞本次响应。
+        # 过期时刻在**这里**算好传进去，落盘排队不影响 TTL。
+        asyncio.create_task(
+            self._run(self._db_put, key, kind, value, now, expires))
 
     async def clear(self, kind: str | None = None) -> int:
         self._mem.clear()
