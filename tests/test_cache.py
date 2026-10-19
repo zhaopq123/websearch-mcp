@@ -184,3 +184,20 @@ def test_l2_hit_does_not_extend_ttl(tmp_path):
             f"L2 回填把 TTL 拉长到 {expires - time.time():.1f}s"
         await cache.aclose()
     asyncio.run(run())
+
+
+def test_put_then_aclose_flushes_pending_write(tmp_path):
+    """put 之后立刻 aclose，落盘不能被丢掉。
+
+    2026-10-19 实测：原实现 aclose 直接置 _closed + 关连接，排队中的
+    `_db_put` 会因 `_ensure_conn()` 返回 None 而静默丢弃 ——
+    `test_l2_survives_new_instance` 在机器忙时偶发红就是这个。
+    """
+    async def run():
+        c1 = make_cache(tmp_path)
+        await c1.put("flush", "v", 300)
+        await c1.aclose()          # 故意不等 sleep
+        c2 = make_cache(tmp_path)
+        assert await c2.get("flush") == "v", "aclose 前没把排队写入刷下去"
+        await c2.aclose()
+    asyncio.run(run())
