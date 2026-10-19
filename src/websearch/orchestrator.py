@@ -36,6 +36,22 @@ from .text import _numeric_query, relevance_ratio, sha1_key
 log = logging.getLogger("websearch.orch")
 
 
+def _log_straggler(task: asyncio.Task) -> None:
+    """给「硬超时后被丢下的抓取任务」兜底收尸。
+
+    `asyncio.wait_for(asyncio.shield(task))` 到点就抛 TimeoutError，但 task
+    还在跑（它身上挂着连接关闭、缓存落盘这些必须做完的收尾）。这个回调保证
+    它异常落地时有迹可循，而不是变成 asyncio 默认那句没人看的
+    "Task exception was never retrieved"。
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        log.warning("硬超时后被丢下的抓取最终失败：%s: %s",
+                    type(exc).__name__, exc)
+
+
 def _proxy_might_be_at_fault(e: Exception) -> bool:
     """判断「这次抓取失败，换个直连 client 重试有没有意义」。
 
@@ -942,12 +958,21 @@ class Orchestrator:
                 # 抓取本身已由 _retry_timeout_ms 限制在 total_budget 内；
                 # 外层只是兜底，要留出正文提取的时间（+5s）。
                 t0 = time.monotonic()
+                # `wait_for` 直接包协程会「先取消、再等它收尾完」才抛超时，
+                # 而收尾路径上有取消不动的东西（DNS 线程池、httpcore/ssl 的
+                # shield 关闭），硬超时 17s 实测被拖到 24s（2026-10-19 vivo）。
+                # 用 shield 隔开：到点立刻返回，收尾让它在后台做完 ——
+                # 硬超时的语义是「不再等」，不是「掐死连接」。
+                task = asyncio.ensure_future(
+                    self.fetch_one(
+                        u, max_chars=max_chars, use_cache=use_cache,
+                        untrusted_wrap=untrusted_wrap,
+                    )
+                )
+                task.add_done_callback(_log_straggler)
                 try:
                     return await asyncio.wait_for(
-                        self.fetch_one(
-                            u, max_chars=max_chars, use_cache=use_cache,
-                            untrusted_wrap=untrusted_wrap,
-                        ),
+                        asyncio.shield(task),
                         timeout=self.cfg.total_budget_ms / 1000.0 + 5.0,
                     )
                 except asyncio.TimeoutError:
