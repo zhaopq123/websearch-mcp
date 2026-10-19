@@ -124,3 +124,63 @@ def test_unicode_roundtrip(tmp_path):
         assert await cache.get("中文key") == {"标题": "咖啡机市场"}
         await cache.aclose()
     asyncio.run(run())
+
+
+# ══════════════ TTL 必须从 put 时刻起算（2026-10-19 实测回归） ══════════════
+#
+# 背景：`_db_put` 跑在单线程 executor 里，原实现用 `time.time() + ttl`
+# 在**落盘那一刻**算过期 —— 排队 0.47s 就让 ttl=1 的条目活了 1.47s。
+# 症状是 test_ttl_expiry 恒红（sleep 1.2 后仍能读到）。
+# 对外承诺的「缓存 TTL 5 分钟」因此是假的，必须钉死。
+
+
+def test_db_expires_measured_from_put_time(tmp_path):
+    """L2 的 created/expires 必须按 put 时刻算，不能按落盘时刻算。"""
+    import sqlite3
+
+    async def run():
+        cache = make_cache(tmp_path)
+        t0 = time.time()
+        await cache.put("k", "v", 30)
+        # 落盘是异步的，轮询等它出现（最多 5s），别拿固定 sleep 赌调度
+        row = None
+        for _ in range(100):
+            await asyncio.sleep(0.05)
+            try:
+                conn = sqlite3.connect(cache._db_path)
+                try:
+                    row = conn.execute(
+                        "SELECT created, expires FROM cache WHERE key='k'"
+                    ).fetchone()
+                finally:
+                    conn.close()
+            except sqlite3.OperationalError:
+                row = None
+            if row:
+                break
+        assert row, "5s 内没等到 L2 落盘"
+        created, expires = row
+        assert abs(created - t0) < 0.15, f"created 偏了 {created - t0:.3f}s（应按 put 时刻）"
+        assert abs((expires - created) - 30) < 0.05, f"TTL 不是 30s：{expires - created}"
+        await cache.aclose()
+    asyncio.run(run())
+
+
+def test_l2_hit_does_not_extend_ttl(tmp_path):
+    """L2 命中回填 L1 必须沿用原过期时刻 —— 不能重新给一整段 TTL。
+
+    原实现回填用 `cache_search_ttl`（默认 300s），于是每次 L2 命中都把
+    短 TTL 条目续命成 300s，缓存永不过期。
+    """
+    async def run():
+        cache = make_cache(tmp_path, cache_search_ttl=3600)
+        await cache.put("k", "v", 2)
+        await asyncio.sleep(0.2)      # 等落盘
+        cache._mem.clear()            # 强制 L1 miss，逼它走 L2
+        assert await cache.get("k") == "v", "L2 应当命中"
+        expires, _ = cache._mem["k"]
+        # 回填后的过期时刻仍应是 put 时刻 + 2，而不是 now + 3600
+        assert expires <= time.time() + 2.01, \
+            f"L2 回填把 TTL 拉长到 {expires - time.time():.1f}s"
+        await cache.aclose()
+    asyncio.run(run())

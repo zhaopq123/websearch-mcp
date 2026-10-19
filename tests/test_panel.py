@@ -47,19 +47,30 @@ def client(store):
 
 
 # ══════════════════ 文件权限（红线） ══════════════════
+#
+# ⚠️ 这些断言只在 POSIX 上有意义（2026-10-19 实测）：Windows 的 os.chmod
+# 只能切只读位，stat 恒报 0o666/0o777，把「600」写成硬断言等于在 Windows
+# 上恒红。产品侧仍按 POSIX 收紧（Linux/Termux/容器是目标平台），
+# 所以是**跳过**而不是放宽断言 —— 放宽就把这条泄露红线废了。
+# 沿用 test_nodes.py 的 IS_WIN 口径，别再造一套。
+IS_WIN = sys.platform == "win32"
+posix_only = pytest.mark.skipif(IS_WIN, reason="Windows 无 POSIX 权限语义")
 
 
+@posix_only
 def test_env_file_is_600(store):
     """凭据文件必须 600 —— 同机其他用户不能读到订阅链接。"""
     mode = stat.S_IMODE(os.stat(store.path).st_mode)
     assert mode == 0o600, f"权限 {oct(mode)}，应为 600"
 
 
+@posix_only
 def test_parent_dir_is_700(store):
     mode = stat.S_IMODE(os.stat(store.path.parent).st_mode)
     assert mode == 0o700, f"目录权限 {oct(mode)}，应为 700"
 
 
+@posix_only
 def test_permissions_rechecked_after_rewrite(store):
     """每次写入都要重新收紧权限（防止外部 chmod 后没恢复）。"""
     os.chmod(store.path, 0o644)

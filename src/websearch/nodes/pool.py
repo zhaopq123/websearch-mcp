@@ -212,10 +212,22 @@ class NodePool:
     # （13:07 入库的 socks 到 14:00 直测 0/30 全死），48h 给「假活库存」
     # 留太久。VPN 节点同理——24h 没活过的死节点没有复活动先例。
     PRUNE_DEAD_AFTER_SEC = 24 * 3600
-    # 陈库存硬删：入库 2 天还从未排到探测（预算有限，新鲜节点一直在
+    # 陈库存硬删：入库多久还从未排到探测（预算有限，新鲜节点一直排在
     # 前面）→ 删。实测 socks backlog 7.6k、探测 340/轮，3 天根本轮不
     # 完一轮；2 天 + 每轮新鲜度优先，保证库存持续周转。
-    PRUNE_UNTESTED_AFTER_SEC = 2 * 24 * 3600
+    #
+    # ⚠️ 2026-10-16 实测仍未收敛：vivo 生产 total=33892 / alive=8 /
+    # untested=33528，单轮只探 172–400 个、间隔 120–600s ——
+    # **17 小时才碰完一遍库存**，而入库仍在净增（单轮新增 399–522）。
+    # 2 天的窗口对当前量级太宽松：被删的（238–1924/轮）追不上新进的。
+    #
+    # 收敛条件应是「窗口 ≤ 一轮库存扫完的时间」而不是拍脑袋的天数。
+    # probe_per_round 与 interval_sec 由 hunter 规划器给出；这里给一个
+    # 保守默认，并由 set_probe_throughput() 在每轮 hunt 后刷新为实测值。
+    # 目标 = 能扫完库存一轮的时间（含 2 倍余量），下限 12h、上限 3 天。
+    PRUNE_UNTESTED_AFTER_SEC = 2 * 24 * 3600      # 保守默认，运行期会收敛
+    PRUNE_UNTESTED_MIN_SEC = 12 * 3600            # 不早于 12h（给新货窗口）
+    PRUNE_UNTESTED_MAX_SEC = 3 * 24 * 3600        # 不晚于 3 天
 
     def __init__(self, db_path: Path | str):
         self.path = Path(db_path)
@@ -726,6 +738,34 @@ class NodePool:
         return total
 
     # ── 对外视图（无凭据）──
+
+    def set_probe_throughput(self, probe_per_round: int,
+                             interval_sec: int) -> int:
+        """把「陈库存硬删」窗口收敛到实际探测吞吐（2026-10-16）。
+
+        为什么必须动态算：库存积压是**入库速率 vs 探测吞吐**的失衡。
+        固定天数（2 天）在入库 400–500/轮、探测 172–400/轮、间隔 120–600s
+        的量级下，被删的追不上新进的 —— 实测 untested 稳在 33k 下不来。
+
+        判据：窗口应等于「扫完当前库存一轮所需时间」× 2。
+          · probe_per_round ≤ 0 或 interval ≤ 0 → 不动（保持上次值）
+          · 结果夹在 [PRUNE_UNTESTED_MIN_SEC, PRUNE_UNTESTED_MAX_SEC]
+
+        返回收敛后的窗口秒数（供日志/工具回显）。
+        """
+        if probe_per_round <= 0 or interval_sec <= 0:
+            return self.PRUNE_UNTESTED_AFTER_SEC
+        total = self._ensure().execute(
+            "SELECT COUNT(*) FROM nodes WHERE pool='free' AND last_probe_at=0"
+        ).fetchone()[0]
+        if total <= 0:
+            return self.PRUNE_UNTESTED_AFTER_SEC
+        rounds = total / float(probe_per_round)
+        sweep = rounds * interval_sec
+        win = int(min(self.PRUNE_UNTESTED_MAX_SEC,
+                      max(self.PRUNE_UNTESTED_MIN_SEC, sweep * 2)))
+        self.PRUNE_UNTESTED_AFTER_SEC = win
+        return win
 
     def list_public(self, limit: int = 50, *,
                     only_alive: bool = True,
