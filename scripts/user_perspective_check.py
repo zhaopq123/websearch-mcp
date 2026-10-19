@@ -3,13 +3,19 @@
 
 不看内部对象，全部走 fastmcp Client（内存传输，协议层与
 WorkBuddy/dsh 客户端一致）：
-  1. 客户端能看到 7 个工具，schema 干净（无 anyOf / outputSchema）
+  1. 客户端看到的工具集完整（断言必备核心工具都在，且 schema 干净：
+     无 anyOf / outputSchema）
   2. web_fetch 三种 urls 形态（逗号串 / JSON 数组串 / 原生数组）行为一致
   3. deep_research 三种 queries 形态行为一致
   4. web_search 空参数走错误返回而不是崩
   5. 真实联网搜索一次（server 会挑可用引擎，拿不到结果也有 meta）
 
 用法: PYTHONPATH=src python scripts/user_perspective_check.py
+
+⚠️ 别把工具数写死成常量（2026-10-16 实测）：本脚本原写「== 7」，
+   新增 node_hunt / node_pool 后一直判 FAIL —— 写死的数字隔天就是
+   假的。改成「必备工具集必须都在」的子集断言：新增工具不会红，
+   删掉核心工具才红。
 """
 import asyncio
 import json
@@ -23,6 +29,12 @@ from websearch.server import build_mcp  # noqa: E402
 
 PASS, FAIL = "\033[32mPASS\033[0m", "\033[31mFAIL\033[0m"
 results = []
+
+# 客户端必须能看到的工具（删任一个都是回归）
+REQUIRED_TOOLS = {
+    "web_search", "web_fetch", "deep_research", "engine_health",
+    "proxy_status", "cache_manage", "server_info",
+}
 
 
 def check(name, ok, detail=""):
@@ -39,7 +51,9 @@ async def main():
         print("\n[1] 客户端视角：工具列表")
         ret = await client.list_tools_mcp()
         tools = {t.name: t for t in ret.tools}
-        check("能看到 7 个工具", len(tools) == 7, f"实到 {len(tools)} 个")
+        missing = REQUIRED_TOOLS - set(tools)
+        check("必备工具集齐全", not missing,
+              f"共 {len(tools)} 个，缺 {sorted(missing) if missing else '无'}")
         bad = []
         for name, t in tools.items():
             s = json.dumps(t.input_schema)

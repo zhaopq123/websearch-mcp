@@ -162,8 +162,13 @@ PYTHONPATH=src ./venv/bin/python scripts/user_perspective_check.py  # 用户视�
 PYTHONPATH=src ./venv/bin/python scripts/stress.py                  # 压测
 ```
 
-当前基线：**466 passed**（离线）。`scripts/diag/` 下有各引擎的独立诊断脚本
+当前基线：**468 passed**（离线，Linux）。`scripts/diag/` 下有各引擎的独立诊断脚本
 （解析器改不动时用它们抓真实 HTML 比对）。
+
+> **平台说明**：权限类断言（凭据文件 600 / 目录 700 / 一键登录票据工具）
+> 依赖 POSIX 权限位，在 Windows 上会自动 skip —— Windows 的 `chmod` 只能切只读位，
+> `stat` 恒报 `0o666`，这类断言在那里没有意义。**服务本身请部署在
+> Linux / WSL / 容器 / Termux**，Windows 直跑会被权限自检拒绝（安全设计，不是 bug）。
 
 ---
 
@@ -210,7 +215,7 @@ websearch-mcp/
 │   ├── nodes/            # 节点池：搜集 / 探测 / 选路 / 本地代理
 │   ├── proxy/            # 出网：订阅解析 / 代理门控 / 管理面板
 │   └── text.py           # 相关性校验 / SimHash / 摘要清洗
-├── tests/                # 466 离线用例
+├── tests/                # 468 离线用例
 ├── scripts/              # 安装 / 启动 / 运维 / 诊断 / E2E / 压测
 └── docs/                 # 代理与出网配置详解
 ```

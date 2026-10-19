@@ -126,6 +126,7 @@ def test_fix_permissions_requires_auth(store):
     assert c.post("/api/fix-permissions").status_code == 401
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows 无 POSIX 权限语义")
 def test_fix_permissions_actually_fixes(authed, store):
     """用户点一下就该修好 —— 不该要求他懂 chmod。"""
     import os
