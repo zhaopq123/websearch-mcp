@@ -60,6 +60,23 @@ def _proxy_might_be_at_fault(e: Exception) -> bool:
     ))
 
 
+def _retry_timeout_ms(elapsed_ms: int, cfg, reserve_ms: int = 1500,
+                      min_ms: int = 1000) -> int | None:
+    """代理失败后，直连重试还能花多久？不够就返回 None（别白等）。
+
+    为什么需要它（2026-10-19 vivo 实测）：两次抓取各用满 `fetch_timeout_ms`
+    （默认 6s+6s=12s），而 `total_budget_ms` 也是 12s —— 正文提取一毫秒都
+    不剩，于是偶发「已经抓到内容却被判 fetch hard timeout」。
+    重试的时长必须从**剩余总预算**里扣，并给提取留 reserve_ms。
+
+    返回：可用毫秒（夹在 min_ms 与 fetch_timeout_ms 之间）；预算不足返回 None。
+    """
+    remaining = int(cfg.total_budget_ms) - int(elapsed_ms) - int(reserve_ms)
+    if remaining < min_ms:
+        return None
+    return int(min(int(cfg.fetch_timeout_ms), remaining))
+
+
 class Orchestrator:
     def __init__(self, cfg: Config, pool: HttpPool, cache: Cache, gov: Governor):
         self.cfg = cfg
@@ -831,11 +848,24 @@ class Orchestrator:
             # 只有「网络层」失败才值得直连重试：404/403 是站点答复，
             # 直连重试也没用（还可能被当成爬虫）。cancel 更不能重试。
             if kind in ("timeout", "network") and _proxy_might_be_at_fault(e):
-                log.info("经代理抓取失败（%s: %s），改用直连重试一次：%s",
-                         type(e).__name__, str(e)[:80], url)
+                # 直连重试必须留在**总预算**里（2026-10-19 实测）：
+                # 原来两次都用满 fetch_timeout_ms（6s+6s=12s），而
+                # total_budget_ms 也是 12s —— 正文提取一毫秒都不剩，
+                # 于是偶发「抓到一半被判 hard timeout」。给重试算剩余预算。
+                elapsed_ms = int((time.monotonic() - t0) * 1000)
+                retry_ms = _retry_timeout_ms(elapsed_ms, cfg)
+                if retry_ms is None:
+                    log.info("代理失败但预算已用尽（%dms/%dms），不重试：%s",
+                             elapsed_ms, cfg.total_budget_ms, url)
+                    return FetchResult(
+                        url=url, ok=False, error=str(e)[:200],
+                        error_kind=kind, elapsed_ms=elapsed_ms,
+                    )
+                log.info("经代理抓取失败（%s: %s），改用直连重试一次（%dms）：%s",
+                         type(e).__name__, str(e)[:80], retry_ms, url)
                 try:
                     resp = await self.pool.fetch(
-                        url, timeout_ms=cfg.fetch_timeout_ms,
+                        url, timeout_ms=retry_ms,
                         max_bytes=cfg.fetch_max_bytes, direct=True,
                     )
                 except asyncio.CancelledError:
@@ -903,7 +933,9 @@ class Orchestrator:
                             u, max_chars=max_chars, use_cache=use_cache,
                             untrusted_wrap=untrusted_wrap,
                         ),
-                        timeout=self.cfg.fetch_timeout_ms / 1000.0 * 2 + 3.0,
+                        # 抓取本身已由 _retry_timeout_ms 限制在 total_budget 内；
+                        # 外层只是兜底，要留出正文提取的时间（+5s）。
+                        timeout=self.cfg.total_budget_ms / 1000.0 + 5.0,
                     )
                 except asyncio.TimeoutError:
                     # 连兜底重试都超时 = 网络真的不通，给代理门一个明确信号

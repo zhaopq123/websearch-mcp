@@ -29,7 +29,11 @@ from websearch.cache import Cache
 from websearch.config import Config
 from websearch.governor import Governor
 from websearch.http_pool import HttpPool
-from websearch.orchestrator import Orchestrator, _proxy_might_be_at_fault
+from websearch.orchestrator import (
+    Orchestrator,
+    _proxy_might_be_at_fault,
+    _retry_timeout_ms,
+)
 
 
 # ── 辅助判定函数的单测 ──────────────────────────────────────
@@ -139,3 +143,33 @@ def test_fetch_reports_error_when_both_paths_fail():
     assert pool.calls == [False, True], "两条路都该试过"
     assert not fr.ok
     assert fr.error, "失败必须有 error 说明，不能静默"
+
+
+# ── 重试预算（2026-10-19：两次各用满 6s 会吃光 12s 总预算） ──
+
+def _cfg(budget_ms=12000, fetch_ms=6000):
+    c = Config.from_env()
+    c.total_budget_ms = budget_ms
+    c.fetch_timeout_ms = fetch_ms
+    return c
+
+
+def test_retry_budget_shrinks_to_remaining():
+    """第一次用掉 6s，总预算 12s → 重试只剩 12-6-1.5=4.5s。"""
+    assert _retry_timeout_ms(6000, _cfg()) == 4500
+
+
+def test_retry_budget_never_exceeds_fetch_timeout():
+    """刚开始就失败 → 重试仍不超过单次抓取超时。"""
+    assert _retry_timeout_ms(200, _cfg()) == 6000
+
+
+def test_retry_skipped_when_budget_exhausted():
+    """预算已耗尽 → 返回 None，别白等第二次超时。"""
+    assert _retry_timeout_ms(11000, _cfg()) is None
+    assert _retry_timeout_ms(12000, _cfg()) is None
+
+
+def test_retry_skipped_when_remaining_below_minimum():
+    """剩余不足 1s 也不重试（重试必然超时，纯浪费）。"""
+    assert _retry_timeout_ms(10500, _cfg()) is None
