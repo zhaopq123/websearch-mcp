@@ -193,7 +193,16 @@ class Config:
     # ── 网络 ──
     proxy: str = ""                  # http://user:pass@host:port
     verify_ssl: bool = True
-    http2: bool = True
+    # HTTP/2 默认**关**。2026-10-19 vivo 生产实测：
+    # `web_fetch` 报 `ValueError: semaphore released too many times`，
+    # 定位到是 httpcore 的 `_max_streams_semaphore`（anyio 有界信号量，
+    # 全栈只有 HTTP/2 路径在用）在失败/取消路径上 release 越界。
+    # 而 HTTP/2 对这个产品没有收益：这里全是一次性的整页抓取，
+    # 收益最大的连接复用 HTTP/1.1 + 连接池已经拿到了；h2 多路复用只有
+    # 「同域大量并发小请求」才划得来。代价却是把整个抓取挂进一个
+    # 在超时/取消下没有安全失败模式的内部状态机。
+    # 想开：`WS_HTTP2=1`（且需装 h2）。
+    http2: bool = False
 
     # ── 节点猎手（免费节点自养池）──
     # 产品定位：节点从「用户自带」变成「系统自养」——没配订阅也能出墙。

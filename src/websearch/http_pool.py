@@ -268,9 +268,7 @@ async def assert_url_async(url: str, cfg: Config) -> tuple[bool, str]:
 
     host = urlsplit(url.strip()).hostname or ""
     try:
-        infos = await asyncio.get_running_loop().getaddrinfo(
-            host, None, proto=socket.IPPROTO_TCP
-        )
+        infos = await _resolve_host(host)
     except Exception as e:  # 解析失败 = 域名不存在，放行让请求自己失败
         log.debug("DNS 解析失败 %s: %s", host, e)
         return True, ""
@@ -283,6 +281,26 @@ async def assert_url_async(url: str, cfg: Config) -> tuple[bool, str]:
         if _is_disallowed_ip(ip):
             return False, f"private_ip_resolved:{ip}"
     return True, ""
+
+
+async def _resolve_host(host: str, timeout: float = 2.0) -> list:
+    """解析域名，**最多等 timeout 秒**。
+
+    为什么必须卡时间：`loop.getaddrinfo` 扔进线程池执行，取消等待它的任务
+    并不能让那个线程停下 —— 它照样占着线程、照样最后把结果写回来。
+    vivo 生产实测：站点被网络层黑洞时 DNS 能拖十几秒，`wait_for` 的取消
+    就一直等这个线程，硬超时 17s 等出 24s。用 `wait_for` 包一层，让等待方
+    到点就走（线程爱跑多久跑多久，不再占调用方的预算）。
+
+    超时按「解析不出来」处理，和 DNS 失败同路径 —— 交给真正的请求去失败，
+    错误信息反而更诚实。
+    """
+    return await asyncio.wait_for(
+        asyncio.get_running_loop().getaddrinfo(
+            host, None, proto=socket.IPPROTO_TCP
+        ),
+        timeout=timeout,
+    )
 
 
 async def check_redirect_sync(url: str, cfg: Config) -> tuple[bool, str]:
@@ -306,9 +324,7 @@ async def check_redirect_sync(url: str, cfg: Config) -> tuple[bool, str]:
 
     host = urlsplit(url.strip()).hostname or ""
     try:
-        infos = await asyncio.get_running_loop().getaddrinfo(
-            host, None, proto=socket.IPPROTO_TCP
-        )
+        infos = await _resolve_host(host)
     except Exception as e:
         log.debug("重定向目标 DNS 解析失败 %s: %s", host, e)
         return True, ""
