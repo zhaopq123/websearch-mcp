@@ -150,6 +150,17 @@ MCP 服务走 HTTP + Bearer token（面板里一键生成配置）。以 Claude 
 
 `tests/test_tool_schema.py` 把这两条锁死了。
 
+### 抓取的两个硬约束（2026-10-19 生产事故复盘）
+
+- **HTTP/2 默认关闭**（`WS_HTTP2=1` 才开）。`ValueError: semaphore released too many times`
+  来自 httpcore 的 HTTP/2 流控信号量在失败/取消路径上 release 越界，只走 h2 时出现，
+  升级 httpcore 也救不了。而这个产品全是一次性整页抓取，连接复用 HTTP/1.1 池已经拿到，
+  h2 多路复用零收益 —— 不值得为它背一个没有安全失败模式的状态机。
+- **硬超时必须用 `shield` 隔开**。`wait_for(协程)` 到点会先 cancel、再**等收尾做完**
+  才抛超时；而 DNS 解析跑在线程池里（取消等待方停不了那个线程）、httpcore/ssl 的关闭
+  用了 shield —— 两样都取消不动，配 17s 的硬超时实测被拖到 24s。
+  现在的语义是「到点就返回，收尾留给后台」，`elapsed_ms` 因此不再超预算。
+
 ---
 
 ## 测试
@@ -162,7 +173,7 @@ PYTHONPATH=src ./venv/bin/python scripts/user_perspective_check.py  # 用户视�
 PYTHONPATH=src ./venv/bin/python scripts/stress.py                  # 压测
 ```
 
-当前基线：**473 passed**（离线，Linux）。`scripts/diag/` 下有各引擎的独立诊断脚本
+当前基线：**484 passed**（离线，Linux；Windows 为 467 passed + 17 条 POSIX 权限用例自动跳过）。`scripts/diag/` 下有各引擎的独立诊断脚本
 （解析器改不动时用它们抓真实 HTML 比对）。
 
 > **平台说明**：权限类断言（凭据文件 600 / 目录 700 / 一键登录票据工具）
@@ -215,7 +226,7 @@ websearch-mcp/
 │   ├── nodes/            # 节点池：搜集 / 探测 / 选路 / 本地代理
 │   ├── proxy/            # 出网：订阅解析 / 代理门控 / 管理面板
 │   └── text.py           # 相关性校验 / SimHash / 摘要清洗
-├── tests/                # 475 离线用例
+├── tests/                # 484 离线用例
 ├── scripts/              # 安装 / 启动 / 运维 / 诊断 / E2E / 压测
 └── docs/                 # 代理与出网配置详解
 ```
