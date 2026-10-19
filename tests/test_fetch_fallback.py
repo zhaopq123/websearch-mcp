@@ -173,3 +173,30 @@ def test_retry_skipped_when_budget_exhausted():
 def test_retry_skipped_when_remaining_below_minimum():
     """剩余不足 1s 也不重试（重试必然超时，纯浪费）。"""
     assert _retry_timeout_ms(10500, _cfg()) is None
+
+
+# ── 失败原因不能是空白（2026-10-19 vivo 实测） ──
+
+def test_empty_exception_message_falls_back_to_class_name():
+    """httpx 的超时异常常常没有 message —— 返回空白 error 等于静默失败。"""
+    from websearch.orchestrator import _err_text
+
+    assert _err_text(httpx.ReadTimeout("")) == "ReadTimeout"
+    assert _err_text(httpx.ConnectError("")) == "ConnectError"
+    # 有 message 时保留类名 + 内容
+    assert "ConnectTimeout" in _err_text(httpx.ConnectTimeout("proxy dead"))
+    assert "proxy dead" in _err_text(httpx.ConnectTimeout("proxy dead"))
+
+
+def test_fetch_failure_never_returns_empty_error():
+    """两条路都挂且异常无 message → error 仍必须可读。"""
+    pool = _FakePool(first_exc=httpx.ReadTimeout(""), ok_direct=False)
+    o = _orch_with(pool)
+    loop = asyncio.new_event_loop()
+    try:
+        fr = loop.run_until_complete(o.fetch_one("https://example.com/"))
+    finally:
+        loop.close()
+
+    assert not fr.ok
+    assert fr.error and fr.error.strip(), "失败必须带原因，不能空白"
