@@ -939,18 +939,15 @@ class Orchestrator:
                 # 每 URL 硬超时兜底：否则一个不可达站点能把整批拖到几十秒。
                 # 实测一个抓不到的站点让 6 个 URL 的批量抓取花了 30 秒。
                 #
-                # 预算 = 2×单次超时 + 3s：fetch_one 内部「代理失败→直连重试」
-                # 可能真的花掉两次超时。预算要是只给一次，重试会在半路被
-                # 这里 cancel —— 那就白重试了，而且 CancelledError 绕过
-                # except Exception，代理门收不到失败反馈，gate 永远不降级。
+                # 抓取本身已由 _retry_timeout_ms 限制在 total_budget 内；
+                # 外层只是兜底，要留出正文提取的时间（+5s）。
+                t0 = time.monotonic()
                 try:
                     return await asyncio.wait_for(
                         self.fetch_one(
                             u, max_chars=max_chars, use_cache=use_cache,
                             untrusted_wrap=untrusted_wrap,
                         ),
-                        # 抓取本身已由 _retry_timeout_ms 限制在 total_budget 内；
-                        # 外层只是兜底，要留出正文提取的时间（+5s）。
                         timeout=self.cfg.total_budget_ms / 1000.0 + 5.0,
                     )
                 except asyncio.TimeoutError:
@@ -963,6 +960,8 @@ class Orchestrator:
                     return FetchResult(
                         url=u, ok=False, error="fetch hard timeout",
                         error_kind="timeout",
+                        # 别报 0：调用方拿它算耗时/判性能会得出「瞬间失败」的假象
+                        elapsed_ms=int((time.monotonic() - t0) * 1000),
                     )
 
         return list(await asyncio.gather(*[one(u) for u in urls]))

@@ -53,6 +53,10 @@ class Cache:
         self._executor: asyncio.ThreadPoolExecutor | None = None
         self._conn: sqlite3.Connection | None = None
         self._closed = False
+        # 排队中的异步落盘任务。aclose() 必须先把它们等完再关连接，
+        # 否则「刚 put 就退出」的条目会静默丢（2026-10-19 实测：
+        # test_l2_survives_new_instance 在机器忙时偶发红就是这个）。
+        self._pending_writes: set[asyncio.Task] = set()
 
     @property
     def enabled(self) -> bool:
@@ -217,8 +221,11 @@ class Cache:
         self._mem_put_until(key, value, expires)
         # 写 DB 不 await 返回：异步落盘，不阻塞本次响应。
         # 过期时刻在**这里**算好传进去，落盘排队不影响 TTL。
-        asyncio.create_task(
+        # 任务记进 _pending_writes，aclose() 会等它们写完再关库。
+        t = asyncio.create_task(
             self._run(self._db_put, key, kind, value, now, expires))
+        self._pending_writes.add(t)
+        t.add_done_callback(self._pending_writes.discard)
 
     async def clear(self, kind: str | None = None) -> int:
         self._mem.clear()
@@ -254,6 +261,21 @@ class Cache:
         }
 
     async def aclose(self) -> None:
+        """关闭缓存。
+
+        ⚠️ 先把排队中的落盘等完（最多 5s）再关连接（2026-10-19）。
+        原实现直接 `_closed=True` + 关连接 —— 排队中的 `_db_put` 会因
+        `_ensure_conn()` 返回 None 而**静默丢弃**，刚 put 的条目就没了。
+        """
+        if self._pending_writes:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*list(self._pending_writes),
+                                   return_exceptions=True),
+                    5.0,
+                )
+            except (asyncio.TimeoutError, Exception):
+                pass
         self._closed = True
         try:
             if self._conn:
