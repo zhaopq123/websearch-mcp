@@ -60,6 +60,22 @@ def _proxy_might_be_at_fault(e: Exception) -> bool:
     ))
 
 
+def _err_text(e: Exception, limit: int = 200) -> str:
+    """异常转人话。
+
+    ⚠️ 2026-10-19 vivo 实测：`httpx` 的超时/连接异常经常**没有 message**
+    （`str(e) == ""`），于是工具返回 `error: ""` —— 调用方看到「失败，
+    原因空白」。静默失败是最坏的失败，空的时候至少给异常类名。
+    """
+    s = str(e).strip()
+    name = type(e).__name__
+    if not s:
+        return name
+    if name in s:
+        return s[:limit]
+    return f"{name}: {s}"[:limit]
+
+
 def _retry_timeout_ms(elapsed_ms: int, cfg, reserve_ms: int = 1500,
                       min_ms: int = 1000) -> int | None:
     """代理失败后，直连重试还能花多久？不够就返回 None（别白等）。
@@ -166,7 +182,7 @@ class Orchestrator:
             else:
                 self.gov.record(name, False, elapsed, str(e)[:200])
             return EngineOutcome(
-                engine=name, ok=False, error=str(e)[:200], error_kind=kind,
+                engine=name, ok=False, error=_err_text(e), error_kind=kind,
                 elapsed_ms=elapsed,
             )
 
@@ -858,7 +874,7 @@ class Orchestrator:
                     log.info("代理失败但预算已用尽（%dms/%dms），不重试：%s",
                              elapsed_ms, cfg.total_budget_ms, url)
                     return FetchResult(
-                        url=url, ok=False, error=str(e)[:200],
+                        url=url, ok=False, error=_err_text(e),
                         error_kind=kind, elapsed_ms=elapsed_ms,
                     )
                 log.info("经代理抓取失败（%s: %s），改用直连重试一次（%dms）：%s",
@@ -872,13 +888,13 @@ class Orchestrator:
                     raise
                 except Exception as e2:
                     return FetchResult(
-                        url=url, ok=False, error=str(e2)[:200],
+                        url=url, ok=False, error=_err_text(e2),
                         error_kind=self._classify_exception(e2),
                         elapsed_ms=int((time.monotonic() - t0) * 1000),
                     )
             else:
                 return FetchResult(
-                    url=url, ok=False, error=str(e)[:200],
+                    url=url, ok=False, error=_err_text(e),
                     error_kind=kind,
                     elapsed_ms=int((time.monotonic() - t0) * 1000),
                 )
